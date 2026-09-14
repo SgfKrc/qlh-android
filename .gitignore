@@ -1,0 +1,26 @@
+# 构建输出
+build/
+.gradle/
+.kotlin/
+*.apk
+*.aab
+*.jks
+*.keystore
+keystore.properties
+keystore-lite.properties
+qlh-lite-release.jks
+
+# IDE
+.idea/
+*.iml
+local.properties
+
+# Room schema 导出
+app/schemas/
+
+# 模型文件（太大，不放 git）
+models/
+*.gguf
+
+# 原生库
+app/.cxx/

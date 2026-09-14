@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- Lite 极简版：不包含本地推理引擎，仅作为薄客户端使用 -->
+    <application
+        android:label="QLH 极简"
+        tools:replace="android:label">
+
+        <!-- 移除全有模式推理引擎 Service -->
+        <service
+            android:name="com.qlh.inference.service.InferenceService"
+            tools:node="remove" />
+    </application>
+</manifest>

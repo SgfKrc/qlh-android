@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 启动画面主题 (使用 splashscreen compat 库) -->
+    <style name="Theme.QLH.Splash" parent="Theme.SplashScreen">
+        <item name="windowSplashScreenBackground">@android:color/black</item>
+        <item name="postSplashScreenTheme">@style/Theme.QLH</item>
+    </style>
+
+    <!-- 如果 splashscreen 库未加载时的回退 -->
+    <style name="Theme.SplashScreen" parent="android:Theme.Material.NoActionBar" />
+
+    <!-- 基础主题 -->
+    <style name="Theme.QLH" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+    </style>
+</resources>

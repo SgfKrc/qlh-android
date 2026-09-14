@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">QLH 边缘推理</string>
+    <string name="app_name_cn">轻量化大模型分布式边缘推理</string>
+
+    <!-- 主界面 -->
+    <string name="tab_chat">对话</string>
+    <string name="tab_sessions">会话</string>
+    <string name="tab_settings">设置</string>
+
+    <!-- 聊天界面 -->
+    <string name="chat_hint">输入消息…</string>
+    <string name="chat_send">发送</string>
+    <string name="chat_empty">开始与 Qwen-1.8B 对话</string>
+    <string name="chat_thinking">思考中…</string>
+    <string name="chat_error">发送失败，请检查网络连接</string>
+    <string name="chat_retry">重试</string>
+
+    <!-- 会话 -->
+    <string name="session_new">新建会话</string>
+    <string name="session_delete">删除会话</string>
+    <string name="session_delete_confirm">确定删除此会话及其所有消息？</string>
+    <string name="session_default">默认会话</string>
+
+    <!-- 设置 -->
+    <string name="settings_server">主节点连接</string>
+    <string name="settings_server_host">主节点地址</string>
+    <string name="settings_server_port">端口</string>
+    <string name="settings_server_hint">例如: 192.168.1.100</string>
+    <string name="settings_test_connection">测试连接</string>
+    <string name="settings_testing">测试中…</string>
+    <string name="settings_connected">✓ 已连接</string>
+    <string name="settings_disconnected">✗ 无法连接</string>
+    <string name="settings_mode">推理模式</string>
+    <string name="settings_mode_thin">全无 (远程推理)</string>
+    <string name="settings_mode_full">全有 (本地推理)</string>
+    <string name="settings_mode_thin_desc">请求发送给 PC 主节点，本机不计算</string>
+    <string name="settings_mode_full_desc">本机加载 GGUF 模型，离线完整推理</string>
+    <string name="settings_inference">推理参数</string>
+    <string name="settings_max_tokens">最大 Token 数</string>
+    <string name="settings_temperature">温度</string>
+    <string name="settings_top_p">Top-P</string>
+    <string name="settings_about">关于</string>
+    <string name="settings_version">版本 %1$s</string>
+    <string name="settings_project">北京交通大学 · 大创项目</string>
+
+    <!-- 通知 -->
+    <string name="notification_channel_inference">推理引擎</string>
+    <string name="notification_inference_running">推理引擎运行中</string>
+
+    <!-- 通用 -->
+    <string name="ok">确定</string>
+    <string name="cancel">取消</string>
+    <string name="confirm">确认</string>
+    <string name="delete">删除</string>
+    <string name="save">保存</string>
+    <string name="loading">加载中…</string>
+</resources>
