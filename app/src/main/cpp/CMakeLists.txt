@@ -46,6 +46,8 @@ set(GGML_NATIVE OFF CACHE BOOL "Disable host-native flags for Android cross comp
 set(GGML_OPENMP OFF CACHE BOOL "Avoid libomp packaging for the first Android build" FORCE)
 set(GGML_CPU_KLEIDIAI OFF CACHE BOOL "Avoid build-time KleidiAI download" FORCE)
 set(GGML_BACKEND_DL OFF CACHE BOOL "Use statically linked backend" FORCE)
+# Koakuma Android RPC worker：App 进程内直接运行 ggml RPC server（不 fork 子进程）
+set(GGML_RPC ON CACHE BOOL "Enable RPC backend for the Koakuma Android worker" FORCE)
 
 add_subdirectory(llama.cpp build-llama)
 
@@ -60,6 +62,7 @@ target_include_directories(qlh_llama_jni PRIVATE
 target_link_libraries(qlh_llama_jni
     llama
     mtmd
+    ggml-rpc
     android
     log
 )

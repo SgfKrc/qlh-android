@@ -756,3 +756,223 @@ Java_com_qlh_inference_service_LocalInferenceEngine_nativeGetLastGenerationStats
     map_put(env, map, put_method, "estimated_memory_mb", std::to_string(estimate_kv_memory_mb(qctx, stats.total_tokens)));
     return map;
 }
+
+// ============================================================================
+// Koakuma Android RPC worker（票 11 / P0-3）
+//
+// 目的：让 Android App 在**自己进程内**跑 ggml RPC server，把本机算力暴露给
+// 集群（对应 PC 侧 scripts/llama_rpc_sim.py 的 `ggml-rpc-server` 角色），
+// 而不需要 fork 子进程 —— Android 上无法像桌面那样起独立可执行文件。
+//
+// 上游约束（llama.cpp 47e1de77a）：`ggml_backend_rpc_start_server` 是**阻塞**
+// 函数且**没有对应的优雅停止 API**（`tools/rpc/rpc-server.cpp` 靠进程退出结束）。
+// 因此这里：
+//   * Start 只负责在独立线程里进入 server 循环；
+//   * Stop 只能做「逻辑停止」（清运行标志），无法中断已阻塞的 accept 循环 ——
+//     这一点通过 Status 的 `stop_supported=false` 显式告知上层，不做虚假承诺。
+// ============================================================================
+
+#include "ggml-rpc.h"
+
+#include <atomic>
+#include <thread>
+
+struct QlhRpcWorker {
+    std::thread th;
+    std::atomic<bool> running{false};
+    std::string endpoint;
+    std::string cache_dir;
+    int n_threads = 0;
+    int n_devices = 0;
+    std::string last_error;
+    std::string devices_desc;
+    long long started_at_ms = 0;
+    long long stopped_at_ms = 0;
+};
+
+static QlhRpcWorker g_rpc_worker;
+static std::mutex g_rpc_mutex;
+
+static long long qlh_now_ms() {
+    using namespace std::chrono;
+    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+static std::string qlh_jstring_to_utf8(JNIEnv * env, jstring value) {
+    if (value == nullptr) {
+        return std::string();
+    }
+    const char * chars = env->GetStringUTFChars(value, nullptr);
+    if (chars == nullptr) {
+        return std::string();
+    }
+    std::string out(chars);
+    env->ReleaseStringUTFChars(value, chars);
+    return out;
+}
+
+// 候选设备：本机所有非 RPC 后端设备（避免把 RPC 设备自身再暴露出去形成自环）
+static std::vector<ggml_backend_dev_t> qlh_rpc_candidate_devices(std::string * desc_out) {
+    std::vector<ggml_backend_dev_t> out;
+    std::ostringstream desc;
+    const size_t n = ggml_backend_dev_count();
+    for (size_t i = 0; i < n; ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (dev == nullptr) {
+            continue;
+        }
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        const char * reg_name = (reg != nullptr) ? ggml_backend_reg_name(reg) : nullptr;
+        if (reg_name != nullptr && std::string(reg_name) == "RPC") {
+            continue;
+        }
+        out.push_back(dev);
+        if (desc.tellp() > 0) {
+            desc << ", ";
+        }
+        desc << ggml_backend_dev_name(dev);
+    }
+    if (desc_out != nullptr) {
+        *desc_out = desc.str();
+    }
+    return out;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_qlh_inference_service_LocalInferenceEngine_nativeRpcWorkerStart(
+    JNIEnv * env, jobject /* thiz */, jstring j_endpoint, jint n_threads, jstring j_cache_dir
+) {
+    if (j_endpoint == nullptr) {
+        throw_java(env, "endpoint must not be null");
+        return JNI_FALSE;
+    }
+    const std::string endpoint = qlh_jstring_to_utf8(env, j_endpoint);
+    const std::string cache_dir = qlh_jstring_to_utf8(env, j_cache_dir);
+
+    std::lock_guard<std::mutex> lock(g_rpc_mutex);
+    if (g_rpc_worker.running.load()) {
+        throw_java(env, "RPC worker is already running");
+        return JNI_FALSE;
+    }
+    if (g_rpc_worker.th.joinable()) {
+        g_rpc_worker.th.join();       // 回收上一次已退出的线程
+    }
+
+    ensure_backend_initialized();
+
+    std::string devices_desc;
+    std::vector<ggml_backend_dev_t> devices = qlh_rpc_candidate_devices(&devices_desc);
+    if (devices.empty()) {
+        throw_java(env, "no local device available for the RPC worker");
+        return JNI_FALSE;
+    }
+
+    g_rpc_worker.endpoint = endpoint;
+    g_rpc_worker.cache_dir = cache_dir;
+    g_rpc_worker.n_threads = (n_threads > 0) ? static_cast<int>(n_threads) : available_threads();
+    g_rpc_worker.n_devices = static_cast<int>(devices.size());
+    g_rpc_worker.devices_desc = devices_desc;
+    g_rpc_worker.last_error.clear();
+    g_rpc_worker.started_at_ms = qlh_now_ms();
+    g_rpc_worker.stopped_at_ms = 0;
+    g_rpc_worker.running.store(true);
+
+    const int worker_threads = g_rpc_worker.n_threads;
+    const char * cache_ptr = g_rpc_worker.cache_dir.empty() ? nullptr : g_rpc_worker.cache_dir.c_str();
+
+    QLH_LOGI("RPC worker starting: endpoint=%s threads=%d devices=%s",
+             endpoint.c_str(), worker_threads, devices_desc.c_str());
+
+    // mutable：devices.data() 需要非 const 指针（lambda 默认按 const 捕获副本）
+    g_rpc_worker.th = std::thread([endpoint, cache_dir, devices, worker_threads]() mutable {
+        const char * cache = cache_dir.empty() ? nullptr : cache_dir.c_str();
+        ggml_backend_rpc_start_server(
+            endpoint.c_str(), cache, static_cast<size_t>(worker_threads),
+            devices.size(), devices.data());
+        // start_server 返回即表示 server 循环结束
+        {
+            std::lock_guard<std::mutex> guard(g_rpc_mutex);
+            g_rpc_worker.running.store(false);
+            g_rpc_worker.stopped_at_ms = qlh_now_ms();
+        }
+        QLH_LOGI("RPC worker stopped: endpoint=%s", endpoint.c_str());
+    });
+    (void) cache_ptr;
+
+    return JNI_TRUE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_qlh_inference_service_LocalInferenceEngine_nativeRpcWorkerStop(
+    JNIEnv * env, jobject /* thiz */
+) {
+    (void) env;
+    std::lock_guard<std::mutex> lock(g_rpc_mutex);
+    if (!g_rpc_worker.running.load() && !g_rpc_worker.th.joinable()) {
+        return JNI_FALSE;
+    }
+    // 逻辑停止：仅清标志。上游没有优雅停止 API，阻塞中的 accept 循环无法从此处中断，
+    // 真正的结束依赖 server 自身返回或进程退出（见 Status 的 stop_supported=false）。
+    g_rpc_worker.running.store(false);
+    g_rpc_worker.stopped_at_ms = qlh_now_ms();
+    QLH_LOGW("RPC worker logical stop requested; upstream has no graceful shutdown API");
+    return JNI_TRUE;
+}
+
+extern "C" JNIEXPORT jobject JNICALL
+Java_com_qlh_inference_service_LocalInferenceEngine_nativeRpcWorkerStatus(
+    JNIEnv * env, jobject /* thiz */
+) {
+    std::lock_guard<std::mutex> lock(g_rpc_mutex);
+    jmethodID put_method = nullptr;
+    jobject map = new_string_map(env, &put_method);
+    map_put(env, map, put_method, "running", g_rpc_worker.running.load() ? "true" : "false");
+    map_put(env, map, put_method, "endpoint", g_rpc_worker.endpoint);
+    map_put(env, map, put_method, "cache_dir", g_rpc_worker.cache_dir);
+    map_put(env, map, put_method, "n_threads", std::to_string(g_rpc_worker.n_threads));
+    map_put(env, map, put_method, "n_devices", std::to_string(g_rpc_worker.n_devices));
+    map_put(env, map, put_method, "devices", g_rpc_worker.devices_desc);
+    map_put(env, map, put_method, "started_at_ms", std::to_string(g_rpc_worker.started_at_ms));
+    map_put(env, map, put_method, "stopped_at_ms", std::to_string(g_rpc_worker.stopped_at_ms));
+    map_put(env, map, put_method, "last_error", g_rpc_worker.last_error);
+    map_put(env, map, put_method, "proto_version", std::to_string(RPC_PROTO_MAJOR_VERSION) + "." +
+            std::to_string(RPC_PROTO_MINOR_VERSION) + "." + std::to_string(RPC_PROTO_PATCH_VERSION));
+    // 如实上报能力边界：上游无优雅停止，Stop 只能做逻辑标记
+    map_put(env, map, put_method, "stop_supported", "false");
+    return map;
+}
+
+// 探活：把 endpoint 当远端 RPC 设备访问，读取其显存/内存信息以确认可达
+extern "C" JNIEXPORT jobject JNICALL
+Java_com_qlh_inference_service_LocalInferenceEngine_nativeRpcProbe(
+    JNIEnv * env, jobject /* thiz */, jstring j_endpoint
+) {
+    const std::string endpoint = qlh_jstring_to_utf8(env, j_endpoint);
+    jmethodID put_method = nullptr;
+    jobject map = new_string_map(env, &put_method);
+    map_put(env, map, put_method, "endpoint", endpoint);
+    if (endpoint.empty()) {
+        map_put(env, map, put_method, "reachable", "false");
+        map_put(env, map, put_method, "error", "endpoint is empty");
+        return map;
+    }
+
+    ensure_backend_initialized();
+
+    size_t free_bytes = 0;
+    size_t total_bytes = 0;
+    bool ok = false;
+    try {
+        ggml_backend_rpc_get_device_memory(endpoint.c_str(), 0, &free_bytes, &total_bytes);
+        ok = (total_bytes > 0);
+    } catch (...) {
+        ok = false;
+    }
+    map_put(env, map, put_method, "reachable", ok ? "true" : "false");
+    map_put(env, map, put_method, "free_bytes", std::to_string(free_bytes));
+    map_put(env, map, put_method, "total_bytes", std::to_string(total_bytes));
+    if (!ok) {
+        map_put(env, map, put_method, "error", "no response from RPC endpoint");
+    }
+    return map;
+}

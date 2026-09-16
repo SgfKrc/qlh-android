@@ -94,7 +94,12 @@ android {
             externalNativeBuild {
                 cmake {
                     cppFlags += listOf("-std=c++17")
-                    arguments += listOf("-DANDROID_STL=c++_shared")
+                    arguments += listOf(
+                        "-DANDROID_STL=c++_shared",
+                        // Android 15+ 的 16 KB page 设备要求 ELF LOAD 段 16 KB 对齐；
+                        // NDK r27 通过该开关带上 -Wl,-z,max-page-size=16384（无需改源码）。
+                        "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON",
+                    )
                 }
             }
         }

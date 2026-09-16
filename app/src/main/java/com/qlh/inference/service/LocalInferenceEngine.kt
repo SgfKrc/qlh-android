@@ -501,4 +501,52 @@ class LocalInferenceEngine(private val context: Context) {
 
     /** 获取最近一次生成的 token 和耗时统计。 */
     private external fun nativeGetLastGenerationStats(modelPtr: Long): Map<String, String>
+
+    // ===================== Koakuma RPC worker（票 11 / P0-3） =====================
+
+    /**
+     * 在本进程内启动 ggml RPC server，把本机算力暴露给集群。
+     *
+     * 对应 PC 侧 `ggml-rpc-server` 的角色，但跑在 App 进程的独立线程里
+     * （Android 无法像桌面那样 fork 独立可执行文件）。
+     *
+     * @param endpoint 监听地址，形如 `"0.0.0.0:50052"`；**切勿暴露到开放网络**
+     * @param nThreads 计算线程数；`<= 0` 时使用默认值
+     * @param cacheDir 可选本地缓存目录；`null` 表示不缓存
+     * @return `true` 表示 server 线程已启动
+     */
+    private external fun nativeRpcWorkerStart(
+        endpoint: String,
+        nThreads: Int,
+        cacheDir: String?
+    ): Boolean
+
+    /** 查询 RPC worker 状态（running / endpoint / n_devices / stop_supported 等）。 */
+    private external fun nativeRpcWorkerStatus(): Map<String, String>
+
+    /**
+     * 请求停止 RPC worker。
+     *
+     * **注意**：上游 llama.cpp 未提供优雅停止 API，本方法只做逻辑停止标记；
+     * 状态里以 `stop_supported = false` 如实上报该限制。
+     */
+    private external fun nativeRpcWorkerStop(): Boolean
+
+    /** 探活：把 endpoint 当远端 RPC 设备访问，确认可达并读取其内存信息。 */
+    private external fun nativeRpcProbe(endpoint: String): Map<String, String>
+
+    // ------------------- 公开封装（供 UI / 集群接入层调用） -------------------
+
+    /** 启动本机 RPC worker；已在运行时返回 `false`。 */
+    fun startRpcWorker(endpoint: String, nThreads: Int = 0, cacheDir: String? = null): Boolean =
+        nativeRpcWorkerStart(endpoint, nThreads, cacheDir)
+
+    /** 当前 RPC worker 状态快照。 */
+    fun rpcWorkerStatus(): Map<String, String> = nativeRpcWorkerStatus()
+
+    /** 请求停止 RPC worker（逻辑停止；上游无优雅停止机制）。 */
+    fun stopRpcWorker(): Boolean = nativeRpcWorkerStop()
+
+    /** 探测某个 RPC endpoint 是否可达。 */
+    fun probeRpcEndpoint(endpoint: String): Map<String, String> = nativeRpcProbe(endpoint)
 }

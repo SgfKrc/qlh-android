@@ -30,10 +30,13 @@ class AndroidFullWorkerStageExecutor(
             )
         }
         val payload = offer.payload
-        if (payload["stage_type"] != "full_inference") {
+        val stageType = payload["stage_type"] as? String
+        if (!AndroidWorkerCapabilities.isSupportedStageType(stageType)) {
             throw AndroidFullWorkerStageException(
                 "unsupported_stage_type",
-                "Android Full Worker accepts full_inference only",
+                "Android Full Worker accepts only supported stage types " +
+                    "(got [${stageType ?: "null"}]; " +
+                    "supported: [${AndroidWorkerCapabilities.describeSupportedStageTypes()}])",
             )
         }
         val advertised = expectedModelIdentity()

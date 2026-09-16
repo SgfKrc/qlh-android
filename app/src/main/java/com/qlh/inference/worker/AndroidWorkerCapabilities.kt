@@ -2,6 +2,50 @@ package com.qlh.inference.worker
 
 /** Builds the conservative capability snapshot sent by an Android Full Worker. */
 object AndroidWorkerCapabilities {
+    /**
+     * 本 Android worker 支持的推理引擎集合 —— **能力探测的单一来源**。
+     *
+     * 新增/切换引擎时只改这里，不再向协议校验处散落字面量：`TaskWorkerProtocol`
+     * 通过 [areAllEnginesSupported] / [isSupportedEngine] 判定，而不是拿
+     * `listOf("llama_cpp")` 做相等比较。与主仓 `CORE-KOAKUMA-ENGINE-ABC-01` 的
+     * 「能力差异以能力探测表达、而非 `if engine_type`」判据对齐。
+     */
+    val SUPPORTED_ENGINES: List<String> = listOf("llama_cpp")
+
+    /** 默认引擎（用于未显式指定引擎的模型身份）。 */
+    val DEFAULT_ENGINE: String = SUPPORTED_ENGINES.first()
+
+    /** 该引擎是否受支持。 */
+    fun isSupportedEngine(engine: String?): Boolean =
+        engine != null && SUPPORTED_ENGINES.contains(engine)
+
+    /** 上报的引擎列表是否全部受支持（空列表视为不合法）。 */
+    fun areAllEnginesSupported(engines: List<String>): Boolean =
+        engines.isNotEmpty() && engines.all { SUPPORTED_ENGINES.contains(it) }
+
+    /** 供错误信息展示的支持清单。 */
+    fun describeSupportedEngines(): String = SUPPORTED_ENGINES.joinToString(", ")
+
+    /**
+     * 本 Android worker 支持的 stage 类型 —— 与 [SUPPORTED_ENGINES] 同一约定：
+     * 同样作为能力探测的单一来源，协议校验不得对字面量做相等比较。
+     */
+    val SUPPORTED_STAGE_TYPES: List<String> = listOf("full_inference")
+
+    /** 默认 stage 类型。 */
+    val DEFAULT_STAGE_TYPE: String = SUPPORTED_STAGE_TYPES.first()
+
+    /** 该 stage 类型是否受支持。 */
+    fun isSupportedStageType(stageType: String?): Boolean =
+        stageType != null && SUPPORTED_STAGE_TYPES.contains(stageType)
+
+    /** 上报的 stage 类型列表是否全部受支持（空列表视为不合法）。 */
+    fun areAllStageTypesSupported(stageTypes: List<String>): Boolean =
+        stageTypes.isNotEmpty() && stageTypes.all { SUPPORTED_STAGE_TYPES.contains(it) }
+
+    /** 供错误信息展示的 stage 支持清单。 */
+    fun describeSupportedStageTypes(): String = SUPPORTED_STAGE_TYPES.joinToString(", ")
+
     fun modelIdentity(
         modelId: String,
         modelFormat: String,
@@ -13,7 +57,7 @@ object AndroidWorkerCapabilities {
     ) {
         mapOf(
             "model_id" to modelId,
-            "engine" to "llama_cpp",
+            "engine" to DEFAULT_ENGINE,
             "format" to modelFormat,
             "revision" to modelRevision,
             "sha256" to modelSha256.lowercase(),
@@ -37,8 +81,8 @@ object AndroidWorkerCapabilities {
             modelId, modelFormat, modelRevision, modelSha256, resourceAdmitted,
         )
         return mapOf(
-            "stage_types" to listOf("full_inference"),
-            "engines" to listOf("llama_cpp"),
+            "stage_types" to SUPPORTED_STAGE_TYPES,
+            "engines" to SUPPORTED_ENGINES,
             "models" to (model?.let { listOf(it) } ?: emptyList<Map<String, Any?>>()),
             "max_concurrency" to 1,
             "resource_gate" to mapOf(

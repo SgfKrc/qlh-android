@@ -373,12 +373,24 @@ object TaskWorkerProtocol {
             "payload.capabilities",
         )
         val stageTypes = stringList(capabilities, "stage_types")
-        if (stageTypes != listOf("full_inference")) {
-            fail("Android workers may advertise only full_inference", "invalid_capabilities", "payload.capabilities.stage_types")
+        if (!AndroidWorkerCapabilities.areAllStageTypesSupported(stageTypes)) {
+            fail(
+                "Android workers may advertise only supported stage types " +
+                    "(got [${stageTypes.joinToString(", ")}]; " +
+                    "supported: [${AndroidWorkerCapabilities.describeSupportedStageTypes()}])",
+                "invalid_capabilities",
+                "payload.capabilities.stage_types",
+            )
         }
         val engines = stringList(capabilities, "engines")
-        if (engines != listOf("llama_cpp")) {
-            fail("Android workers must advertise llama_cpp", "invalid_capabilities", "payload.capabilities.engines")
+        if (!AndroidWorkerCapabilities.areAllEnginesSupported(engines)) {
+            fail(
+                "Android workers must advertise supported engines " +
+                    "(got [${engines.joinToString(", ")}]; " +
+                    "supported: [${AndroidWorkerCapabilities.describeSupportedEngines()}])",
+                "invalid_capabilities",
+                "payload.capabilities.engines",
+            )
         }
         val models = list(capabilities, "models")
         models.forEachIndexed { index, item -> validateModelIdentity(item as? Map<*, *>, "payload.capabilities.models[$index]") }
@@ -412,7 +424,15 @@ object TaskWorkerProtocol {
         when (type) {
             STAGE_OFFER -> {
                 requirePattern(string(payload, "request_id", allowEmpty = true), safeId, "payload.request_id")
-                if (payload["stage_type"] != "full_inference") fail("unsupported stage type", "unsupported_stage_type", "payload.stage_type")
+                val stageType = payload["stage_type"] as? String
+                if (!AndroidWorkerCapabilities.isSupportedStageType(stageType)) {
+                    fail(
+                        "unsupported stage type [${stageType ?: "null"}]; " +
+                            "supported: [${AndroidWorkerCapabilities.describeSupportedStageTypes()}]",
+                        "unsupported_stage_type",
+                        "payload.stage_type",
+                    )
+                }
                 val deadline = long(payload, "lease_expires_at_ms")
                 if (deadline <= envelope.sentAtMs) fail("lease deadline must be later than message timestamp", "invalid_lease_deadline", "payload.lease_expires_at_ms")
                 val rootInput = objectValue(payload, "root_input")
@@ -465,7 +485,16 @@ object TaskWorkerProtocol {
         if (value == null) fail("model identity must be an object", "invalid_object", field)
         requireExact(value.keys.map { it.toString() }.toSet(), setOf("model_id", "engine", "format", "revision", "sha256"), field)
         requirePattern(value["model_id"].toString(), safeId, "$field.model_id")
-        if (value["engine"] != "llama_cpp") fail("Android worker requires llama_cpp", "invalid_model_identity", "$field.engine")
+        val engine = value["engine"] as? String
+        if (!AndroidWorkerCapabilities.isSupportedEngine(engine)) {
+            fail(
+                "Android worker requires a supported engine " +
+                    "(got [${engine ?: "null"}]; " +
+                    "supported: [${AndroidWorkerCapabilities.describeSupportedEngines()}])",
+                "invalid_model_identity",
+                "$field.engine",
+            )
+        }
         requirePattern(value["format"].toString(), safeId, "$field.format")
         requirePattern(value["revision"].toString(), safeId, "$field.revision")
         requireSha(value["sha256"].toString(), "$field.sha256")
