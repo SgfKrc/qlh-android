@@ -43,10 +43,16 @@ object AndroidWorkerCapabilities {
      * * 本节点是**中间段**（要产出 hidden）时，模型**必须**以
      *   `extractHidden = true` 加载；未开启则 native 返回 `-2`，
      *   上层如实失败（`extract_hidden_not_enabled`），**不返回空 hidden**。
-     * * 声明的验证阶梯止于 **B 层（Gradle/APK 构建通过）**；
-     *   **C+（x86_64 数值验证）/ D（ARM64 设备）/ E（真机）尚未走完** ——
-     *   即：**协议层可接收、执行路径完整，但数值正确性未在设备上验证过**。
-     *   接入真实层流水线前必须先补 C+/D 证据。
+     * * **验证阶梯当前到 C+**：
+     *   - ✅ **B**（Gradle/APK 构建通过，含 `buildCMakeDebug[arm64-v8a]`）
+     *   - ✅ **C+**（**x86_64 数值正确性**）：用**同一份 llama.cpp
+     *     （b9902 / 47e1de77a）源码**以 x86_64 目标重编译，做端到端对照 ——
+     *     整模型取 `layer_inp(K)` 当上游 hidden，裁层模型用 `llama_batch.embd`
+     *     注入后续算取 argmax，与整模型 token 路径的 argmax 逐 token 比对。
+     *     实测**两个 prompt、共 11 步全部 MATCH**（exit code 0）。
+     *   - ❌ **D**（ARM64 AVD/QEMU）、**E**（真机）**尚未走完**，因此
+     *     **「在 Android 设备上的数值正确性」仍未验证**。
+     *   接入真实层流水线前必须先补 D/E 证据。
      */
     val SUPPORTED_STAGE_TYPES: List<String> = listOf("full_inference", "layer_forward")
 
