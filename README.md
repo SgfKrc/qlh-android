@@ -15,7 +15,10 @@ gradlew.bat :app:testFullDebugUnitTest
 
 The `app/src/main/cpp/llama.cpp` submodule is pinned to
 `47e1de77aa0f06bf73cfd8c5281d95979f89fcbe`. Do not silently upgrade it; update
-the pin and run the native/JVM gates together.
+the pin and run the native/JVM gates together. The QLH patch contract is owned
+by the sibling main repository; from that repository, run
+`python scripts/model_tools/sync_llama_cpp.py --dry-run` before a build and use
+`--apply` only when the managed patch is missing.
 
 The Android client does not own PC PyTorch execution, Web UI code, image
 generation, or model weights. Model assets are user-managed through the QLH
