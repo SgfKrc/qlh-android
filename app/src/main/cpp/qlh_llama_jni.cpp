@@ -976,3 +976,180 @@ Java_com_qlh_inference_service_LocalInferenceEngine_nativeRpcProbe(
     }
     return map;
 }
+
+// ============================================================================
+// 层段（layer_forward）—— 用 llama.cpp 承「一段层」，参与主仓层流水线
+// ============================================================================
+//
+// ## 为什么需要
+// Android 要用 llama.cpp 参与**层流水线**：加载**裁层 GGUF**（只含尾段层），
+// 接收上游的 hidden 并注入（`llama_batch.embd`），只算自己负责的层区间。
+// —— 这条路径就是主仓 `CORE-RELAY-01` / `L→L Relay` 的 L 侧一边。
+// 主仓任务协议 v3 已定义 `layer_forward` stage 与 `layer_range`/`handoff_at`/
+// `hidden_sha256`/`hidden_spec` 字段（见 `src/task_worker_protocol.py`）。
+//
+// ## 实现来源
+// 移植自已跑通的实验实现
+//   `build/cross-framework-layer-poc/llama.cpp/tools/hs-extract-batch/relay-gen-dl.cpp`
+// （D→L 接力，逐 token 一致）。**三个已踩过的坑必须保留**：
+//   ① `n_batch`/`n_ubatch` 必须 ≥ 最长序列，否则 `llama_decode` 越界崩溃
+//      （实测 rc=0xC0000409）；本文件在 nativeLoadModel 侧已按 n_ctx 设置。
+//   ② **pos 数组必须按 `n_pos_per_embd * n_tokens` 提供** —— llama.cpp 的
+//      `ubatch_add` 在 M-RoPE + `embd` 批次会按该长度读 `pos`，而
+//      `llama_batch_init` 只分配 `n_tokens` 个。这是上游 issue #28963 / #28902
+//      的**调用方修法**（上游 #28910 只修 pos==NULL 路径，不覆盖我们的显式 pos）。
+//   ③ `embd` 注入路径**进程内 bitwise 非确定** ⇒ 验收**只认 per-token argmax**，
+//      不得要求 bitwise 一致（主仓 `RELAY_ACCEPTANCE = "per_token_argmax"`）。
+
+//: M-RoPE 的位置段数（Qwen3.5 的 `rope.dimension_sections` 为 4 段）。与
+//: `relay-gen-dl.cpp` 保持一致；若接入非 M-RoPE 模型需按模型 metadata 调整。
+static const int QLH_LAYER_N_POS_PER_EMBD = 4;
+
+// 把 f32 hidden 注入 embd 批次并从本节点层段继续前向；返回末位置 argmax token。
+//
+// out_hidden 非空时，额外把「末位置的输出 hidden」拷回它（供中间层段节点继续接力）。
+static jint qlh_layer_forward_impl(
+    JNIEnv * env,
+    jlong model_ptr,
+    jfloatArray j_hidden,
+    jint n_tokens,
+    jint pos_base,
+    jfloatArray out_hidden
+) {
+    if (model_ptr == 0 || j_hidden == nullptr || n_tokens <= 0) {
+        return -1;
+    }
+    auto * qctx = reinterpret_cast<QlhLlamaContext *>(model_ptr);
+    if (qctx->ctx == nullptr || qctx->model == nullptr) {
+        return -1;
+    }
+
+    const int n_embd_inp = llama_model_n_embd_inp(qctx->model);
+    const jsize arr_len = env->GetArrayLength(j_hidden);
+    if (arr_len != (jsize) n_tokens * n_embd_inp) {
+        // 形状不符：明确失败，不做静默截断/补齐
+        return -1;
+    }
+
+    std::vector<float> hidden((size_t) arr_len);
+    env->GetFloatArrayRegion(j_hidden, 0, arr_len, hidden.data());
+    if (env->ExceptionCheck()) {
+        return -1;
+    }
+
+    // 每步从零重算（与 relay-gen-dl 默认模式一致）：避免跨步 KV 复用带来的
+    // 序列号/位置耦合，先把正确性钉死；增量模式（keep-kv）是后续优化位。
+    llama_memory_t mem = llama_get_memory(qctx->ctx);
+    if (mem) {
+        llama_memory_clear(mem, true);
+    }
+
+    llama_batch batch = llama_batch_init(n_tokens, n_embd_inp, /*n_seq_max=*/1);
+    if (batch.embd == nullptr) {
+        return -1;
+    }
+    for (int i = 0; i < n_tokens; ++i) {
+        batch.pos[i] = pos_base + i;
+        batch.n_seq_id[i] = 1;
+        batch.seq_id[i][0] = 0;
+        batch.logits[i] = (i + 1 == n_tokens) ? 1 : 0;
+    }
+    batch.n_tokens = n_tokens;
+    std::memcpy(batch.embd, hidden.data(), hidden.size() * sizeof(float));
+
+    // ★ 坑②：pos 按 n_pos_per_embd * n_tokens 重建（上游 #28963 调用方修法）。
+    {
+        const size_t pos_len = (size_t) QLH_LAYER_N_POS_PER_EMBD * (size_t) n_tokens;
+        auto * pos_ext = static_cast<llama_pos *>(malloc(pos_len * sizeof(llama_pos)));
+        if (pos_ext == nullptr) {
+            llama_batch_free(batch);
+            return -1;
+        }
+        for (int j = 0; j < QLH_LAYER_N_POS_PER_EMBD; ++j) {
+            for (int i = 0; i < n_tokens; ++i) {
+                pos_ext[(size_t) j * (size_t) n_tokens + (size_t) i] = pos_base + i;
+            }
+        }
+        free(batch.pos);
+        batch.pos = pos_ext;
+    }
+
+    jint result = -1;
+    const int rc = llama_decode(qctx->ctx, batch);
+    if (rc == 0) {
+        const float * logits = llama_get_logits_ith(qctx->ctx, n_tokens - 1);
+        if (logits != nullptr) {
+            const int n_vocab = llama_vocab_n_tokens(qctx->vocab);
+            int best = 0;
+            for (int i = 1; i < n_vocab; ++i) {
+                if (logits[i] > logits[best]) {
+                    best = i;
+                }
+            }
+            result = (jint) best;
+        }
+        if (out_hidden != nullptr) {
+            const float * hidden_out = llama_get_embeddings_ith(qctx->ctx, n_tokens - 1);
+            if (hidden_out != nullptr && env->GetArrayLength(out_hidden) == (jsize) n_embd_inp) {
+                env->SetFloatArrayRegion(out_hidden, 0, (jsize) n_embd_inp, hidden_out);
+            }
+        }
+    }
+
+    // batch.pos 已被我们替换为 malloc 的 pos_ext；llama_batch_free 会 free() 它，
+    // 与 llama_batch_init 的分配方式一致（同为 malloc），故这里统一走 free 路径。
+    llama_batch_free(batch);
+    return result;
+}
+
+// 层段前向：返回末位置 argmax token（本节点是**末段**时用）。
+extern "C" JNIEXPORT jint JNICALL
+Java_com_qlh_inference_service_LocalInferenceEngine_nativeLayerForwardToken(
+    JNIEnv * env, jobject /* thiz */, jlong model_ptr,
+    jfloatArray j_hidden, jint n_tokens, jint pos_base
+) {
+    return qlh_layer_forward_impl(env, model_ptr, j_hidden, n_tokens, pos_base, nullptr);
+}
+
+// 层段前向（中间段）：除 argmax 外，把末位置输出 hidden 拷回 out_hidden，
+// 供上层继续交给下一段。形状不符时返回 -1。
+extern "C" JNIEXPORT jint JNICALL
+Java_com_qlh_inference_service_LocalInferenceEngine_nativeLayerForwardHidden(
+    JNIEnv * env, jobject /* thiz */, jlong model_ptr,
+    jfloatArray j_hidden, jint n_tokens, jint pos_base, jfloatArray out_hidden
+) {
+    return qlh_layer_forward_impl(env, model_ptr, j_hidden, n_tokens, pos_base, out_hidden);
+}
+
+// 层段能力探测：上报本节点能否承层段、hidden 宽度、以及「层段运行必需的批量下限」。
+// 与 `AndroidWorkerCapabilities` 的「能力探测是单一来源」约定一致 —— 上层据此决定
+// 是否把本节点纳入层流水线，而不是靠 `if engine_type` 猜。
+extern "C" JNIEXPORT jobject JNICALL
+Java_com_qlh_inference_service_LocalInferenceEngine_nativeLayerForwardInfo(
+    JNIEnv * env, jobject /* thiz */, jlong model_ptr
+) {
+    jmethodID put_method = nullptr;
+    jobject map = new_string_map(env, &put_method);
+    const bool usable = (model_ptr != 0);
+    map_put(env, map, put_method, "layer_forward_supported", usable ? "true" : "false");
+    if (!usable) {
+        map_put(env, map, put_method, "reason", "model not loaded");
+        return map;
+    }
+    auto * qctx = reinterpret_cast<QlhLlamaContext *>(model_ptr);
+    if (qctx->model == nullptr) {
+        map_put(env, map, put_method, "layer_forward_supported", "false");
+        map_put(env, map, put_method, "reason", "model handle is empty");
+        return map;
+    }
+    const int n_embd_inp = llama_model_n_embd_inp(qctx->model);
+    const int n_layer = (int) llama_model_n_layer(qctx->model);
+    map_put(env, map, put_method, "n_embd", std::to_string(n_embd_inp));
+    map_put(env, map, put_method, "n_layer", std::to_string(n_layer));
+    // 裁层 GGUF 天然只含尾段层 ⇒ `n_layer` 即本节点实际负责的层数；
+    // 层区间的**源模型**编号由主仓按 `layer_range` 下发，不在此臆测。
+    map_put(env, map, put_method, "hidden_dtype", "float32");
+    map_put(env, map, put_method, "n_pos_per_embd", std::to_string(QLH_LAYER_N_POS_PER_EMBD));
+    map_put(env, map, put_method, "acceptance", "per_token_argmax");
+    return map;
+}

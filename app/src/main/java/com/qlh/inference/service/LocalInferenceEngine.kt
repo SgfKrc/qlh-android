@@ -535,6 +535,51 @@ class LocalInferenceEngine(private val context: Context) {
     /** 探活：把 endpoint 当远端 RPC 设备访问，确认可达并读取其内存信息。 */
     private external fun nativeRpcProbe(endpoint: String): Map<String, String>
 
+    // ------------------- 层段（layer_forward）-------------------
+
+    /**
+     * 层段前向：把上游 hidden 注入 embd 批次，从本节点的裁层 GGUF 继续算，
+     * 返回**末位置 argmax token**（本节点是层流水线的**末段**时用）。
+     *
+     * 用于主仓任务协议 v3 的 `layer_forward` stage。前提是加载的是**裁层 GGUF**
+     * （只含尾段层）；本节点实际负责的层区间由主仓按 `layer_range` 下发并核对。
+     *
+     * @param modelPtr `nativeLoadModel` 返回的句柄
+     * @param hidden 上游 hidden，**f32**、长度必须恰为 `nTokens * n_embd`
+     * @param nTokens 本次注入的 token 数（通常为当前整段序列长度）
+     * @param posBase 位置起点（每步可用绝对位置累加）
+     * @return 末位置 argmax token；形状不符/解码失败返回 `-1`
+     */
+    private external fun nativeLayerForwardToken(
+        modelPtr: Long,
+        hidden: FloatArray,
+        nTokens: Int,
+        posBase: Int
+    ): Int
+
+    /**
+     * 层段前向（**中间段**）：除 argmax 外，额外把末位置的输出 hidden 拷回
+     * `outHidden`，供上层交给下一段继续接力。
+     *
+     * `outHidden` 的长度必须等于 `n_embd`；不符时不写入（仅返回 argmax）。
+     */
+    private external fun nativeLayerForwardHidden(
+        modelPtr: Long,
+        hidden: FloatArray,
+        nTokens: Int,
+        posBase: Int,
+        outHidden: FloatArray
+    ): Int
+
+    /**
+     * 层段能力探测：`layer_forward_supported` / `n_embd` / `n_layer` /
+     * `hidden_dtype` / `n_pos_per_embd` / `acceptance`。
+     *
+     * 与 [AndroidWorkerCapabilities] 的「能力探测是单一来源」约定一致 ——
+     * 上层据此决定是否把本节点纳入层流水线，而不是靠 `if engine_type` 猜。
+     */
+    private external fun nativeLayerForwardInfo(modelPtr: Long): Map<String, String>
+
     // ------------------- 公开封装（供 UI / 集群接入层调用） -------------------
 
     /** 启动本机 RPC worker；已在运行时返回 `false`。 */
