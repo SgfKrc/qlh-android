@@ -43,16 +43,23 @@ object AndroidWorkerCapabilities {
      * * 本节点是**中间段**（要产出 hidden）时，模型**必须**以
      *   `extractHidden = true` 加载；未开启则 native 返回 `-2`，
      *   上层如实失败（`extract_hidden_not_enabled`），**不返回空 hidden**。
-     * * **验证阶梯当前到 C+**：
+     * * **验证阶梯当前到 D/E（真机）**：
      *   - ✅ **B**（Gradle/APK 构建通过，含 `buildCMakeDebug[arm64-v8a]`）
      *   - ✅ **C+**（**x86_64 数值正确性**）：用**同一份 llama.cpp
      *     （b9902 / 47e1de77a）源码**以 x86_64 目标重编译，做端到端对照 ——
      *     整模型取 `layer_inp(K)` 当上游 hidden，裁层模型用 `llama_batch.embd`
      *     注入后续算取 argmax，与整模型 token 路径的 argmax 逐 token 比对。
      *     实测**两个 prompt、共 11 步全部 MATCH**（exit code 0）。
-     *   - ❌ **D**（ARM64 AVD/QEMU）、**E**（真机）**尚未走完**，因此
-     *     **「在 Android 设备上的数值正确性」仍未验证**。
-     *   接入真实层流水线前必须先补 D/E 证据。
+     *   - ✅ **D/E（真机 ARM64）**：同一份源码经 NDK 交叉编译为 aarch64 可执行文件，
+     *     在 **Lenovo Y700（TB321FU / **SM8650 = Snapdragon 8 Gen 3** / Android 15 /
+     *     `arm64-v8a`）**上重跑同一对照 ⇒ **5 步逐 token 全部 MATCH**（exit 0），
+     *     且 token 序列与 x86_64 的 C+ **完全相同**（`576/9396/11/14019/9396`）。
+     *     辅助判据：反汇编 `libggml-cpu.so` 统计到 `sdot`×1063、`smmla`×244
+     *     ⇒ 确认跑的是 **dotprod + i8mm 快速 kernel**，**不是 baseline**。
+     *   - ⚠️ **仍未验证：APK 应用链路**。上述 D/E 证据来自 **Termux 里的原生可执行文件**，
+     *     它**绕过了** `qlh_llama_jni.cpp` 的 JNI 封装、Kotlin 执行器、协议 v3 编解码、
+     *     APK 打包签名与安装 —— **从未在真机上装过 APK**。
+     *     详见 `docs/安卓验证阶梯D-E层-真机Termux方案-2026-09-20.md` §2.1 与 §5.1。
      */
     val SUPPORTED_STAGE_TYPES: List<String> = listOf("full_inference", "layer_forward")
 
