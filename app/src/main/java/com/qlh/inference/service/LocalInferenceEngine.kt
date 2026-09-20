@@ -126,7 +126,8 @@ class LocalInferenceEngine(private val context: Context) {
     )
     suspend fun loadModel(
         modelPath: String,
-        contextSize: Int = DEFAULT_CONTEXT_SIZE
+        contextSize: Int = DEFAULT_CONTEXT_SIZE,
+        extractHidden: Boolean = false
     ): Result<Unit> = withContext(Dispatchers.IO) {
         val libResult = ensureNativeLibraryLoaded()
         if (libResult.isFailure) {
@@ -151,7 +152,7 @@ class LocalInferenceEngine(private val context: Context) {
         }
 
         try {
-            val ptr = nativeLoadModel(modelPath, contextSize)
+            val ptr = nativeLoadModel(modelPath, contextSize, extractHidden)
             if (ptr == 0L) {
                 return@withContext Result.failure(
                     IllegalStateException("模型加载失败（native 返回空指针）: $modelPath")
@@ -175,7 +176,8 @@ class LocalInferenceEngine(private val context: Context) {
      */
     suspend fun loadModel(
         handle: ModelManager.ModelOpenHandle,
-        contextSize: Int = DEFAULT_CONTEXT_SIZE
+        contextSize: Int = DEFAULT_CONTEXT_SIZE,
+        extractHidden: Boolean = false
     ): Result<Unit> = withContext(Dispatchers.IO) {
         val libResult = ensureNativeLibraryLoaded()
         if (libResult.isFailure) {
@@ -205,7 +207,7 @@ class LocalInferenceEngine(private val context: Context) {
         }
 
         try {
-            val ptr = nativeLoadModel(modelPath, contextSize)
+            val ptr = nativeLoadModel(modelPath, contextSize, extractHidden)
             if (ptr == 0L) {
                 handle.close()
                 return@withContext Result.failure(
@@ -452,7 +454,7 @@ class LocalInferenceEngine(private val context: Context) {
      * 加载 GGUF 模型。
      * @return 模型指针（> 0 成功，0 失败）
      */
-    private external fun nativeLoadModel(path: String, nCtx: Int): Long
+    private external fun nativeLoadModel(path: String, nCtx: Int, extractHidden: Boolean): Long
 
     /** 释放模型内存 */
     private external fun nativeFreeModel(modelPtr: Long)

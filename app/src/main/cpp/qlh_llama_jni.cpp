@@ -39,6 +39,10 @@ struct QlhLlamaContext {
     int n_ctx = 0;
     int n_threads = 0;
     int n_threads_batch = 0;
+    //: ★ 2026-09-20（层段）：context 是否开启了隐藏态导出。只有为 true 时
+    //: `llama_get_embeddings_ith` 才有值 ⇒ 中间层段节点必须以此为前提，
+    //: `nativeLayerForwardHidden` 据此**如实报错**而不是回退成空 hidden。
+    bool extract_hidden = false;
     QlhGenerationStats last_stats;
 };
 
@@ -210,7 +214,8 @@ Java_com_qlh_inference_service_LocalInferenceEngine_nativeLoadModel(
     JNIEnv * env,
     jobject /* thiz */,
     jstring j_path,
-    jint j_n_ctx
+    jint j_n_ctx,
+    jboolean j_extract_hidden
 ) {
     ensure_backend_initialized();
 
@@ -235,11 +240,23 @@ Java_com_qlh_inference_service_LocalInferenceEngine_nativeLoadModel(
     const int n_threads = available_threads();
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx = static_cast<uint32_t>(std::max(512, static_cast<int>(j_n_ctx)));
-    ctx_params.n_batch = std::min<uint32_t>(512, ctx_params.n_ctx);
-    ctx_params.n_ubatch = std::min<uint32_t>(256, ctx_params.n_batch);
+    // ★ 2026-09-20 修 BUG：原先 `n_batch = min(512, n_ctx)`、`n_ubatch = min(256, n_batch)`。
+    //   层段（layer_forward）每步注入的是**整段序列**的 hidden，长 prefill 会超过 512
+    //   ⇒ `llama_decode` 越界（实验侧实测 rc=0xC0000409）。批量必须能吃下最长序列，
+    //   故与 n_ctx 联动（上游 llama.cpp 的默认 n_batch 也是 2048 量级）。
+    ctx_params.n_batch = ctx_params.n_ctx;
+    ctx_params.n_ubatch = ctx_params.n_ctx;
     ctx_params.n_threads = n_threads;
     ctx_params.n_threads_batch = n_threads;
     ctx_params.no_perf = true;
+    // ★ 2026-09-20（层段）：中间层段节点需要把「本段末位置的输出 hidden」交给下一段，
+    //   而 `llama_get_embeddings_ith` 仅在 context 开启隐藏态导出时才有值。
+    //   ⚠️ 字段名随版本而异：**android 子模块的 llama.cpp 为 `b9902`，用的是
+    //      `embeddings`**；桌面实验 fork（较新）叫 `extract_hidden_states`。
+    //      这正是「两侧必须同构建」的一个具体体现 —— 不要盲目照搬桌面侧写法。
+    //   ⚠️ 代价：开启后会保留隐藏态张量，有额外内存/时间成本 ⇒ **默认关闭**，
+    //      只有要当**中间层段**时才置 true（末段只需 logits）。
+    ctx_params.embeddings = (j_extract_hidden == JNI_TRUE);
 
     llama_context * ctx = llama_init_from_model(model, ctx_params);
     if (ctx == nullptr) {
@@ -264,8 +281,11 @@ Java_com_qlh_inference_service_LocalInferenceEngine_nativeLoadModel(
     qctx->n_ctx = static_cast<int>(llama_n_ctx(ctx));
     qctx->n_threads = llama_n_threads(ctx);
     qctx->n_threads_batch = llama_n_threads_batch(ctx);
+    qctx->extract_hidden = (j_extract_hidden == JNI_TRUE);
 
-    QLH_LOGI("model loaded: ctx=%d threads=%d", qctx->n_ctx, n_threads);
+    QLH_LOGI("model loaded: ctx=%d n_batch=%u extract_hidden=%d threads=%d",
+             qctx->n_ctx, ctx_params.n_batch,
+             ctx_params.embeddings ? 1 : 0, n_threads);
     return reinterpret_cast<jlong>(qctx);
 }
 
@@ -1089,9 +1109,27 @@ static jint qlh_layer_forward_impl(
             result = (jint) best;
         }
         if (out_hidden != nullptr) {
+            // ★ 2026-09-20：中间层段必须由 load 时开启 `extract_hidden_states`，
+            //   否则 `llama_get_embeddings_ith` 无值。此处**如实处理**：
+            //   未开启时把结果标记为「不能承中间段」，由调用方 fail-closed，
+            //   而不是悄悄回传一个全零 hidden 让下游算出错误结果。
+            if (!qctx->extract_hidden) {
+                llama_batch_free(batch);
+                return -2;  // -2 = 需要 extract_hidden_states（load 时开启）
+            }
             const float * hidden_out = llama_get_embeddings_ith(qctx->ctx, n_tokens - 1);
-            if (hidden_out != nullptr && env->GetArrayLength(out_hidden) == (jsize) n_embd_inp) {
-                env->SetFloatArrayRegion(out_hidden, 0, (jsize) n_embd_inp, hidden_out);
+            if (hidden_out == nullptr) {
+                llama_batch_free(batch);
+                return -1;
+            }
+            if (env->GetArrayLength(out_hidden) != (jsize) n_embd_inp) {
+                llama_batch_free(batch);
+                return -1;
+            }
+            env->SetFloatArrayRegion(out_hidden, 0, (jsize) n_embd_inp, hidden_out);
+            if (env->ExceptionCheck()) {
+                llama_batch_free(batch);
+                return -1;
             }
         }
     }
@@ -1151,5 +1189,14 @@ Java_com_qlh_inference_service_LocalInferenceEngine_nativeLayerForwardInfo(
     map_put(env, map, put_method, "hidden_dtype", "float32");
     map_put(env, map, put_method, "n_pos_per_embd", std::to_string(QLH_LAYER_N_POS_PER_EMBD));
     map_put(env, map, put_method, "acceptance", "per_token_argmax");
+    // ★ 2026-09-20：能否承**中间段**取决于 load 时是否开了隐藏态导出。
+    //   末段（只要 argmax）不受该开关影响 ⇒ 两个能力分别上报。
+    map_put(env, map, put_method, "can_tail", "true");
+    map_put(env, map, put_method, "extract_hidden", qctx->extract_hidden ? "true" : "false");
+    map_put(env, map, put_method, "can_middle", qctx->extract_hidden ? "true" : "false");
+    if (!qctx->extract_hidden) {
+        map_put(env, map, put_method, "middle_reason",
+                "extract_hidden_states not enabled at load time");
+    }
     return map;
 }
