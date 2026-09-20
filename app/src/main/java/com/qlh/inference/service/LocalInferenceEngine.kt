@@ -62,6 +62,17 @@ class LocalInferenceEngine(private val context: Context) {
     var loadedModelSourceUri: String = ""
         private set
 
+    /**
+     * ★ 2026-09-20（层段）：当前模型加载时是否开启了隐藏态导出。
+     *
+     * 必须记录 —— 层段做**中间段**（要输出 hidden）时，模型**必须**以
+     * `extractHidden = true` 加载。而「同一个模型文件、两次加载方式不同」在
+     * 卸载判据里必须被区分开，否则会出现「模型已加载但 hidden 取不到」的静默失败。
+     */
+    @Volatile
+    var loadedExtractHidden: Boolean = false
+        private set
+
     /** Whether a verified/loaded MTMD projector is attached to the model. */
     @Volatile
     var multimodalLoaded: Boolean = false
@@ -161,6 +172,7 @@ class LocalInferenceEngine(private val context: Context) {
             modelPtr = ptr
             loadedModelPath = modelPath
             loadedModelSourceUri = ""
+            loadedExtractHidden = extractHidden
             Log.i(TAG, "模型加载成功: $modelPath (context=$contextSize, ptr=$ptr)")
             Result.success(Unit)
         } catch (e: Exception) {
@@ -217,6 +229,7 @@ class LocalInferenceEngine(private val context: Context) {
             modelPtr = ptr
             loadedModelPath = modelPath
             loadedModelSourceUri = handle.sourceUri.toString()
+            loadedExtractHidden = extractHidden
             modelOpenHandle = handle
             Log.i(
                 TAG,
@@ -317,6 +330,7 @@ class LocalInferenceEngine(private val context: Context) {
             modelPtr = 0
             loadedModelPath = ""
             loadedModelSourceUri = ""
+            loadedExtractHidden = false
         }
         modelOpenHandle?.close()
         modelOpenHandle = null
@@ -435,6 +449,100 @@ class LocalInferenceEngine(private val context: Context) {
         } catch (e: Exception) {
             Result.failure(e)
         }
+    }
+
+    // ------------------- 层段（layer_forward）-------------------
+
+    /**
+     * 层段前向的输出。`hiddenOut` 仅在请求了「中间段」（[wantHidden]=true）且
+     * 本节点在 load 时开启了隐藏态导出时有值。
+     */
+    data class LayerForwardOutput(
+        /** 末位置 argmax token。 */
+        val tokenArgmax: Int,
+        /** 末位置输出 hidden（本节点为中间段时），否则为 null。 */
+        val hiddenOut: FloatArray?,
+    ) {
+        override fun equals(other: Any?): Boolean = this === other
+        override fun hashCode(): Int = System.identityHashCode(this)
+    }
+
+    /**
+     * 层段前向：把上游 hidden 注入本节点的**裁层 GGUF**，只算自己的层区间。
+     *
+     * 这是「Android 参与主仓层流水线」的执行入口，对应任务协议 v3 的
+     * `layer_forward` stage。**本方法只管算，不管协议** —— 层区间/handoff 的
+     * 合法性、模型身份对账由 `worker` 层的 `AndroidFullWorkerStageExecutor` 负责。
+     *
+     * @param hidden f32 hidden 平铺数组，长度必须恰为 `nTokens * n_embd`
+     * @param nTokens 注入的 token 数
+     * @param posBase 位置起点（每步可用绝对位置累加）
+     * @param wantHidden 本节点是否为**中间段**（需要把输出 hidden 交给下一段）。
+     *   若为 true 但模型未以 `extractHidden=true` 加载 ⇒ **失败**（不返回空 hidden）。
+     */
+    suspend fun layerForward(
+        hidden: FloatArray,
+        nTokens: Int,
+        posBase: Int,
+        wantHidden: Boolean,
+    ): Result<LayerForwardOutput> = withContext(Dispatchers.IO) {
+        if (!isLoaded) {
+            return@withContext Result.failure(IllegalStateException("model_not_loaded"))
+        }
+        if (nTokens <= 0) {
+            return@withContext Result.failure(IllegalArgumentException("nTokens must be positive"))
+        }
+        try {
+            if (wantHidden) {
+                val out = FloatArray(estimateEmbeddingWidth(hidden.size, nTokens))
+                val token = nativeLayerForwardHidden(modelPtr, hidden, nTokens, posBase, out)
+                when (token) {
+                    // -2 = native 侧报告「load 时未开启 extract_hidden_states」。
+                    // 如实转成失败：中间段拿不到 hidden 就必须停，不能悄悄降级。
+                    -2 -> return@withContext Result.failure(
+                        IllegalStateException("extract_hidden_not_enabled")
+                    )
+                    else -> Result.success(LayerForwardOutput(token, if (token >= 0) out else null))
+                }
+            } else {
+                val token = nativeLayerForwardToken(modelPtr, hidden, nTokens, posBase)
+                Result.success(LayerForwardOutput(token, null))
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * 层段能力探测：`layer_forward_supported` / `n_embd` / `n_layer` /
+     * `hidden_dtype` / `n_pos_per_embd` / `acceptance` / `can_tail` /
+     * `extract_hidden` / `can_middle`。
+     *
+     * 与 [getBackendInfo] 同一模式 —— 能力由 native 侧**上报**，调用方据此决定
+     * 是否把本节点纳入层流水线，而不是靠 `if engine_type` 猜。
+     */
+    suspend fun layerForwardInfo(): Result<Map<String, String>> = withContext(Dispatchers.IO) {
+        if (!isLoaded) {
+            return@withContext Result.failure(IllegalStateException("model_not_loaded"))
+        }
+        try {
+            Result.success(nativeLayerForwardInfo(modelPtr))
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * 由 hidden 平铺长度与 token 数反推宽度（= `n_embd`），用作输出缓冲尺寸。
+     * 形状不自洽时抛错 —— 与 native 侧同样的 fail-closed 纪律。
+     */
+    private fun estimateEmbeddingWidth(hiddenSize: Int, nTokens: Int): Int {
+        if (hiddenSize <= 0 || nTokens <= 0 || hiddenSize % nTokens != 0) {
+            throw IllegalArgumentException(
+                "hidden array size $hiddenSize is not a multiple of nTokens $nTokens"
+            )
+        }
+        return hiddenSize / nTokens
     }
 
     /**

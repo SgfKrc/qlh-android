@@ -102,6 +102,31 @@ class TaskWorkerService : Service() {
                         prompt, maxTokens, temperature, topP,
                     ) ?: Result.failure(IllegalStateException("inference_service_unavailable"))
                 },
+                // ★ 2026-09-20（层段）：接上 layer_forward。
+                //   中间段需要隐藏态导出 ⇒ 用 ensureModelLoadedForLayer 单独加载。
+                //   ⚠️ 「是否导出隐藏态」是两种不同的加载方式，二者**不能共存**
+                //      （引擎会按需卸载重载）。这是刻意的 fail-closed：
+                //      宁可重载一次，也不静默降级成取不到 hidden。
+                layerForward = { req ->
+                    QlhApplication.instance.inferenceService?.engine?.let { engine ->
+                        engine.layerForward(
+                            hidden = req.hidden,
+                            nTokens = req.nTokens,
+                            posBase = req.posBase,
+                            wantHidden = req.wantHidden,
+                        ).map { out ->
+                            LayerForwardResult(
+                                tokenArgmax = out.tokenArgmax,
+                                hiddenOut = out.hiddenOut,
+                            )
+                        }
+                    } ?: Result.failure(IllegalStateException("inference_service_unavailable"))
+                },
+                ensureModelLoadedForLayer = { contextSize ->
+                    QlhApplication.instance.inferenceService
+                        ?.ensureModelLoaded(contextSize, extractHidden = true)
+                        ?: Result.failure(IllegalStateException("inference_service_unavailable"))
+                },
             ),
         ).also { it.start() }
     }

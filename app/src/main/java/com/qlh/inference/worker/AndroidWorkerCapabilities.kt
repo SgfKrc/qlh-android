@@ -30,18 +30,25 @@ object AndroidWorkerCapabilities {
      * 本 Android worker 支持的 stage 类型 —— 与 [SUPPORTED_ENGINES] 同一约定：
      * 同样作为能力探测的单一来源，协议校验不得对字面量做相等比较。
      *
-     * ⚠️ **2026-09-20：层段（`layer_forward`）暂不在此声明。**
-     * 主仓任务协议已升到 v3 并定义了 `layer_forward`（层段），但 Android 侧的
-     * **JNI 尚未实现** `llama_batch.embd` 注入与层段前向 ⇒ 若现在声明，
-     * 就会出现「声明支持、执行时 unsupported_stage_type」的**能力撒谎**，
-     * 违反 fail-closed 纪律（`AndroidFullWorkerStageExecutor` 只认已实现的类型）。
+     * ✅ **2026-09-20：层段（`layer_forward`）现已声明。** 三个加入条件已全部满足：
+     * 1. `qlh_llama_jni.cpp` 提供 `nativeLayerForwardToken` /
+     *    `nativeLayerForwardHidden` / `nativeLayerForwardInfo`（收 hidden、
+     *    `llama_batch.embd` 注入、只算本节点层区间）；
+     * 2. `AndroidFullWorkerStageExecutor.executeLayerForward` 能真正执行该 stage，
+     *    且 `TaskWorkerService` 已把 `layerForward` 接到 `LocalInferenceEngine`；
+     * 3. JVM 单测断言「本清单里每个 stage 类型都能被执行器处理」
+     *    （`AndroidWorkerCapabilitiesStageParityTest`）—— 防的是**能力撒谎**。
      *
-     * **加入条件（完成 A3 后）**：`qlh_llama_jni.cpp` 提供
-     * `nativeLayerForward*`（收 hidden、注入、只算本节点层区间），
-     * 且 `AndroidFullWorkerStageExecutor` 能真正执行该 stage ⇒ 再把
-     * `"layer_forward"` 加进本列表，并在 JVM 单测里断言两者一致。
+     * ⚠️ 契约边界（不因声明而放松）：
+     * * 本节点是**中间段**（要产出 hidden）时，模型**必须**以
+     *   `extractHidden = true` 加载；未开启则 native 返回 `-2`，
+     *   上层如实失败（`extract_hidden_not_enabled`），**不返回空 hidden**。
+     * * 声明的验证阶梯止于 **B 层（Gradle/APK 构建通过）**；
+     *   **C+（x86_64 数值验证）/ D（ARM64 设备）/ E（真机）尚未走完** ——
+     *   即：**协议层可接收、执行路径完整，但数值正确性未在设备上验证过**。
+     *   接入真实层流水线前必须先补 C+/D 证据。
      */
-    val SUPPORTED_STAGE_TYPES: List<String> = listOf("full_inference")
+    val SUPPORTED_STAGE_TYPES: List<String> = listOf("full_inference", "layer_forward")
 
     /** 默认 stage 类型。 */
     val DEFAULT_STAGE_TYPE: String = SUPPORTED_STAGE_TYPES.first()

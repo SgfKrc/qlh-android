@@ -157,16 +157,34 @@ class InferenceService : Service() {
 
     /**
      * 确保模型已加载（如未加载则尝试加载默认路径的模型）。
+     *
+     * @param extractHidden ★ 2026-09-20（层段）：是否开启隐藏态导出。
+     *   只有要当**中间层段**时才需要（末段只需 logits）；开启有额外内存/时间成本。
+     *   ⚠️ 该选项**只能在创建 context 时**设定 ⇒ 改变它就等于需要重新加载模型。
      */
-    suspend fun ensureModelLoaded(contextSize: Int = 2048): Result<Unit> {
+    suspend fun ensureModelLoaded(
+        contextSize: Int = 2048,
+        extractHidden: Boolean = false,
+    ): Result<Unit> {
         val eng = engine ?: return Result.failure(IllegalStateException("Service 未初始化"))
 
         val selectedUri = modelManager.getSelectedModelUri()
-        if (eng.isLoaded && eng.loadedModelSourceUri == selectedUri) {
+        // ★ 2026-09-20 修 BUG：短路判据原先只看「同一个 URI」。
+        //   但「同一模型文件、是否导出隐藏态」是**两种不同的加载方式**，
+        //   若视为等价，层段做中间段时会一直取不到 hidden（静默失败）。
+        //   故把 loadedExtractHidden 一并纳入判据。
+        if (eng.isLoaded && eng.loadedModelSourceUri == selectedUri &&
+            eng.loadedExtractHidden == extractHidden
+        ) {
             return Result.success(Unit)
         }
         if (eng.isLoaded) {
-            Log.i(TAG, "模型选择已变化，卸载旧模型: ${eng.loadedModelSourceUri} -> $selectedUri")
+            Log.i(
+                TAG,
+                "模型选择或加载方式已变化，卸载旧模型: " +
+                    "${eng.loadedModelSourceUri}(hidden=${eng.loadedExtractHidden}) -> " +
+                    "$selectedUri(hidden=$extractHidden)",
+            )
             eng.unloadModel()
         }
 
@@ -184,7 +202,7 @@ class InferenceService : Service() {
         }
 
         val handle = handleResult.getOrThrow()
-        val fdResult = eng.loadModel(handle, contextSize)
+        val fdResult = eng.loadModel(handle, contextSize, extractHidden)
         if (fdResult.isSuccess) {
             return fdResult
         }
@@ -203,7 +221,7 @@ class InferenceService : Service() {
         val fallbackHandle = modelManager.openModelForLlama(preferFd = false).getOrElse {
             return Result.failure(fdResult.exceptionOrNull() ?: it)
         }
-        return eng.loadModel(fallbackHandle, contextSize)
+        return eng.loadModel(fallbackHandle, contextSize, extractHidden)
     }
 
     suspend fun unloadModel(): Result<Unit> {

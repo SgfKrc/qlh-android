@@ -55,7 +55,11 @@ data class TaskWorkerAttemptIdentity(
  */
 object TaskWorkerProtocol {
     const val PROTOCOL = "qlh.task_worker"
-    const val VERSION = 2
+    const val VERSION = 3
+    const val MIN_VERSION = 2
+    /** v3：层段 stage 类型（`layer_forward`）——与主仓协议同名。 */
+    const val LAYER_FORWARD_STAGE = "layer_forward"
+
     const val MAX_MESSAGE_BYTES = 8 * 1024 * 1024
     const val ANDROID_WORKER_KIND = "android_full_worker"
 
@@ -101,7 +105,7 @@ object TaskWorkerProtocol {
         payload = mapOf(
             "node_id" to nodeId,
             "worker_kind" to ANDROID_WORKER_KIND,
-            "min_version" to VERSION,
+            "min_version" to MIN_VERSION,
             "max_version" to VERSION,
             "capabilities" to capabilities,
         ),
@@ -139,6 +143,15 @@ object TaskWorkerProtocol {
         modelIdentity: Map<String, Any?>,
         messageId: String,
         sentAtMs: Long,
+        /**
+         * ★ 2026-09-20（v3）：`layer_forward` 的顶层附加字段
+         * （`layer_range` / `handoff_at` / `hidden_sha256` / `hidden_spec`）。
+         *
+         * 单独走这个口子而不是塞进 `rootInput` —— 因为这些字段是**协议级**的
+         * stage 参数，不是「用户输入」，混进 `root_input` 会让 `input_sha256`
+         * 的语义（对输入做摘要）变得含混。
+         */
+        stageFields: Map<String, Any?> = emptyMap(),
     ): TaskWorkerEnvelope {
         val payload = identity.asPayload() + mapOf(
             "request_id" to requestId,
@@ -149,7 +162,7 @@ object TaskWorkerProtocol {
             "dependencies" to dependencies,
             "input_sha256" to stageInputSha256(rootInput, dependencies),
             "model_identity" to modelIdentity,
-        )
+        ) + stageFields
         return build(STAGE_OFFER, payload, messageId, sentAtMs)
     }
 
@@ -340,15 +353,31 @@ object TaskWorkerProtocol {
 
     fun validate(envelope: TaskWorkerEnvelope) {
         if (envelope.protocol != PROTOCOL) fail("unsupported protocol", "unsupported_protocol", "protocol")
-        if (envelope.version != VERSION) {
-            fail("Android worker requires protocol v2", "unsupported_protocol_version", "version")
+        if (envelope.version < MIN_VERSION || envelope.version > VERSION) {
+            fail(
+                "Android worker accepts protocol v$MIN_VERSION..v$VERSION",
+                "unsupported_protocol_version",
+                "version",
+            )
         }
         if (envelope.messageType !in messageTypes) {
             fail("unsupported message type", "unsupported_message_type", "message_type")
         }
         requirePattern(envelope.messageId, messageId, "message_id")
         if (envelope.sentAtMs < 0) fail("sent_at_ms must be non-negative", "invalid_integer", "sent_at_ms")
-        requireExact(envelope.payload.keys, payloadFields(envelope.messageType), "payload")
+        // ★ 2026-09-20：v3 的 layer_forward stage_offer 允许额外的层段字段。
+        //   条件性放宽（仅 v3 + layer_forward），避免把白名单整体扩大。
+        val allowedFields = payloadFields(envelope.messageType) +
+            if (
+                envelope.version >= 3 &&
+                envelope.messageType == STAGE_OFFER &&
+                envelope.payload["stage_type"] == LAYER_FORWARD_STAGE
+            ) {
+                layerForwardOfferFields
+            } else {
+                emptySet()
+            }
+        requireExact(envelope.payload.keys, allowedFields, "payload")
 
         when (envelope.messageType) {
             HELLO -> validateHello(envelope.payload)
@@ -362,8 +391,14 @@ object TaskWorkerProtocol {
         if (payload["worker_kind"] != ANDROID_WORKER_KIND) {
             fail("worker_kind must be $ANDROID_WORKER_KIND", "unsupported_worker_kind", "payload.worker_kind")
         }
-        if (integer(payload, "min_version") != VERSION || integer(payload, "max_version") != VERSION) {
-            fail("Android worker requires protocol v2", "invalid_version_range", "payload.min_version")
+        val minVersion = integer(payload, "min_version")
+        val maxVersion = integer(payload, "max_version")
+        if (minVersion != MIN_VERSION || maxVersion != VERSION || minVersion > maxVersion) {
+            fail(
+                "Android worker advertises protocol v$MIN_VERSION..v$VERSION",
+                "invalid_version_range",
+                "payload.min_version",
+            )
         }
         val capabilities = objectValue(payload, "capabilities")
         val expectedCapabilityFields = setOf("stage_types", "engines", "models", "max_concurrency")
@@ -406,8 +441,12 @@ object TaskWorkerProtocol {
         val accepted = boolean(payload, "accepted")
         val selected = integer(payload, "selected_version", allowZero = true)
         val reason = code(payload, "reason_code", allowEmpty = true)
-        if (accepted && (selected != version || reason.isNotEmpty())) {
-            fail("accepted hello_ack must select v2 without a reason", "invalid_negotiation_result", "payload")
+        if (accepted && (selected < MIN_VERSION || selected > version || reason.isNotEmpty())) {
+            fail(
+                "accepted hello_ack must select a version in v$MIN_VERSION..v$VERSION without a reason",
+                "invalid_negotiation_result",
+                "payload",
+            )
         }
         if (!accepted && (selected != 0 || reason.isEmpty())) {
             fail("rejected hello_ack must include a reason", "invalid_negotiation_result", "payload")
@@ -442,6 +481,11 @@ object TaskWorkerProtocol {
                     fail("stage input digest does not match payload", "input_digest_mismatch", "payload.input_sha256")
                 }
                 validateModelIdentity(payload["model_identity"] as? Map<*, *>, "payload.model_identity")
+                // ★ 2026-09-20（v3 层段）：`layer_forward` 的专项字段校验。
+                //   与主仓 protocol v3 对称；v2 下出现这些字段早在白名单那步就被拒。
+                if (envelope.version >= 3 && stageType == LAYER_FORWARD_STAGE) {
+                    validateLayerForwardOffer(payload)
+                }
             }
             STAGE_ACCEPT -> {
                 val accepted = boolean(payload, "accepted")
@@ -521,6 +565,71 @@ object TaskWorkerProtocol {
         "sent_at_ms" to envelope.sentAtMs,
         "payload" to envelope.payload,
     )
+
+    /**
+     * ★ 2026-09-20：v3 的 `layer_forward` stage_offer 额外字段。
+     *
+     * 与主仓 `src/task_worker_protocol.py` 的 `_LAYER_FORWARD_OFFER_FIELDS` **同名同集合** ——
+     * 两侧必须对称，否则协商成 v3 后字段校验会互相打架。
+     *
+     * ⚠️ 这些字段是**条件性**的：只在 v3 **且** `stage_type == "layer_forward"` 时才允许
+     * （不是全局扩白名单，否则 v2 或 full_inference 也能夹带，等于放松校验）。
+     */
+    private val layerForwardOfferFields =
+        setOf("layer_range", "handoff_at", "hidden_sha256", "hidden_spec")
+
+    /**
+     * ★ 2026-09-20（v3 层段）：`layer_forward` stage_offer 的专项字段校验。
+     *
+     * 与主仓 `src/task_worker_protocol.py` 的 v3 分支**逐条对称**：
+     * * `layer_range` —— `[start, end)`，`end > start >= 0`
+     * * `handoff_at`  —— 上游交接点，非负
+     * * `hidden_sha256` —— 64 位十六进制摘要
+     * * `hidden_spec` —— 对象，含正整数 `n_tokens` / `n_embd`，`dtype == "float32"`
+     *
+     * 这里只做**形状与范围**校验（协议层职责）；「层区间是否与真实裁层工件自洽」
+     * 属于执行侧（`AndroidFullWorkerStageExecutor` + native 的 `n_layer` 对账）。
+     */
+    private fun validateLayerForwardOffer(payload: Map<String, Any?>) {
+        val range = list(payload, "layer_range")
+        if (range.size != 2) {
+            fail("layer_range must be [start, end)", "invalid_layer_range", "payload.layer_range")
+        }
+        val start = (range[0] as? Number)?.toInt()
+        val end = (range[1] as? Number)?.toInt()
+        if (start == null || end == null || start < 0 || end <= start) {
+            fail(
+                "layer_range must be [start, end) with end > start >= 0",
+                "invalid_layer_range",
+                "payload.layer_range",
+            )
+        }
+        val handoffAt = integer(payload, "handoff_at", allowZero = true)
+        if (handoffAt < 0) {
+            fail("handoff_at must be >= 0", "invalid_handoff", "payload.handoff_at")
+        }
+        requireSha(string(payload, "hidden_sha256"), "payload.hidden_sha256")
+
+        val spec = objectValue(payload, "hidden_spec")
+        val nTokens = integer(spec, "n_tokens")
+        val nEmbd = integer(spec, "n_embd")
+        if (nTokens < 1 || nEmbd < 1) {
+            fail(
+                "hidden_spec.n_tokens/n_embd must be positive",
+                "invalid_hidden_spec",
+                "payload.hidden_spec",
+            )
+        }
+        val dtype = spec["dtype"] as? String
+        if (dtype != "float32") {
+            // 跨框架层接力以 f32 为基线（与主仓 relay 合同一致）。
+            fail(
+                "hidden_spec.dtype must be float32",
+                "unsupported_hidden_dtype",
+                "payload.hidden_spec.dtype",
+            )
+        }
+    }
 
     private fun payloadFields(type: String): Set<String> = when (type) {
         HELLO -> setOf("node_id", "worker_kind", "min_version", "max_version", "capabilities")
