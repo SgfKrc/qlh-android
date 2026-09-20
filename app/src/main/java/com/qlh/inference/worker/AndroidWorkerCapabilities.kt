@@ -50,16 +50,22 @@ object AndroidWorkerCapabilities {
      *     整模型取 `layer_inp(K)` 当上游 hidden，裁层模型用 `llama_batch.embd`
      *     注入后续算取 argmax，与整模型 token 路径的 argmax 逐 token 比对。
      *     实测**两个 prompt、共 11 步全部 MATCH**（exit code 0）。
-     *   - ✅ **D/E（真机 ARM64）**：同一份源码经 NDK 交叉编译为 aarch64 可执行文件，
+     *   - ✅ **D/E（真机 ARM64 数值）**：同一份源码经 NDK 交叉编译为 aarch64 可执行文件，
      *     在 **Lenovo Y700（TB321FU / **SM8650 = Snapdragon 8 Gen 3** / Android 15 /
      *     `arm64-v8a`）**上重跑同一对照 ⇒ **5 步逐 token 全部 MATCH**（exit 0），
      *     且 token 序列与 x86_64 的 C+ **完全相同**（`576/9396/11/14019/9396`）。
      *     辅助判据：反汇编 `libggml-cpu.so` 统计到 `sdot`×1063、`smmla`×244
      *     ⇒ 确认跑的是 **dotprod + i8mm 快速 kernel**，**不是 baseline**。
-     *   - ⚠️ **仍未验证：APK 应用链路**。上述 D/E 证据来自 **Termux 里的原生可执行文件**，
-     *     它**绕过了** `qlh_llama_jni.cpp` 的 JNI 封装、Kotlin 执行器、协议 v3 编解码、
-     *     APK 打包签名与安装 —— **从未在真机上装过 APK**。
-     *     详见 `docs/安卓验证阶梯D-E层-真机Termux方案-2026-09-20.md` §2.1 与 §5.1。
+     *   - ✅ **D0（真机控制面）**：APK 经无线调试装到真机并启动，官方
+     *     `scripts/android_validation.py --install --launch` 得
+     *     `status = "native-worker-candidate"`（`jvm_and_build` /
+     *     `apk_device_control_plane` / `arm64_native_worker` **均 true**）。
+     *   - ⚠️ **仍未验证：APK 内部的层段能力**。
+     *     * D/E 数值证据来自 **Termux 里的原生可执行文件**，它**绕过了**
+     *       `qlh_llama_jni.cpp` 的 JNI 封装、Kotlin 执行器与协议 v3 编解码；
+     *     * D0 只证明「装得上 / 起得来 / ABI 对」，**没有跑过一次 `layer_forward`**。
+     *     ⇒ 要断言「APK 里的层段真的能用」，需 App 内入口或 instrumentation test。
+     *     详见 `docs/安卓验证阶梯D-E层-真机Termux方案-2026-09-20.md` §2.1 / §5.1 / §9.9。
      */
     val SUPPORTED_STAGE_TYPES: List<String> = listOf("full_inference", "layer_forward")
 
