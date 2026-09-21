@@ -1169,6 +1169,141 @@ Java_com_qlh_inference_service_LocalInferenceEngine_nativeLayerForwardHidden(
     return qlh_layer_forward_impl(env, model_ptr, j_hidden, n_tokens, pos_base, out_hidden);
 }
 
+// ---------------------------------------------------------------------------
+// ★ 2026-09-21：keep-head 中间段 —— 与主仓 `scripts/model_tools/keep_head_shim/qlh_keep_head.c`
+//   **同语义**（任何一侧改动必须同步，判据同为 per-token argmax）。
+//
+//   问题：上面的 `nativeLayerForwardHidden` 用 `llama_get_embeddings_ith` 取中间段输出，
+//   而该通道返回的是 **`output_norm(H)`** —— 比层接力上游/中间段所需的 hidden 多一次
+//   归一化（主仓实测：与 `RMSNorm(H)*model.norm.weight` 的 rel_err=0.0018 / cos=0.999998，
+//   同通道的端到端对照 first_mismatch=2）。拿它当中间段输出，下游会收到被多归一化一次
+//   的激活 ⇒ 三段链路必然分叉。
+//
+//   解：走补丁导出的 nextn 通道 —— `llama_set_embeddings_nextn(ctx, true, false)` +
+//   `llama_get_embeddings_nextn_ith(ctx, i)`，取**末层输出（output_norm 之前）**。
+//
+//   ⚠️ 前提：批次的**每个 token** 都必须标记输出（`batch.logits[i] = 1`）。`t_h_nextn`
+//      只对「有输出的行」计算，只标末位却按 n_tokens 读会撞 GGML_ASSERT
+//      "tensor read out of bounds"（主仓 shim 实测踩过，此处同样遵守）。
+//
+//   返回：末位置 argmax（≥0）；-1 形状/参数错；-3 = nextn 通道不可用（该架构没把末层
+//   输出挂到 t_h_nextn，或补丁未生效）—— 调用方必须 fail-closed，不得退回 embeddings 通道。
+static jint qlh_layer_forward_keep_head_impl(
+    JNIEnv * env,
+    jlong model_ptr,
+    jfloatArray j_hidden,
+    jint n_tokens,
+    jint pos_base,
+    jfloatArray out_hidden
+) {
+    if (model_ptr == 0 || j_hidden == nullptr || out_hidden == nullptr || n_tokens <= 0) {
+        return -1;
+    }
+    auto * qctx = reinterpret_cast<QlhLlamaContext *>(model_ptr);
+    if (qctx->ctx == nullptr || qctx->model == nullptr) {
+        return -1;
+    }
+
+    const int n_embd_inp = llama_model_n_embd_inp(qctx->model);
+    const jsize arr_len = env->GetArrayLength(j_hidden);
+    if (arr_len != (jsize) n_tokens * n_embd_inp) {
+        return -1;
+    }
+    if (env->GetArrayLength(out_hidden) != (jsize) n_embd_inp) {
+        return -1;
+    }
+
+    std::vector<float> hidden((size_t) arr_len);
+    env->GetFloatArrayRegion(j_hidden, 0, arr_len, hidden.data());
+    if (env->ExceptionCheck()) {
+        return -1;
+    }
+
+    // 与 Hidden 版一致：每步从零重算，先把正确性钉死（增量 KV 是后续优化位）。
+    llama_memory_t mem = llama_get_memory(qctx->ctx);
+    if (mem) {
+        llama_memory_clear(mem, true);
+    }
+
+    // ★ 开启 nextn 导出（unmasked ⇒ rows 按 token 稠密存放）
+    llama_set_embeddings_nextn(qctx->ctx, true, false);
+
+    llama_batch batch = llama_batch_init(n_tokens, n_embd_inp, /*n_seq_max=*/1);
+    if (batch.embd == nullptr) {
+        llama_set_embeddings_nextn(qctx->ctx, false, false);
+        return -1;
+    }
+    for (int i = 0; i < n_tokens; ++i) {
+        batch.pos[i] = pos_base + i;
+        batch.n_seq_id[i] = 1;
+        batch.seq_id[i][0] = 0;
+        batch.logits[i] = 1;   // ★ 每个 token 都标（见上文断言说明）
+    }
+    batch.n_tokens = n_tokens;
+    std::memcpy(batch.embd, hidden.data(), hidden.size() * sizeof(float));
+
+    // pos 按 n_pos_per_embd * n_tokens 重建（与 Hidden 版同一修法）。
+    {
+        const size_t pos_len = (size_t) QLH_LAYER_N_POS_PER_EMBD * (size_t) n_tokens;
+        auto * pos_ext = static_cast<llama_pos *>(malloc(pos_len * sizeof(llama_pos)));
+        if (pos_ext == nullptr) {
+            llama_batch_free(batch);
+            llama_set_embeddings_nextn(qctx->ctx, false, false);
+            return -1;
+        }
+        for (int j = 0; j < QLH_LAYER_N_POS_PER_EMBD; ++j) {
+            for (int i = 0; i < n_tokens; ++i) {
+                pos_ext[(size_t) j * (size_t) n_tokens + (size_t) i] = pos_base + i;
+            }
+        }
+        free(batch.pos);
+        batch.pos = pos_ext;
+    }
+
+    jint result = -1;
+    const int rc = llama_decode(qctx->ctx, batch);
+    if (rc == 0) {
+        const float * logits = llama_get_logits_ith(qctx->ctx, n_tokens - 1);
+        if (logits != nullptr) {
+            const int n_vocab = llama_vocab_n_tokens(qctx->vocab);
+            int best = 0;
+            for (int i = 1; i < n_vocab; ++i) {
+                if (logits[i] > logits[best]) {
+                    best = i;
+                }
+            }
+            result = (jint) best;
+        }
+        const float * hidden_out = llama_get_embeddings_nextn_ith(qctx->ctx, n_tokens - 1);
+        if (hidden_out == nullptr) {
+            llama_batch_free(batch);
+            llama_set_embeddings_nextn(qctx->ctx, false, false);
+            return -3;  // nextn 通道不可用 ⇒ 调用方 fail-closed
+        }
+        env->SetFloatArrayRegion(out_hidden, 0, (jsize) n_embd_inp, hidden_out);
+        if (env->ExceptionCheck()) {
+            llama_batch_free(batch);
+            llama_set_embeddings_nextn(qctx->ctx, false, false);
+            return -1;
+        }
+    }
+
+    llama_batch_free(batch);
+    // 复位：nextn 导出只服务本次中间段调用，不污染后续普通推理。
+    llama_set_embeddings_nextn(qctx->ctx, false, false);
+    return result;
+}
+
+// 层段前向（中间段，keep-head 语义）：吐**末层输出（output_norm 之前）**。
+extern "C" JNIEXPORT jint JNICALL
+Java_com_qlh_inference_service_LocalInferenceEngine_nativeLayerForwardHiddenKeepHead(
+    JNIEnv * env, jobject /* thiz */, jlong model_ptr,
+    jfloatArray j_hidden, jint n_tokens, jint pos_base, jfloatArray out_hidden
+) {
+    return qlh_layer_forward_keep_head_impl(env, model_ptr, j_hidden, n_tokens, pos_base,
+                                            out_hidden);
+}
+
 // 层段能力探测：上报本节点能否承层段、hidden 宽度、以及「层段运行必需的批量下限」。
 // 与 `AndroidWorkerCapabilities` 的「能力探测是单一来源」约定一致 —— 上层据此决定
 // 是否把本节点纳入层流水线，而不是靠 `if engine_type` 猜。
@@ -1208,5 +1343,11 @@ Java_com_qlh_inference_service_LocalInferenceEngine_nativeLayerForwardInfo(
         map_put(env, map, put_method, "middle_reason",
                 "extract_hidden_states not enabled at load time");
     }
+    // ★ 2026-09-21：中间段的**正确**通道。`extract_hidden`（embeddings 通道）给的是
+    //   `output_norm(H)`，比层接力所需的 hidden 多一次归一化，两者不可混用；
+    //   keep-head 走 nextn（末层输出，norm 之前）⇒ 与主仓 D→L / L→L / 三段语义一致。
+    //   能力单独上报：调用方据此选择通道，而不是靠 extract_hidden 猜。
+    map_put(env, map, put_method, "keep_head_middle", "true");
+    map_put(env, map, put_method, "middle_channel", "keep_head_nextn");
     return map;
 }

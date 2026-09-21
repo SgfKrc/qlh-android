@@ -499,12 +499,19 @@ class LocalInferenceEngine(private val context: Context) {
      * @param posBase 位置起点（每步可用绝对位置累加）
      * @param wantHidden 本节点是否为**中间段**（需要把输出 hidden 交给下一段）。
      *   若为 true 但模型未以 `extractHidden=true` 加载 ⇒ **失败**（不返回空 hidden）。
+     * @param keepHead ★ 中间段通道选择（默认 false，保持向后兼容）：
+     *   - `false` —— `extract_hidden`（embeddings 通道）。该通道返回的是
+     *     **`output_norm(H)`**，比层接力所需的 hidden **多一次归一化**，与主仓 D→L / L→L
+     *     的判据不一致；只应用于历史对照。
+     *   - `true` —— **keep-head（nextn）通道**，取末层输出（`output_norm` 之前），与主仓
+     *     `scripts/model_tools/keep_head_shim` 同语义。三段链路与跨框架接力必须用这个。
      */
     suspend fun layerForward(
         hidden: FloatArray,
         nTokens: Int,
         posBase: Int,
         wantHidden: Boolean,
+        keepHead: Boolean = false,
     ): Result<LayerForwardOutput> = withContext(Dispatchers.IO) {
         if (!isLoaded) {
             return@withContext Result.failure(IllegalStateException("model_not_loaded"))
@@ -515,12 +522,23 @@ class LocalInferenceEngine(private val context: Context) {
         try {
             if (wantHidden) {
                 val out = FloatArray(estimateEmbeddingWidth(hidden.size, nTokens))
-                val token = nativeLayerForwardHidden(modelPtr, hidden, nTokens, posBase, out)
+                // keep-head（nextn）通道给的是末层输出（output_norm 之前）—— 与主仓接力
+                // 上游/中间段同语义；embeddings 通道给的是 output_norm(H)，多一次归一化。
+                val token = if (keepHead) {
+                    nativeLayerForwardHiddenKeepHead(modelPtr, hidden, nTokens, posBase, out)
+                } else {
+                    nativeLayerForwardHidden(modelPtr, hidden, nTokens, posBase, out)
+                }
                 when (token) {
                     // -2 = native 侧报告「load 时未开启 extract_hidden_states」。
                     // 如实转成失败：中间段拿不到 hidden 就必须停，不能悄悄降级。
                     -2 -> return@withContext Result.failure(
                         IllegalStateException("extract_hidden_not_enabled")
+                    )
+                    // -3 = keep-head（nextn）通道不可用：该架构没把末层输出挂到 t_h_nextn。
+                    // 同样 fail-closed —— 绝不退回 embeddings 通道（那会多一次归一化）。
+                    -3 -> return@withContext Result.failure(
+                        IllegalStateException("keep_head_nextn_unavailable")
                     )
                     else -> Result.success(LayerForwardOutput(token, if (token >= 0) out else null))
                 }
@@ -699,6 +717,26 @@ class LocalInferenceEngine(private val context: Context) {
      * `outHidden` 的长度必须等于 `n_embd`；不符时不写入（仅返回 argmax）。
      */
     private external fun nativeLayerForwardHidden(
+        modelPtr: Long,
+        hidden: FloatArray,
+        nTokens: Int,
+        posBase: Int,
+        outHidden: FloatArray
+    ): Int
+
+    /**
+     * 层段前向（**中间段，keep-head 语义**）：把**末层输出（`output_norm` 之前）**拷回
+     * `outHidden`，供下一段继续接力。
+     *
+     * 与 [nativeLayerForwardHidden] 的区别只在 hidden 通道：那个走 `extract_hidden`
+     * （embeddings 通道，返回 `output_norm(H)`，多一次归一化）；本方法走补丁导出的
+     * nextn 通道（末层输出，norm 之前），与主仓 `scripts/model_tools/keep_head_shim`
+     * 同语义 —— 三段链路/跨框架接力必须用这个通道。
+     *
+     * 返回末位 argmax；`-1` = 形状/参数错；`-3` = nextn 通道不可用（调用方 fail-closed，
+     * **不得**退回 embeddings 通道）。
+     */
+    private external fun nativeLayerForwardHiddenKeepHead(
         modelPtr: Long,
         hidden: FloatArray,
         nTokens: Int,
