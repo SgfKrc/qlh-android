@@ -50,6 +50,7 @@ class ModelManager(private val context: Context) {
         const val STORAGE_MODE_INTERNAL_TEST = "internal_test"
 
         private const val GGUF_EXTENSION = ".gguf"
+        private const val JSON_EXTENSION = ".json"
     }
 
     private val settings = SettingsDataStore(context)
@@ -172,6 +173,13 @@ class ModelManager(private val context: Context) {
 
     suspend fun getSelectedModelUri(): String = settings.getSelectedModelUri()
 
+    /** Compute the selected GGUF identity used by the authenticated task worker. */
+    suspend fun getSelectedModelSha256(): String = withContext(Dispatchers.IO) {
+        val selected = settings.getSelectedModelUri()
+        if (selected.isBlank()) return@withContext ""
+        runCatching { computeSha256(Uri.parse(selected)) }.getOrDefault("")
+    }
+
     suspend fun isModelReady(): Boolean = withContext(Dispatchers.IO) {
         val selected = getSelectedModel()
         if (selected != null && selected.sizeBytes != 0L) {
@@ -245,6 +253,123 @@ class ModelManager(private val context: Context) {
                 Result.failure(e)
             }
         }
+
+    /**
+     * Resolve and verify the GGUF artifact for one layer stage.
+     *
+     * Layer stages never fall back to the selected full model. A manifest is
+     * required so the loaded GGUF geometry cannot silently disagree with the
+     * coordinator's half-open layer range.
+     */
+    suspend fun openLayerModelForLlama(
+        layerRange: List<Int>,
+        expectedModelSha256: String = "",
+        preferFd: Boolean = true,
+    ): Result<LayerArtifactHandle> = withContext(Dispatchers.IO) {
+        if (layerRange.size != 2 || layerRange[1] <= layerRange[0] || layerRange[0] < 0) {
+            return@withContext Result.failure(IOException("invalid layer range"))
+        }
+        val artifacts = listLayerArtifacts(
+            expectedModelSha256 = expectedModelSha256,
+            verifyArtifactDigest = true,
+        ).getOrElse { return@withContext Result.failure(it) }
+        val artifact = artifacts.firstOrNull {
+            it.startLayer == layerRange[0] && it.endLayerExclusive == layerRange[1]
+        } ?: return@withContext Result.failure(
+            IOException("layer artifact not found for [${layerRange[0]}, ${layerRange[1]})")
+        )
+
+        openModelHandle(artifact.document.uri, preferFd).map { handle ->
+            LayerArtifactHandle(
+                handle = handle,
+                startLayer = artifact.startLayer,
+                endLayerExclusive = artifact.endLayerExclusive,
+                sourceModelSha256 = artifact.sourceModelSha256,
+                artifactSha256 = artifact.artifactSha256,
+            )
+        }
+    }
+
+    /** Return manifests whose artifact files are present in the selected model root. */
+    suspend fun listLayerArtifacts(
+        expectedModelSha256: String = "",
+        verifyArtifactDigest: Boolean = false,
+    ): Result<List<LayerArtifact>> = withContext(Dispatchers.IO) {
+        try {
+            val treeUri = getSavedTreeUri()
+            val modelDocuments = if (treeUri != null && hasPersistedPermission(treeUri)) {
+                listSafModels(treeUri)
+            } else {
+                modelsDir.listFiles { file ->
+                    file.isFile && file.name.endsWith(GGUF_EXTENSION, true)
+                }?.map {
+                    ModelDocument(it.name, Uri.fromFile(it), it.length(), ModelSource.INTERNAL)
+                }.orEmpty()
+            }
+            val manifests = if (treeUri != null && hasPersistedPermission(treeUri)) {
+                listSafFiles(treeUri, setOf(JSON_EXTENSION))
+            } else {
+                modelsDir.listFiles { file ->
+                    file.isFile && file.name.endsWith(JSON_EXTENSION, true)
+                }?.map {
+                    ModelDocument(it.name, Uri.fromFile(it), it.length(), ModelSource.INTERNAL)
+                }.orEmpty()
+            }
+            val expected = expectedModelSha256.trim().lowercase()
+            val output = mutableListOf<LayerArtifact>()
+            for (manifest in manifests) {
+                val raw = readDocument(manifest.uri) ?: continue
+                val descriptor = LayerArtifactManifestParser
+                    .parse(raw, manifest.name).getOrNull() ?: continue
+                if (expected.isNotBlank() && descriptor.sourceModelSha256 != expected) continue
+                val document = modelDocuments.firstOrNull {
+                    it.name.equals(descriptor.artifactName, ignoreCase = true)
+                } ?: continue
+                if (verifyArtifactDigest &&
+                    computeSha256(document.uri).equals(descriptor.artifactSha256, ignoreCase = true).not()
+                ) {
+                    Log.w(TAG, "layer artifact digest mismatch: ${document.name}")
+                    continue
+                }
+                output += LayerArtifact(
+                    document = document,
+                    manifest = manifest,
+                    startLayer = descriptor.startLayer,
+                    endLayerExclusive = descriptor.endLayerExclusive,
+                    artifactSha256 = descriptor.artifactSha256,
+                    sourceModelSha256 = descriptor.sourceModelSha256,
+                    architecture = descriptor.architecture,
+                )
+            }
+            Result.success(output.distinctBy { "${it.startLayer}:${it.endLayerExclusive}:${it.document.uri}" })
+        } catch (error: Exception) {
+            Log.e(TAG, "layer artifact scan failed", error)
+            Result.failure(error)
+        }
+    }
+
+    private suspend fun openModelHandle(uri: Uri, preferFd: Boolean): Result<ModelOpenHandle> {
+        if (uri.scheme == "content") {
+            if (preferFd && settings.getModelStorageMode() != STORAGE_MODE_SAF_CACHE) {
+                val fdResult = openSafFd(uri)
+                if (fdResult.isSuccess) return fdResult
+            }
+            return openSafCachedCopy(uri)
+        }
+        val file = File(uri.path ?: uri.toString())
+        if (!file.exists() || !file.canRead()) {
+            return Result.failure(IOException("model artifact is not readable: ${file.name}"))
+        }
+        return Result.success(
+            ModelOpenHandle(
+                loadPath = file.absolutePath,
+                displayName = file.name,
+                sourceUri = Uri.fromFile(file),
+                mode = STORAGE_MODE_INTERNAL_TEST,
+                pfd = null,
+            )
+        )
+    }
 
     /** Open the fixed Gemma4 mmproj from the same user-owned storage root. */
     suspend fun openGemma4MmprojForLlama(preferFd: Boolean = true): Result<ModelOpenHandle> =
@@ -357,6 +482,20 @@ class ModelManager(private val context: Context) {
             .sortedBy { it.name.lowercase() }
     }
 
+    private fun listSafFiles(treeUri: Uri, extensions: Set<String>): List<ModelDocument> {
+        val treeDocumentId = DocumentsContract.getTreeDocumentId(treeUri)
+        val files = mutableListOf<ModelDocument>()
+        collectSafModels(
+            treeUri = treeUri,
+            parentDocumentId = treeDocumentId,
+            output = files,
+            depth = 0,
+            maxDepth = 2,
+            extensions = extensions,
+        )
+        return files.distinctBy { it.uri.toString() }.sortedBy { it.name.lowercase() }
+    }
+
     /**
      * 递归扫描 SAF 目录。MVP 限制为 2 层，覆盖常见 Download/QLH/models 场景，
      * 避免用户误选 Download 根目录时完全扫不到模型。
@@ -366,7 +505,8 @@ class ModelManager(private val context: Context) {
         parentDocumentId: String,
         output: MutableList<ModelDocument>,
         depth: Int,
-        maxDepth: Int
+        maxDepth: Int,
+        extensions: Set<String> = setOf(GGUF_EXTENSION),
     ) {
         val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentDocumentId)
         val projection = arrayOf(
@@ -394,13 +534,14 @@ class ModelManager(private val context: Context) {
                             parentDocumentId = documentId,
                             output = output,
                             depth = depth + 1,
-                            maxDepth = maxDepth
+                            maxDepth = maxDepth,
+                            extensions = extensions,
                         )
                     }
                     continue
                 }
 
-                if (!name.endsWith(GGUF_EXTENSION, ignoreCase = true)) continue
+                if (extensions.none { name.endsWith(it, ignoreCase = true) }) continue
 
                 val documentUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, documentId)
                 val sizeBytes = if (sizeIndex >= 0 && !cursor.isNull(sizeIndex)) {
@@ -545,6 +686,17 @@ class ModelManager(private val context: Context) {
                 }
             }
         return -1L
+    }
+
+    private fun readDocument(uri: Uri): String? = try {
+        if (uri.scheme == "file") {
+            File(uri.path.orEmpty()).readText()
+        } else {
+            context.contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
+        }
+    } catch (error: Exception) {
+        Log.w(TAG, "cannot read layer manifest: ${error.message}")
+        null
     }
 
     // ================================================================
@@ -767,10 +919,15 @@ class ModelManager(private val context: Context) {
 
     private fun computeSha256(uri: Uri): String {
         val digest = MessageDigest.getInstance("SHA-256")
-        context.contentResolver.openInputStream(uri)?.use { input ->
+        val input = if (uri.scheme == "file") {
+            File(uri.path.orEmpty()).inputStream()
+        } else {
+            context.contentResolver.openInputStream(uri)
+        }
+        input?.use { stream ->
             val buffer = ByteArray(1024 * 1024)
             while (true) {
-                val count = input.read(buffer)
+                val count = stream.read(buffer)
                 if (count < 0) break
                 digest.update(buffer, 0, count)
             }
@@ -978,6 +1135,24 @@ class ModelManager(private val context: Context) {
         val uri: Uri,
         val sizeBytes: Long,
         val source: ModelSource
+    )
+
+    data class LayerArtifact(
+        val document: ModelDocument,
+        val manifest: ModelDocument,
+        val startLayer: Int,
+        val endLayerExclusive: Int,
+        val artifactSha256: String,
+        val sourceModelSha256: String,
+        val architecture: String,
+    )
+
+    data class LayerArtifactHandle(
+        val handle: ModelOpenHandle,
+        val startLayer: Int,
+        val endLayerExclusive: Int,
+        val sourceModelSha256: String,
+        val artifactSha256: String,
     )
 
     data class ModelOpenHandle(

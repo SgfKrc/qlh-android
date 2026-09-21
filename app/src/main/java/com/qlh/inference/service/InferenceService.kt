@@ -167,6 +167,7 @@ class InferenceService : Service() {
         extractHidden: Boolean = false,
     ): Result<Unit> {
         val eng = engine ?: return Result.failure(IllegalStateException("Service 未初始化"))
+        val gpuLayers = preferredGpuLayers(eng)
 
         val selectedUri = modelManager.getSelectedModelUri()
         // ★ 2026-09-20 修 BUG：短路判据原先只看「同一个 URI」。
@@ -174,7 +175,9 @@ class InferenceService : Service() {
         //   若视为等价，层段做中间段时会一直取不到 hidden（静默失败）。
         //   故把 loadedExtractHidden 一并纳入判据。
         if (eng.isLoaded && eng.loadedModelSourceUri == selectedUri &&
-            eng.loadedExtractHidden == extractHidden
+            eng.loadedExtractHidden == extractHidden &&
+            eng.loadedLayerRange.isEmpty() &&
+            eng.loadedGpuLayers == gpuLayers
         ) {
             return Result.success(Unit)
         }
@@ -202,7 +205,12 @@ class InferenceService : Service() {
         }
 
         val handle = handleResult.getOrThrow()
-        val fdResult = eng.loadModel(handle, contextSize, extractHidden)
+        val fdResult = eng.loadModel(
+            handle = handle,
+            contextSize = contextSize,
+            extractHidden = extractHidden,
+            gpuLayers = gpuLayers,
+        )
         if (fdResult.isSuccess) {
             return fdResult
         }
@@ -221,7 +229,83 @@ class InferenceService : Service() {
         val fallbackHandle = modelManager.openModelForLlama(preferFd = false).getOrElse {
             return Result.failure(fdResult.exceptionOrNull() ?: it)
         }
-        return eng.loadModel(fallbackHandle, contextSize, extractHidden)
+        return eng.loadModel(
+            handle = fallbackHandle,
+            contextSize = contextSize,
+            extractHidden = extractHidden,
+            gpuLayers = gpuLayers,
+        )
+    }
+
+    /** Load the exact crop GGUF requested by an Android layer worker offer. */
+    suspend fun ensureLayerModelLoaded(
+        layerRange: List<Int>,
+        contextSize: Int = 2048,
+        extractHidden: Boolean = false,
+        expectedModelSha256: String = "",
+        expectedEmbeddingWidth: Int = 0,
+    ): Result<Unit> {
+        val eng = engine ?: return Result.failure(IllegalStateException("Service 未初始化"))
+        if (layerRange.size != 2 || layerRange[1] <= layerRange[0] || layerRange[0] < 0) {
+            return Result.failure(IllegalArgumentException("invalid layer range"))
+        }
+        val gpuLayers = preferredGpuLayers(eng)
+        if (eng.isLoaded && eng.loadedLayerRange == layerRange &&
+            eng.loadedExtractHidden == extractHidden && eng.loadedGpuLayers == gpuLayers
+        ) {
+            return validateLayerModel(eng, layerRange, expectedEmbeddingWidth)
+        }
+        if (eng.isLoaded) eng.unloadModel()
+
+        suspend fun load(preferFd: Boolean): Result<Unit> {
+            val artifact = modelManager.openLayerModelForLlama(
+                layerRange = layerRange,
+                expectedModelSha256 = expectedModelSha256,
+                preferFd = preferFd,
+            ).getOrElse { return Result.failure(it) }
+            val loaded = eng.loadModel(
+                handle = artifact.handle,
+                contextSize = contextSize,
+                extractHidden = extractHidden,
+                gpuLayers = gpuLayers,
+                layerRange = layerRange,
+            )
+            if (loaded.isFailure) return loaded
+            return validateLayerModel(eng, layerRange, expectedEmbeddingWidth)
+        }
+
+        val first = load(preferFd = true)
+        if (first.isSuccess) return first
+        Log.w(TAG, "layer artifact fd load failed; retrying cached copy")
+        if (eng.isLoaded) eng.unloadModel()
+        return load(preferFd = false)
+    }
+
+    private suspend fun validateLayerModel(
+        eng: LocalInferenceEngine,
+        layerRange: List<Int>,
+        expectedEmbeddingWidth: Int,
+    ): Result<Unit> {
+        val info = eng.layerForwardInfo().getOrElse { return Result.failure(it) }
+        val expectedLayers = layerRange[1] - layerRange[0]
+        val actualLayers = info["n_layer"]?.toIntOrNull() ?: 0
+        if (actualLayers != expectedLayers) {
+            return Result.failure(
+                IllegalStateException("layer_artifact_mismatch:n_layer=$actualLayers expected=$expectedLayers")
+            )
+        }
+        if (expectedEmbeddingWidth > 0 && info["n_embd"]?.toIntOrNull() != expectedEmbeddingWidth) {
+            return Result.failure(IllegalStateException("layer_artifact_mismatch:n_embd"))
+        }
+        return Result.success(Unit)
+    }
+
+    private suspend fun preferredGpuLayers(eng: LocalInferenceEngine): Int {
+        val backend = eng.getBackendInfo().getOrNull().orEmpty()
+        val devices = backend["backend_devices"].orEmpty()
+        return if (backend.bool("supports_gpu_offload") &&
+            (devices.contains("(gpu)") || devices.contains("(igpu)"))
+        ) -1 else 0
     }
 
     suspend fun unloadModel(): Result<Unit> {

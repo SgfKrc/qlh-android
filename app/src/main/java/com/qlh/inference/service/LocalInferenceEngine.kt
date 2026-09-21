@@ -73,6 +73,16 @@ class LocalInferenceEngine(private val context: Context) {
     var loadedExtractHidden: Boolean = false
         private set
 
+    /** Source-model range represented by the loaded GGUF; empty means full model. */
+    @Volatile
+    var loadedLayerRange: List<Int> = emptyList()
+        private set
+
+    /** llama.cpp offload setting used for the loaded model (-1 means all layers). */
+    @Volatile
+    var loadedGpuLayers: Int = 0
+        private set
+
     /** Whether a verified/loaded MTMD projector is attached to the model. */
     @Volatile
     var multimodalLoaded: Boolean = false
@@ -138,7 +148,9 @@ class LocalInferenceEngine(private val context: Context) {
     suspend fun loadModel(
         modelPath: String,
         contextSize: Int = DEFAULT_CONTEXT_SIZE,
-        extractHidden: Boolean = false
+        extractHidden: Boolean = false,
+        gpuLayers: Int = 0,
+        layerRange: List<Int>? = null,
     ): Result<Unit> = withContext(Dispatchers.IO) {
         val libResult = ensureNativeLibraryLoaded()
         if (libResult.isFailure) {
@@ -163,7 +175,7 @@ class LocalInferenceEngine(private val context: Context) {
         }
 
         try {
-            val ptr = nativeLoadModel(modelPath, contextSize, extractHidden)
+            val ptr = nativeLoadModel(modelPath, contextSize, extractHidden, gpuLayers)
             if (ptr == 0L) {
                 return@withContext Result.failure(
                     IllegalStateException("模型加载失败（native 返回空指针）: $modelPath")
@@ -173,6 +185,8 @@ class LocalInferenceEngine(private val context: Context) {
             loadedModelPath = modelPath
             loadedModelSourceUri = ""
             loadedExtractHidden = extractHidden
+            loadedLayerRange = layerRange.orEmpty()
+            loadedGpuLayers = gpuLayers
             Log.i(TAG, "模型加载成功: $modelPath (context=$contextSize, ptr=$ptr)")
             Result.success(Unit)
         } catch (e: Exception) {
@@ -189,7 +203,9 @@ class LocalInferenceEngine(private val context: Context) {
     suspend fun loadModel(
         handle: ModelManager.ModelOpenHandle,
         contextSize: Int = DEFAULT_CONTEXT_SIZE,
-        extractHidden: Boolean = false
+        extractHidden: Boolean = false,
+        gpuLayers: Int = 0,
+        layerRange: List<Int>? = null,
     ): Result<Unit> = withContext(Dispatchers.IO) {
         val libResult = ensureNativeLibraryLoaded()
         if (libResult.isFailure) {
@@ -219,7 +235,7 @@ class LocalInferenceEngine(private val context: Context) {
         }
 
         try {
-            val ptr = nativeLoadModel(modelPath, contextSize, extractHidden)
+            val ptr = nativeLoadModel(modelPath, contextSize, extractHidden, gpuLayers)
             if (ptr == 0L) {
                 handle.close()
                 return@withContext Result.failure(
@@ -230,6 +246,8 @@ class LocalInferenceEngine(private val context: Context) {
             loadedModelPath = modelPath
             loadedModelSourceUri = handle.sourceUri.toString()
             loadedExtractHidden = extractHidden
+            loadedLayerRange = layerRange.orEmpty()
+            loadedGpuLayers = gpuLayers
             modelOpenHandle = handle
             Log.i(
                 TAG,
@@ -331,6 +349,8 @@ class LocalInferenceEngine(private val context: Context) {
             loadedModelPath = ""
             loadedModelSourceUri = ""
             loadedExtractHidden = false
+            loadedLayerRange = emptyList()
+            loadedGpuLayers = 0
         }
         modelOpenHandle?.close()
         modelOpenHandle = null
@@ -562,7 +582,12 @@ class LocalInferenceEngine(private val context: Context) {
      * 加载 GGUF 模型。
      * @return 模型指针（> 0 成功，0 失败）
      */
-    private external fun nativeLoadModel(path: String, nCtx: Int, extractHidden: Boolean): Long
+    private external fun nativeLoadModel(
+        path: String,
+        nCtx: Int,
+        extractHidden: Boolean,
+        gpuLayers: Int,
+    ): Long
 
     /** 释放模型内存 */
     private external fun nativeFreeModel(modelPtr: Long)

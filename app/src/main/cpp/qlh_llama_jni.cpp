@@ -39,6 +39,7 @@ struct QlhLlamaContext {
     int n_ctx = 0;
     int n_threads = 0;
     int n_threads_batch = 0;
+    int n_gpu_layers = 0;
     //: ★ 2026-09-20（层段）：context 是否开启了隐藏态导出。只有为 true 时
     //: `llama_get_embeddings_ith` 才有值 ⇒ 中间层段节点必须以此为前提，
     //: `nativeLayerForwardHidden` 据此**如实报错**而不是回退成空 hidden。
@@ -215,7 +216,8 @@ Java_com_qlh_inference_service_LocalInferenceEngine_nativeLoadModel(
     jobject /* thiz */,
     jstring j_path,
     jint j_n_ctx,
-    jboolean j_extract_hidden
+    jboolean j_extract_hidden,
+    jint j_gpu_layers
 ) {
     ensure_backend_initialized();
 
@@ -229,7 +231,11 @@ Java_com_qlh_inference_service_LocalInferenceEngine_nativeLoadModel(
     QLH_LOGI("loading model: %s", model_path.c_str());
 
     llama_model_params model_params = llama_model_default_params();
-    model_params.n_gpu_layers = 0;
+    model_params.n_gpu_layers = std::max(-1, static_cast<int>(j_gpu_layers));
+    if (!llama_supports_gpu_offload() && model_params.n_gpu_layers != 0) {
+        QLH_LOGW("GPU offload requested but no llama backend is available; using CPU");
+        model_params.n_gpu_layers = 0;
+    }
 
     llama_model * model = llama_model_load_from_file(model_path.c_str(), model_params);
     if (model == nullptr) {
@@ -281,11 +287,12 @@ Java_com_qlh_inference_service_LocalInferenceEngine_nativeLoadModel(
     qctx->n_ctx = static_cast<int>(llama_n_ctx(ctx));
     qctx->n_threads = llama_n_threads(ctx);
     qctx->n_threads_batch = llama_n_threads_batch(ctx);
+    qctx->n_gpu_layers = model_params.n_gpu_layers;
     qctx->extract_hidden = (j_extract_hidden == JNI_TRUE);
 
-    QLH_LOGI("model loaded: ctx=%d n_batch=%u extract_hidden=%d threads=%d",
+    QLH_LOGI("model loaded: ctx=%d n_batch=%u extract_hidden=%d gpu_layers=%d threads=%d",
              qctx->n_ctx, ctx_params.n_batch,
-             ctx_params.embeddings ? 1 : 0, n_threads);
+             ctx_params.embeddings ? 1 : 0, qctx->n_gpu_layers, n_threads);
     return reinterpret_cast<jlong>(qctx);
 }
 
@@ -704,7 +711,10 @@ Java_com_qlh_inference_service_LocalInferenceEngine_nativeGetModelInfo(
     put("n_threads", std::to_string(qctx->n_threads));
     put("n_threads_batch", std::to_string(qctx->n_threads_batch));
     put("ftype", std::to_string(static_cast<int>(llama_model_ftype(qctx->model))));
-    put("backend", "llama.cpp Android CPU");
+    put("backend", qctx->n_gpu_layers == 0
+        ? "llama.cpp Android CPU"
+        : "llama.cpp Android GPU offload");
+    put("n_gpu_layers", std::to_string(qctx->n_gpu_layers));
     put("supports_gpu_offload", llama_supports_gpu_offload() ? "true" : "false");
     put("estimated_kv_memory_mb", std::to_string(estimate_kv_memory_mb(qctx, qctx->n_ctx)));
 
