@@ -110,6 +110,7 @@ object AndroidWorkerCapabilities {
         modelSha256: String = "",
         resourceAdmitted: Boolean = false,
         resourceReason: String = "resource_gate_not_confirmed",
+        layerRanges: List<List<Int>> = emptyList(),
     ): Map<String, Any?> {
         val normalizedReason = if (resourceAdmitted) "" else resourceReason.ifBlank {
             "resource_gate_not_confirmed"
@@ -117,8 +118,15 @@ object AndroidWorkerCapabilities {
         val model = modelIdentity(
             modelId, modelFormat, modelRevision, modelSha256, resourceAdmitted,
         )
-        return mapOf(
-            "stage_types" to SUPPORTED_STAGE_TYPES,
+        val normalizedRanges = layerRanges
+            .filter { it.size == 2 && it[0] >= 0 && it[1] > it[0] }
+            .distinct()
+        val capabilities = linkedMapOf<String, Any?>(
+            "stage_types" to if (normalizedRanges.isEmpty()) {
+                listOf("full_inference")
+            } else {
+                SUPPORTED_STAGE_TYPES
+            },
             "engines" to SUPPORTED_ENGINES,
             "models" to (model?.let { listOf(it) } ?: emptyList<Map<String, Any?>>()),
             "max_concurrency" to 1,
@@ -127,5 +135,7 @@ object AndroidWorkerCapabilities {
                 "reason_code" to normalizedReason,
             ),
         )
+        if (normalizedRanges.isNotEmpty()) capabilities["layer_ranges"] = normalizedRanges
+        return capabilities
     }
 }

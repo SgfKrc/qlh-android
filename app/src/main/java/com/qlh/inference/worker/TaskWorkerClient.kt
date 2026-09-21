@@ -22,7 +22,10 @@ import java.io.EOFException
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.nio.charset.StandardCharsets
+import java.util.Locale
 import java.util.UUID
+import javax.crypto.Mac
+import javax.crypto.spec.SecretKeySpec
 import com.google.gson.GsonBuilder
 import com.google.gson.JsonParser
 
@@ -289,8 +292,27 @@ class TaskWorkerStateMachine(
 interface TaskWorkerTransport {
     suspend fun send(envelope: TaskWorkerEnvelope)
     suspend fun receive(): TaskWorkerEnvelope?
+    suspend fun receiveEvent(): TaskWorkerInboundEvent =
+        receive()?.let { TaskWorkerInboundEvent.Envelope(it) }
+            ?: TaskWorkerInboundEvent.Closed
+    suspend fun sendHeartbeat(nodeId: String, sentAtMs: Long) = Unit
     suspend fun close()
 }
+
+sealed class TaskWorkerInboundEvent {
+    data class Envelope(val value: TaskWorkerEnvelope) : TaskWorkerInboundEvent()
+    data object HeartbeatAck : TaskWorkerInboundEvent()
+    data object Closed : TaskWorkerInboundEvent()
+}
+
+data class TaskWorkerRegistration(
+    val nodeId: String,
+    val clusterSecret: String,
+    val hostname: String,
+    val networkType: String,
+    val deviceInfo: Map<String, Any?>,
+    val modelSha256: String = "",
+)
 
 fun interface TaskWorkerTransportFactory {
     suspend fun connect(host: String, port: Int): TaskWorkerTransport
@@ -306,9 +328,9 @@ class SocketTaskWorkerTransport(
     private val sendLock = Any()
     private val gson = GsonBuilder().disableHtmlEscaping().create()
 
-    override suspend fun send(envelope: TaskWorkerEnvelope) = withContext(Dispatchers.IO) {
-        val inner = TaskWorkerProtocol.encode(envelope).toString(StandardCharsets.UTF_8)
-        val outer = "{\"type\":\"task_worker\",\"format\":\"json\",\"data\":$inner}"
+    private suspend fun sendOuter(type: String, data: Any? = null) = withContext(Dispatchers.IO) {
+        val dataJson = data?.let { ",\"data\":${gson.toJson(it)}" } ?: ""
+        val outer = "{\"type\":\"$type\",\"format\":\"json\"$dataJson}"
             .toByteArray(StandardCharsets.UTF_8)
         if (outer.size > maxFrameBytes) throw TaskWorkerProtocolException(
             "task worker frame exceeds maximum size",
@@ -322,7 +344,24 @@ class SocketTaskWorkerTransport(
         }
     }
 
-    override suspend fun receive(): TaskWorkerEnvelope? = withContext(Dispatchers.IO) {
+    override suspend fun send(envelope: TaskWorkerEnvelope) = withContext(Dispatchers.IO) {
+        val inner = TaskWorkerProtocol.encode(envelope).toString(StandardCharsets.UTF_8)
+        sendOuterJson("{\"type\":\"task_worker\",\"format\":\"json\",\"data\":$inner}")
+    }
+
+    private suspend fun sendOuterJson(json: String) = withContext(Dispatchers.IO) {
+        val outer = json.toByteArray(StandardCharsets.UTF_8)
+        if (outer.size > maxFrameBytes) throw TaskWorkerProtocolException(
+            "task worker frame exceeds maximum size", "message_too_large", "message",
+        )
+        synchronized(sendLock) {
+            output.writeInt(outer.size)
+            output.write(outer)
+            output.flush()
+        }
+    }
+
+    private suspend fun receiveOuter(): com.google.gson.JsonObject? = withContext(Dispatchers.IO) {
         val size = try {
             input.readInt()
         } catch (_: EOFException) {
@@ -342,16 +381,81 @@ class SocketTaskWorkerTransport(
         }
         if (!root.isJsonObject) throw TaskWorkerProtocolException("task worker frame must be an object", "invalid_frame", "message")
         val objectValue = root.asJsonObject
-        if (objectValue.get("type")?.asString != "task_worker" ||
-            objectValue.get("format")?.asString != "json"
-        ) {
-            throw TaskWorkerProtocolException("unexpected task worker frame", "invalid_frame", "message")
+        if (objectValue.get("format")?.asString != "json") {
+            throw TaskWorkerProtocolException("unexpected task worker frame", "invalid_frame", "format")
         }
-        val data = objectValue.get("data")
-        if (data == null || !data.isJsonObject) {
-            throw TaskWorkerProtocolException("task worker frame has no data object", "invalid_frame", "data")
+        objectValue
+    }
+
+    suspend fun register(registration: TaskWorkerRegistration) {
+        require(registration.nodeId.isNotBlank()) { "node id must not be blank" }
+        require(registration.clusterSecret.isNotBlank()) { "cluster secret must not be blank" }
+        val timestamp = System.currentTimeMillis() / 1000.0
+        val authMessage = String.format(Locale.US, "%s:%.6f", registration.nodeId, timestamp)
+        val mac = Mac.getInstance("HmacSHA256")
+        mac.init(SecretKeySpec(registration.clusterSecret.toByteArray(StandardCharsets.UTF_8), "HmacSHA256"))
+        val signature = mac.doFinal(authMessage.toByteArray(StandardCharsets.UTF_8))
+            .joinToString("") { "%02x".format(Locale.US, it) }
+        sendOuter(
+            "register",
+            mapOf(
+                "client_id" to registration.nodeId,
+                "role" to "client",
+                "node_type" to "android",
+                "hostname" to registration.hostname,
+                "network_type" to registration.networkType,
+                "advertised_host" to "",
+                "advertised_port" to 8888,
+                "advertised_address" to "",
+                "device_info" to registration.deviceInfo,
+                "model_sha256" to registration.modelSha256,
+                "auth" to mapOf(
+                    "auth_timestamp" to timestamp,
+                    "auth_signature" to signature,
+                ),
+            ),
+        )
+        val ack = receiveOuter() ?: throw EOFException("coordinator closed during register")
+        if (ack.get("type")?.asString != "register") {
+            throw TaskWorkerProtocolException("expected register acknowledgement", "unexpected_message_type", "type")
         }
-        TaskWorkerProtocol.decode(gson.toJson(data).toByteArray(StandardCharsets.UTF_8))
+        val data = ack.getAsJsonObject("data")
+        if (data?.get("status")?.asString != "registered") {
+            throw TaskWorkerProtocolException(
+                data?.get("reason")?.asString ?: "coordinator rejected registration",
+                "registration_rejected", "data.status",
+            )
+        }
+    }
+
+    override suspend fun receiveEvent(): TaskWorkerInboundEvent {
+        val objectValue = receiveOuter() ?: return TaskWorkerInboundEvent.Closed
+        return when (objectValue.get("type")?.asString) {
+            "task_worker" -> {
+                val data = objectValue.get("data")
+                if (data == null || !data.isJsonObject) {
+                    throw TaskWorkerProtocolException("task worker frame has no data object", "invalid_frame", "data")
+                }
+                TaskWorkerInboundEvent.Envelope(
+                    TaskWorkerProtocol.decode(gson.toJson(data).toByteArray(StandardCharsets.UTF_8))
+                )
+            }
+            "heartbeat_ack" -> TaskWorkerInboundEvent.HeartbeatAck
+            "node_list_sync", "node_update", "layer_config" -> receiveEvent()
+            else -> throw TaskWorkerProtocolException("unexpected task worker frame", "invalid_frame", "message")
+        }
+    }
+
+    override suspend fun receive(): TaskWorkerEnvelope? = when (val event = receiveEvent()) {
+        is TaskWorkerInboundEvent.Envelope -> event.value
+        TaskWorkerInboundEvent.Closed -> null
+        TaskWorkerInboundEvent.HeartbeatAck -> throw TaskWorkerProtocolException(
+            "heartbeat acknowledgement is not a task worker envelope", "unexpected_message_type", "type",
+        )
+    }
+
+    override suspend fun sendHeartbeat(nodeId: String, sentAtMs: Long) {
+        sendOuter("heartbeat", mapOf("client_id" to nodeId, "t_send" to sentAtMs))
     }
 
     override suspend fun close() {
@@ -364,6 +468,7 @@ class SocketTaskWorkerTransport(
 class SocketTaskWorkerTransportFactory(
     private val connectTimeoutMs: Int = 8_000,
     private val readTimeoutMs: Int = 45_000,
+    private val registration: TaskWorkerRegistration? = null,
 ) : TaskWorkerTransportFactory {
     override suspend fun connect(host: String, port: Int): TaskWorkerTransport = withContext(Dispatchers.IO) {
         require(port in 1..65535) { "port must be between 1 and 65535" }
@@ -371,7 +476,14 @@ class SocketTaskWorkerTransportFactory(
         val socket = Socket()
         socket.connect(InetSocketAddress(normalizedHost, port), connectTimeoutMs)
         socket.soTimeout = readTimeoutMs
-        SocketTaskWorkerTransport(socket)
+        val transport = SocketTaskWorkerTransport(socket)
+        try {
+            registration?.let { transport.register(it) }
+            transport
+        } catch (error: Exception) {
+            transport.close()
+            throw error
+        }
     }
 }
 
@@ -390,7 +502,9 @@ class TaskWorkerClient(
     private val port: Int,
     private val nodeId: String,
     private val capabilities: () -> Map<String, Any?>,
-    private val transportFactory: TaskWorkerTransportFactory = SocketTaskWorkerTransportFactory(),
+    private val registration: TaskWorkerRegistration? = null,
+    private val transportFactory: TaskWorkerTransportFactory =
+        SocketTaskWorkerTransportFactory(registration = registration),
     private val stageHandler: TaskWorkerStageHandler? = null,
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
     private val clockMs: () -> Long = { System.currentTimeMillis() },
@@ -400,6 +514,7 @@ class TaskWorkerClient(
     private var loopJob: Job? = null
     private var transport: TaskWorkerTransport? = null
     private var executionJob: Job? = null
+    private var heartbeatJob: Job? = null
 
     val snapshot: StateFlow<TaskWorkerSnapshot> = mutableSnapshot.asStateFlow()
 
@@ -418,6 +533,7 @@ class TaskWorkerClient(
         machine.fail(identity, errorCode, retryable = true)
         publish()
         executionJob?.cancel()
+        heartbeatJob?.cancel()
         scope.launch {
             val current = transport ?: return@launch
             runCatching {
@@ -442,6 +558,7 @@ class TaskWorkerClient(
         machine.stop()
         publish()
         executionJob?.cancel()
+        heartbeatJob?.cancel()
         loopJob?.cancel()
         val current = transport
         if (current == null) {
@@ -502,6 +619,13 @@ class TaskWorkerClient(
                 )
                 publish()
                 if (!accepted) throw TaskWorkerProtocolException("coordinator rejected hello", "hello_rejected", "payload.accepted")
+                heartbeatJob?.cancel()
+                heartbeatJob = scope.launch {
+                    while (isActive && machine.snapshot().connection == TaskWorkerConnectionState.READY) {
+                        delay(15_000L)
+                        opened.sendHeartbeat(nodeId, clockMs())
+                    }
+                }
                 receiveLoop(opened)
             } catch (error: CancellationException) {
                 throw error
@@ -510,6 +634,8 @@ class TaskWorkerClient(
                 publish()
             } finally {
                 runCatching { transport?.close() }
+                heartbeatJob?.cancel()
+                heartbeatJob = null
                 transport = null
             }
         }
@@ -517,16 +643,19 @@ class TaskWorkerClient(
 
     private suspend fun receiveLoop(connection: TaskWorkerTransport) {
         while (scope.isActive && machine.snapshot().connection == TaskWorkerConnectionState.READY) {
-            val envelope = connection.receive() ?: throw EOFException("coordinator closed worker connection")
-            when (envelope.messageType) {
-                TaskWorkerProtocol.STAGE_OFFER -> handleOffer(connection, envelope)
-                TaskWorkerProtocol.STAGE_CANCEL -> handleCancel(connection, envelope)
-                TaskWorkerProtocol.LEASE_RENEW -> handleLeaseRenew(envelope)
-                else -> throw TaskWorkerProtocolException(
-                    "unexpected coordinator message for Android worker",
-                    "unexpected_message_type",
-                    "message_type",
-                )
+            when (val event = connection.receiveEvent()) {
+                TaskWorkerInboundEvent.Closed -> throw EOFException("coordinator closed worker connection")
+                TaskWorkerInboundEvent.HeartbeatAck -> Unit
+                is TaskWorkerInboundEvent.Envelope -> when (event.value.messageType) {
+                    TaskWorkerProtocol.STAGE_OFFER -> handleOffer(connection, event.value)
+                    TaskWorkerProtocol.STAGE_CANCEL -> handleCancel(connection, event.value)
+                    TaskWorkerProtocol.LEASE_RENEW -> handleLeaseRenew(event.value)
+                    else -> throw TaskWorkerProtocolException(
+                        "unexpected coordinator message for Android worker",
+                        "unexpected_message_type",
+                        "message_type",
+                    )
+                }
             }
         }
     }

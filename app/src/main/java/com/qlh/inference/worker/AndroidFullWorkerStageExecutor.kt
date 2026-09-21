@@ -65,7 +65,13 @@ class AndroidFullWorkerStageExecutor(
      * ★ 2026-09-20：保证模型已按 `layer_forward` 的需要加载
      * （中间段需 `extract_hidden_states`）。默认委托 [ensureModelLoaded]。
      */
-    private val ensureModelLoadedForLayer: suspend (contextSize: Int) -> Result<Unit> = ensureModelLoaded,
+    private val ensureModelLoadedForLayer: suspend (
+        layerRange: List<Int>,
+        contextSize: Int,
+        embeddingWidth: Int,
+        wantHidden: Boolean,
+        modelSha256: String,
+    ) -> Result<Unit> = { _, contextSize, _, _, _ -> ensureModelLoaded(contextSize) },
 ) : TaskWorkerStageHandler {
     override suspend fun execute(offer: TaskWorkerEnvelope): TaskWorkerStageExecution {
         if (offer.messageType != TaskWorkerProtocol.STAGE_OFFER) {
@@ -205,8 +211,18 @@ class AndroidFullWorkerStageExecutor(
         // 中间段（要产出 hidden）必须由 load 时开 extract_hidden_states；
         // 末段只需 argmax，不开也能跑 ⇒ 是否中间段由调用方显式声明。
         val wantHidden = (rootInput["want_hidden"] as? Boolean) ?: false
-        val loader = if (wantHidden) ensureModelLoadedForLayer else ensureModelLoaded
-        loader(contextSize).getOrElse { error ->
+        val loaderResult = if (wantHidden || layerRange.isNotEmpty()) {
+            ensureModelLoadedForLayer(
+                layerRange,
+                contextSize,
+                nEmbd,
+                wantHidden,
+                (advertised["sha256"] as? String).orEmpty(),
+            )
+        } else {
+            ensureModelLoaded(contextSize)
+        }
+        loaderResult.getOrElse { error ->
             throw AndroidFullWorkerStageException(
                 "model_not_ready",
                 error.message ?: "Android inference model is not ready",

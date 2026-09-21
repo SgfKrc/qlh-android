@@ -404,7 +404,9 @@ object TaskWorkerProtocol {
         val expectedCapabilityFields = setOf("stage_types", "engines", "models", "max_concurrency")
         requireExact(
             capabilities.keys,
-            expectedCapabilityFields + if (capabilities.containsKey("resource_gate")) setOf("resource_gate") else emptySet(),
+            expectedCapabilityFields +
+                (if (capabilities.containsKey("resource_gate")) setOf("resource_gate") else emptySet()) +
+                (if (capabilities.containsKey("layer_ranges")) setOf("layer_ranges") else emptySet()),
             "payload.capabilities",
         )
         val stageTypes = stringList(capabilities, "stage_types")
@@ -433,6 +435,17 @@ object TaskWorkerProtocol {
         if (maxConcurrency != 1) fail("Android workers support one concurrent task", "invalid_capabilities", "payload.capabilities.max_concurrency")
         if (capabilities.containsKey("resource_gate")) {
             validateResourceGate(capabilities["resource_gate"] as? Map<*, *>, "payload.capabilities.resource_gate")
+        }
+        if (capabilities.containsKey("layer_ranges")) {
+            val ranges = list(capabilities, "layer_ranges")
+            ranges.forEachIndexed { index, value ->
+                val range = value as? List<*>
+                val start = (range?.getOrNull(0) as? Number)?.toInt()
+                val end = (range?.getOrNull(1) as? Number)?.toInt()
+                if (range?.size != 2 || start == null || end == null || start < 0 || end <= start) {
+                    fail("layer_ranges must contain [start, end) integer ranges", "invalid_capabilities", "payload.capabilities.layer_ranges[$index]")
+                }
+            }
         }
     }
 

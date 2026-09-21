@@ -14,11 +14,17 @@ import com.qlh.inference.BuildConfig
 import com.qlh.inference.MainActivity
 import com.qlh.inference.QlhApplication
 import com.qlh.inference.R
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 
 /** Foreground lifecycle shell for the Android Full Worker client. */
 class TaskWorkerService : Service() {
     private val binder = LocalBinder()
     private var client: TaskWorkerClient? = null
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     inner class LocalBinder : Binder() {
         fun getService(): TaskWorkerService = this@TaskWorkerService
@@ -31,21 +37,23 @@ class TaskWorkerService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val starting = intent?.action == ACTION_START
         when (intent?.action) {
-            ACTION_START -> startWorker(intent)
+            ACTION_START -> scope.launch { startWorker(intent) }
             ACTION_STOP -> {
                 stopWorker()
                 stopSelf(startId)
             }
             ACTION_CANCEL -> client?.cancelActive(intent.getStringExtra(EXTRA_REASON) ?: "user_cancelled")
         }
-        return if (client != null) START_STICKY else START_NOT_STICKY
+        return if (starting || client != null) START_STICKY else START_NOT_STICKY
     }
 
     override fun onBind(intent: Intent?): IBinder = binder
 
     override fun onDestroy() {
         stopWorker()
+        scope.cancel()
         super.onDestroy()
     }
 
@@ -53,7 +61,7 @@ class TaskWorkerService : Service() {
 
     fun cancelActive(reasonCode: String = "user_cancelled"): Boolean = client?.cancelActive(reasonCode) == true
 
-    private fun startWorker(intent: Intent) {
+    private suspend fun startWorker(intent: Intent) {
         if (BuildConfig.IS_LITE) {
             stopSelf()
             return
@@ -61,7 +69,21 @@ class TaskWorkerService : Service() {
         val host = intent.getStringExtra(EXTRA_COORDINATOR_HOST).orEmpty().trim()
         val port = intent.getIntExtra(EXTRA_COORDINATOR_PORT, 0)
         val nodeId = intent.getStringExtra(EXTRA_NODE_ID).orEmpty().trim()
+        val clusterSecret = intent.getStringExtra(EXTRA_CLUSTER_SECRET).orEmpty()
+        val hostname = intent.getStringExtra(EXTRA_HOSTNAME).orEmpty().ifBlank { nodeId }
+        val networkType = intent.getStringExtra(EXTRA_NETWORK_TYPE).orEmpty().ifBlank { "unknown" }
+        val deviceInfo = intent.getStringExtra(EXTRA_DEVICE_INFO_JSON).orEmpty()
+            .let { raw ->
+                runCatching {
+                    @Suppress("UNCHECKED_CAST")
+                    com.google.gson.Gson().fromJson(raw, Map::class.java) as? Map<String, Any?>
+                }.getOrNull().orEmpty()
+            }
         if (host.isEmpty() || port !in 1..65535 || nodeId.isEmpty()) {
+            stopSelf()
+            return
+        }
+        if (clusterSecret.isBlank()) {
             stopSelf()
             return
         }
@@ -71,6 +93,15 @@ class TaskWorkerService : Service() {
         val modelSha256 = intent.getStringExtra(EXTRA_MODEL_SHA256).orEmpty().trim()
         val resourceAdmitted = intent.getBooleanExtra(EXTRA_RESOURCE_ADMITTED, false)
         val resourceReason = intent.getStringExtra(EXTRA_RESOURCE_REASON).orEmpty().trim()
+        val layerRanges = QlhApplication.instance.inferenceService
+            ?.modelManager
+            ?.listLayerArtifacts(
+                expectedModelSha256 = modelSha256,
+                verifyArtifactDigest = true,
+            )
+            ?.getOrNull()
+            ?.map { listOf(it.startLayer, it.endLayerExclusive) }
+            .orEmpty()
         val expectedModelIdentity = {
             AndroidWorkerCapabilities.modelIdentity(
                 modelId, modelFormat, modelRevision, modelSha256, resourceAdmitted,
@@ -81,6 +112,14 @@ class TaskWorkerService : Service() {
             host = host,
             port = port,
             nodeId = nodeId,
+            registration = TaskWorkerRegistration(
+                nodeId = nodeId,
+                clusterSecret = clusterSecret,
+                hostname = hostname,
+                networkType = networkType,
+                deviceInfo = deviceInfo,
+                modelSha256 = modelSha256,
+            ),
             capabilities = {
                 AndroidWorkerCapabilities.build(
                     modelId = modelId,
@@ -89,6 +128,7 @@ class TaskWorkerService : Service() {
                     modelSha256 = modelSha256,
                     resourceAdmitted = resourceAdmitted,
                     resourceReason = resourceReason,
+                    layerRanges = layerRanges,
                 )
             },
             stageHandler = AndroidFullWorkerStageExecutor(
@@ -122,9 +162,15 @@ class TaskWorkerService : Service() {
                         }
                     } ?: Result.failure(IllegalStateException("inference_service_unavailable"))
                 },
-                ensureModelLoadedForLayer = { contextSize ->
+                ensureModelLoadedForLayer = { range, contextSize, embeddingWidth, wantHidden, sha256 ->
                     QlhApplication.instance.inferenceService
-                        ?.ensureModelLoaded(contextSize, extractHidden = true)
+                        ?.ensureLayerModelLoaded(
+                            layerRange = range,
+                            contextSize = contextSize,
+                            extractHidden = wantHidden,
+                            expectedModelSha256 = sha256,
+                            expectedEmbeddingWidth = embeddingWidth,
+                        )
                         ?: Result.failure(IllegalStateException("inference_service_unavailable"))
                 },
             ),
@@ -174,6 +220,10 @@ class TaskWorkerService : Service() {
         const val EXTRA_COORDINATOR_HOST = "coordinator_host"
         const val EXTRA_COORDINATOR_PORT = "coordinator_port"
         const val EXTRA_NODE_ID = "node_id"
+        const val EXTRA_CLUSTER_SECRET = "cluster_secret"
+        const val EXTRA_HOSTNAME = "hostname"
+        const val EXTRA_NETWORK_TYPE = "network_type"
+        const val EXTRA_DEVICE_INFO_JSON = "device_info_json"
         const val EXTRA_MODEL_ID = "model_id"
         const val EXTRA_MODEL_FORMAT = "model_format"
         const val EXTRA_MODEL_REVISION = "model_revision"
@@ -187,6 +237,10 @@ class TaskWorkerService : Service() {
             host: String,
             port: Int,
             nodeId: String,
+            clusterSecret: String,
+            hostname: String,
+            networkType: String,
+            deviceInfo: Map<String, Any?>,
             modelId: String = "",
             modelFormat: String = "gguf",
             modelRevision: String = "local",
@@ -200,6 +254,10 @@ class TaskWorkerService : Service() {
             .putExtra(EXTRA_COORDINATOR_HOST, host)
             .putExtra(EXTRA_COORDINATOR_PORT, port)
             .putExtra(EXTRA_NODE_ID, nodeId)
+            .putExtra(EXTRA_CLUSTER_SECRET, clusterSecret)
+            .putExtra(EXTRA_HOSTNAME, hostname)
+            .putExtra(EXTRA_NETWORK_TYPE, networkType)
+            .putExtra(EXTRA_DEVICE_INFO_JSON, com.google.gson.Gson().toJson(deviceInfo))
             .putExtra(EXTRA_MODEL_ID, modelId)
             .putExtra(EXTRA_MODEL_FORMAT, modelFormat)
             .putExtra(EXTRA_MODEL_REVISION, modelRevision)
