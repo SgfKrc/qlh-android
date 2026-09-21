@@ -1,6 +1,7 @@
 package com.qlh.inference
 
 import com.qlh.inference.network.ApiClientHttpException
+import com.qlh.inference.data.SettingsDataStore
 import com.qlh.inference.status.AndroidRuntimeStatus
 import com.qlh.inference.status.GpuStatus
 import com.qlh.inference.status.MemoryStatus
@@ -104,7 +105,12 @@ fun validateChatImageSubmission(inferenceMode: String, imageDataUrls: List<Strin
             return "图像总大小不得超过 16 MiB"
         }
     }
-    if (normalized.isNotEmpty() && inferenceMode !in setOf("thin", "full")) {
+    val mode = SettingsDataStore.normalizeInferenceMode(inferenceMode)
+    if (normalized.isNotEmpty() && mode !in setOf(
+            SettingsDataStore.MODE_LOCAL,
+            SettingsDataStore.MODE_DISTRIBUTED,
+            SettingsDataStore.MODE_FALLBACK,
+        )) {
         return "当前模式不支持图像理解"
     }
     return null
@@ -194,9 +200,23 @@ fun buildAndroidPresencePayload(
     gpu: GpuStatus,
     runtime: AndroidRuntimeStatus?,
 ): Map<String, Any?> = mapOf(
-    "connection_type" to "http_thin",
-    "pipeline_worker" to false,
-    "client_mode" to inferenceMode,
+    "connection_type" to when (SettingsDataStore.normalizeInferenceMode(inferenceMode)) {
+        "distributed" -> "tcp_task_worker"
+        "fallback" -> "http_thin"
+        else -> "local"
+    },
+    "pipeline_worker" to (runtime?.nativeRuntimeAvailable == true && !runtime.isLite),
+    "capabilities" to if (runtime?.nativeRuntimeAvailable == true && !runtime.isLite) {
+        listOf("forward_layers")
+    } else {
+        emptyList<String>()
+    },
+    "backend_id" to if (runtime?.nativeRuntimeAvailable == true && !runtime.isLite) {
+        "llama_cpp"
+    } else {
+        ""
+    },
+    "client_mode" to SettingsDataStore.normalizeInferenceMode(inferenceMode),
     "app_variant" to appVariant,
     "app_version" to appVersion,
     "android" to mapOf(
@@ -230,6 +250,7 @@ fun buildAndroidPresencePayload(
     ),
     "backend" to mapOf(
         "engine" to (runtime?.backend?.engine ?: ""),
+        "backend_id" to "llama_cpp",
         "supports_gpu_offload" to (runtime?.backend?.supportsGpuOffload ?: false),
     ),
     "multimodal" to mapOf(

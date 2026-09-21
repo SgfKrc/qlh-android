@@ -5,6 +5,7 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import com.qlh.inference.BuildConfig
+import com.qlh.inference.data.SettingsDataStore
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.border
@@ -332,7 +333,7 @@ fun SettingsScreen(
                 onThemeModeChange = onThemeModeChange
             )
 
-            if (!isLite && inferenceMode == "full") {
+            if (!isLite) {
                 SettingsGroup(title = "模型管理", icon = Icons.Default.FolderOpen) {
                     ModelManagementPanel(
                         modelTreeUri = modelTreeUri,
@@ -1491,11 +1492,15 @@ private fun InferenceModeGroup(
 
     SettingsGroup(title = "推理模式", icon = Icons.Default.Cloud) {
         SettingRow(
-            title = if (inferenceMode == "thin") "全无 (远程推理)" else "全有 (本地推理)",
-            subtitle = if (inferenceMode == "thin") {
-                "请求发送给 PC 主节点，本机不计算"
-            } else {
-                "本机加载 GGUF 模型，离线完整推理"
+            title = when (inferenceMode) {
+                SettingsDataStore.MODE_LOCAL -> "本地推理"
+                SettingsDataStore.MODE_FALLBACK -> "故障绕行"
+                else -> "分布式协作"
+            },
+            subtitle = when (inferenceMode) {
+                SettingsDataStore.MODE_LOCAL -> "本机加载 GGUF 模型并完成推理"
+                SettingsDataStore.MODE_FALLBACK -> "优先连接主节点，故障时切换本地模型"
+                else -> "优先由主节点调度，本机可参与层段任务"
             },
             trailing = {
                 Button(
@@ -1520,21 +1525,30 @@ private fun InferenceModeGroup(
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     ModeOptionRow(
-                        selected = inferenceMode == "thin",
-                        title = "全无模式 (远程推理)",
-                        desc = "请求发送给 PC 主节点，本机不计算",
+                        selected = inferenceMode == SettingsDataStore.MODE_DISTRIBUTED,
+                        title = "分布式协作",
+                        desc = "优先发送给 PC 主节点，也可作为层段工作器",
                         onClick = {
-                            onInferenceModeChange("thin")
+                            onInferenceModeChange(SettingsDataStore.MODE_DISTRIBUTED)
                             showModeDialog = false
                         }
                     )
                     if (!isLite) {
                         ModeOptionRow(
-                            selected = inferenceMode == "full",
-                            title = "全有模式 (本地推理)",
-                            desc = "本机加载 GGUF 模型，离线完整推理",
+                            selected = inferenceMode == SettingsDataStore.MODE_FALLBACK,
+                            title = "故障绕行",
+                            desc = "主节点不可用时使用本地 GGUF 完成任务",
                             onClick = {
-                                onInferenceModeChange("full")
+                                onInferenceModeChange(SettingsDataStore.MODE_FALLBACK)
+                                showModeDialog = false
+                            }
+                        )
+                        ModeOptionRow(
+                            selected = inferenceMode == SettingsDataStore.MODE_LOCAL,
+                            title = "本地推理",
+                            desc = "仅使用本机 llama.cpp 和已选择的 GGUF",
+                            onClick = {
+                                onInferenceModeChange(SettingsDataStore.MODE_LOCAL)
                                 showModeDialog = false
                             }
                         )
@@ -2173,7 +2187,11 @@ private fun DeviceStatusGroups(
                     if (status.isLite) {
                         StatusRow("模式", "极简版 (仅远程推理)")
                     } else {
-                        StatusRow("模式", if (status.inferenceMode == "thin") "全无 (远程推理)" else "全有 (本地推理)")
+                        StatusRow("模式", when (status.inferenceMode) {
+                            SettingsDataStore.MODE_LOCAL -> "本地推理"
+                            SettingsDataStore.MODE_FALLBACK -> "故障绕行"
+                            else -> "分布式协作"
+                        })
                     }
                     if (status.serviceRunning) {
                         StatusRow("推理服务", "运行中")

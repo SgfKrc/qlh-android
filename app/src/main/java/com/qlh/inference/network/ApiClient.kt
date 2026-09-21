@@ -140,7 +140,7 @@ data class RegisterNodeRequest(
     @SerializedName("device_info")
     val deviceInfo: Map<String, Any?> = emptyMap(),
     @SerializedName("client_mode")
-    val clientMode: String = "thin",
+    val clientMode: String = "distributed",
     @SerializedName("app_variant")
     val appVariant: String = if (BuildConfig.IS_LITE) "lite" else "full",
     @SerializedName("app_version")

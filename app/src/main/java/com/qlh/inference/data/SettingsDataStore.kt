@@ -27,11 +27,13 @@ class SettingsDataStore(private val context: Context) {
         val KEY_ANDROID_NODE_ID = stringPreferencesKey("android_node_id")
         val KEY_BOOTSTRAPPED = booleanPreferencesKey("bootstrapped")
         val KEY_CLUSTER_ID = stringPreferencesKey("cluster_id")
+        val KEY_MASTER_TCP_HOST = stringPreferencesKey("master_tcp_host")
         val KEY_MASTER_TCP_PORT = intPreferencesKey("master_tcp_port")
+        val KEY_CLUSTER_SECRET = stringPreferencesKey("cluster_secret")
         val KEY_MODEL_MANIFEST_URL = stringPreferencesKey("model_manifest_url")
 
         // ---- 推理模式 ----
-        val KEY_INFERENCE_MODE = stringPreferencesKey("inference_mode")  // "thin" | "full"
+        val KEY_INFERENCE_MODE = stringPreferencesKey("inference_mode")  // "local" | "distributed" | "fallback"
 
         // ---- 推理参数 ----
         val KEY_MAX_TOKENS = intPreferencesKey("max_tokens")
@@ -50,7 +52,17 @@ class SettingsDataStore(private val context: Context) {
         // ---- 默认值 ----
         const val DEFAULT_HOST = "100.90.76.108"
         const val DEFAULT_PORT = 8000
-        const val DEFAULT_MODE = "thin"
+        const val MODE_LOCAL = "local"
+        const val MODE_DISTRIBUTED = "distributed"
+        const val MODE_FALLBACK = "fallback"
+        const val DEFAULT_MODE = MODE_DISTRIBUTED
+
+        fun normalizeInferenceMode(value: String): String = when (value.lowercase()) {
+            "full" -> MODE_LOCAL
+            "thin" -> MODE_DISTRIBUTED
+            MODE_LOCAL, MODE_DISTRIBUTED, MODE_FALLBACK -> value.lowercase()
+            else -> DEFAULT_MODE
+        }
         const val DEFAULT_MAX_TOKENS = 1024
         const val DEFAULT_TEMPERATURE = 0.7f
         const val DEFAULT_TOP_P = 0.9f
@@ -74,7 +86,7 @@ class SettingsDataStore(private val context: Context) {
     }
 
     val inferenceMode: Flow<String> = context.dataStore.data.map { prefs ->
-        prefs[KEY_INFERENCE_MODE] ?: DEFAULT_MODE
+        normalizeInferenceMode(prefs[KEY_INFERENCE_MODE] ?: DEFAULT_MODE)
     }
 
     val maxTokens: Flow<Int> = context.dataStore.data.map { prefs ->
@@ -130,9 +142,13 @@ class SettingsDataStore(private val context: Context) {
     suspend fun getServerPort(): Int = context.dataStore.data.first()[KEY_SERVER_PORT] ?: DEFAULT_PORT
     suspend fun isBootstrapped(): Boolean = context.dataStore.data.first()[KEY_BOOTSTRAPPED] ?: false
     suspend fun getClusterId(): String = context.dataStore.data.first()[KEY_CLUSTER_ID] ?: ""
+    suspend fun getMasterTcpHost(): String = context.dataStore.data.first()[KEY_MASTER_TCP_HOST] ?: ""
     suspend fun getMasterTcpPort(): Int = context.dataStore.data.first()[KEY_MASTER_TCP_PORT] ?: 8888
+    suspend fun getClusterSecret(): String = context.dataStore.data.first()[KEY_CLUSTER_SECRET] ?: ""
     suspend fun getModelManifestUrl(): String = context.dataStore.data.first()[KEY_MODEL_MANIFEST_URL] ?: ""
-    suspend fun getInferenceMode(): String = context.dataStore.data.first()[KEY_INFERENCE_MODE] ?: DEFAULT_MODE
+    suspend fun getInferenceMode(): String = normalizeInferenceMode(
+        context.dataStore.data.first()[KEY_INFERENCE_MODE] ?: DEFAULT_MODE,
+    )
     suspend fun getMaxTokens(): Int = context.dataStore.data.first()[KEY_MAX_TOKENS] ?: DEFAULT_MAX_TOKENS
     suspend fun getTemperature(): Float = context.dataStore.data.first()[KEY_TEMPERATURE] ?: DEFAULT_TEMPERATURE
     suspend fun getTopP(): Float = context.dataStore.data.first()[KEY_TOP_P] ?: DEFAULT_TOP_P
@@ -170,16 +186,20 @@ class SettingsDataStore(private val context: Context) {
     suspend fun saveBootstrapConfig(
         serverHost: String,
         serverPort: Int,
+        masterTcpHost: String,
         masterTcpPort: Int,
         clusterId: String,
+        clusterSecret: String,
         nodeId: String,
         modelManifestUrl: String,
     ) {
         context.dataStore.edit {
             if (serverHost.isNotBlank()) it[KEY_SERVER_HOST] = serverHost
             it[KEY_SERVER_PORT] = serverPort
+            if (masterTcpHost.isNotBlank()) it[KEY_MASTER_TCP_HOST] = masterTcpHost
             it[KEY_MASTER_TCP_PORT] = masterTcpPort
             it[KEY_CLUSTER_ID] = clusterId
+            if (clusterSecret.isNotBlank()) it[KEY_CLUSTER_SECRET] = clusterSecret
             if (nodeId.isNotBlank()) it[KEY_ANDROID_NODE_ID] = nodeId
             if (modelManifestUrl.isNotBlank()) it[KEY_MODEL_MANIFEST_URL] = modelManifestUrl
             it[KEY_BOOTSTRAPPED] = true
@@ -190,7 +210,9 @@ class SettingsDataStore(private val context: Context) {
         context.dataStore.edit {
             it.remove(KEY_BOOTSTRAPPED)
             it.remove(KEY_CLUSTER_ID)
+            it.remove(KEY_MASTER_TCP_HOST)
             it.remove(KEY_MASTER_TCP_PORT)
+            it.remove(KEY_CLUSTER_SECRET)
             it.remove(KEY_MODEL_MANIFEST_URL)
         }
     }

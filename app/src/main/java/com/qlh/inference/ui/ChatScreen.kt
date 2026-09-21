@@ -73,6 +73,7 @@ import com.qlh.inference.media.ImageAttachmentEncoder
 import com.qlh.inference.ui.components.EmptyState
 import com.qlh.inference.ui.components.QlhTopBar
 import com.qlh.inference.ui.components.StatusChip
+import com.qlh.inference.data.SettingsDataStore
 import com.qlh.inference.ui.theme.QlhShapeTokens
 import com.qlh.inference.ui.theme.qlhBrandGold
 import com.qlh.inference.ui.theme.qlhNeonGreen
@@ -114,7 +115,7 @@ fun ChatScreen(
     var pendingImage by remember { mutableStateOf<EncodedImageAttachment?>(null) }
     var imageError by remember { mutableStateOf<String?>(null) }
     var isEncodingImage by remember { mutableStateOf(false) }
-    val canAttachImage = inferenceMode == "thin" && !isLoading
+    val canAttachImage = inferenceMode != SettingsDataStore.MODE_DISTRIBUTED && !isLoading
     val imagePicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent(),
     ) { uri ->
@@ -136,10 +137,7 @@ fun ChatScreen(
     }
 
     LaunchedEffect(inferenceMode) {
-        if (inferenceMode != "thin") {
-            pendingImage = null
-            imageError = null
-        }
+        imageError = null
     }
 
     val copyAssistantMessage: (String) -> Unit = { text ->
@@ -173,11 +171,17 @@ fun ChatScreen(
             title = sessionTitle.ifBlank { "对话" },
             actions = {
                 if (inferenceMode.isNotBlank()) {
-                    if (inferenceMode == "thin") {
+                    if (inferenceMode == SettingsDataStore.MODE_DISTRIBUTED) {
                         StatusChip(
                             text = "远程推理",
                             containerColor = MaterialTheme.colorScheme.tertiaryContainer,
                             contentColor = MaterialTheme.colorScheme.onTertiaryContainer
+                        )
+                    } else if (inferenceMode == SettingsDataStore.MODE_FALLBACK) {
+                        StatusChip(
+                            text = "故障绕行",
+                            containerColor = MaterialTheme.colorScheme.secondaryContainer,
+                            contentColor = MaterialTheme.colorScheme.onSecondaryContainer
                         )
                     } else {
                         StatusChip(

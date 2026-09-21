@@ -32,6 +32,7 @@ import com.qlh.inference.security.AuthTokenStore
 import com.qlh.inference.security.StoredAuthSession
 import com.qlh.inference.update.AndroidAppUpdateManager
 import com.qlh.inference.update.AndroidUpdateCandidate
+import com.qlh.inference.worker.TaskWorkerService
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
@@ -144,7 +145,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         messageDao = database.messageDao(),
         apiClient = {
             val state = _uiState.value
-            if (state.inferenceMode == "thin") {
+            if (state.inferenceMode != SettingsDataStore.MODE_LOCAL) {
                 apiClient(state)
             } else {
                 null // 全有模式 — 使用本地推理引擎
@@ -157,6 +158,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     ).also { repo ->
         repo.setThinClientMetadataProvider { settings.getOrCreateAndroidNodeId() }
         repo.setThinPresenceHook { autoRegisterAndroidNode(force = true) }
+        repo.setLocalFallbackPolicy {
+            _uiState.value.inferenceMode == SettingsDataStore.MODE_FALLBACK
+        }
     }
 
     init {
@@ -165,7 +169,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             try {
                 val host = settings.getServerHost()
                 val port = settings.getServerPort()
-                val mode = if (BuildConfig.IS_LITE) "thin" else settings.getInferenceMode()
+                val mode = if (BuildConfig.IS_LITE) SettingsDataStore.MODE_FALLBACK else settings.getInferenceMode()
                 val maxTokens = settings.getMaxTokens()
                 val temp = settings.getTemperature()
                 val topP = settings.getTopP()
@@ -203,6 +207,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 QlhApplication.instance.inferenceService?.modelContextSize = contextSize
                 ensureAndroidBootstrap()
                 autoRegisterAndroidNode()
+                ensureAndroidTaskWorker()
                 refreshModels(showMessage = false)
                 refreshRuntimeStatus()
                 refreshManagement()
@@ -235,7 +240,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
 
-        // Android Full 薄客户端 presence 心跳：只在 thin 模式生效，Lite 仍跳过。
+        // HTTP presence is used only by fallback mode; distributed mode exposes
+        // its lease through TaskWorkerService.
         viewModelScope.launch {
             AndroidPresenceService.snapshot.collect { snapshot ->
                 _uiState.value = _uiState.value.copy(presence = snapshot)
@@ -270,7 +276,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             settings.inferenceMode.collect { mode ->
                 _uiState.value = _uiState.value.copy(
-                    inferenceMode = if (BuildConfig.IS_LITE) "thin" else mode
+                    inferenceMode = if (BuildConfig.IS_LITE) SettingsDataStore.MODE_FALLBACK else SettingsDataStore.normalizeInferenceMode(mode)
                 )
             }
         }
@@ -1040,7 +1046,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private suspend fun ensureAndroidBootstrap(force: Boolean = false) {
         if (BuildConfig.IS_LITE) return
-        if (!force && settings.isBootstrapped()) return
+        if (!force && settings.isBootstrapped() &&
+            settings.getClusterSecret().isNotBlank() &&
+            settings.getMasterTcpHost().isNotBlank()
+        ) return
 
         val state = _uiState.value
         val nodeId = settings.getOrCreateAndroidNodeId()
@@ -1069,8 +1078,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             settings.saveBootstrapConfig(
                 serverHost = newHost,
                 serverPort = newPort,
+                masterTcpHost = cluster.masterTcpHost,
                 masterTcpPort = cluster.masterTcpPort,
                 clusterId = cluster.clusterId,
+                clusterSecret = cluster.clusterSecret,
                 nodeId = response.node.nodeId.ifBlank { nodeId },
                 modelManifestUrl = android.modelManifestUrl,
             )
@@ -1097,7 +1108,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
         val state = _uiState.value
-        if (state.inferenceMode != "thin") {
+        if (state.inferenceMode != SettingsDataStore.MODE_FALLBACK) {
+            // Distributed mode owns the node's TCP task-worker lease. The HTTP
+            // presence client is reserved for fallback mode and must not race
+            // the TCP registration with a weaker device profile.
             getApplication<Application>().stopService(AndroidPresenceService.stopIntent(getApplication()))
             return
         }
@@ -1145,8 +1159,69 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    /** Start the authenticated TCP worker only for distributed execution. */
+    private suspend fun ensureAndroidTaskWorker() {
+        if (BuildConfig.IS_LITE || _uiState.value.inferenceMode != SettingsDataStore.MODE_DISTRIBUTED) {
+            getApplication<Application>().stopService(TaskWorkerService.stopIntent(getApplication()))
+            return
+        }
+        val secret = settings.getClusterSecret()
+        val host = settings.getMasterTcpHost().ifBlank { _uiState.value.serverHost }
+        val port = settings.getMasterTcpPort()
+        val nodeId = settings.getOrCreateAndroidNodeId()
+        if (secret.isBlank() || host.isBlank() || port !in 1..65535) return
+
+        val selected = modelManager.getSelectedModel()
+        val modelSha256 = modelManager.getSelectedModelSha256()
+        val modelId = selected?.name
+            ?.substringBeforeLast('.', selected.name)
+            ?.takeIf { it.isNotBlank() }
+            .orEmpty()
+        val hasModelIdentity = modelId.isNotBlank() &&
+            modelSha256.matches(Regex("[a-fA-F0-9]{64}"))
+        // Full-model execution needs only the verified model identity. Layer
+        // execution additionally depends on advertised ranges; the worker
+        // capability builder omits layer_forward when no artifacts exist.
+        val resourceAdmitted = hasModelIdentity
+        val resourceReason = if (resourceAdmitted) "" else "model_identity_not_verified"
+        val deviceInfo = buildAndroidPresenceDeviceInfo().toMutableMap().apply {
+            put("connection_type", "tcp_task_worker")
+            put("pipeline_worker", true)
+            put("task_worker", true)
+            put("backend_id", "llama_cpp")
+        }
+        runCatching {
+            ContextCompat.startForegroundService(
+                getApplication(),
+                TaskWorkerService.startIntent(
+                    context = getApplication(),
+                    host = host,
+                    port = port,
+                    nodeId = nodeId,
+                    clusterSecret = secret,
+                    hostname = listOf(android.os.Build.MANUFACTURER, android.os.Build.MODEL)
+                        .filter { it.isNotBlank() }.joinToString(" ").ifBlank { nodeId },
+                    networkType = detectNetworkType(),
+                    deviceInfo = deviceInfo,
+                    modelId = modelId,
+                    modelSha256 = modelSha256,
+                    modelRevision = modelSha256.takeIf { it.length == 64 }
+                        ?.let { "local-${it.take(12)}" } ?: "local",
+                    resourceAdmitted = resourceAdmitted,
+                    resourceReason = resourceReason,
+                ),
+            )
+        }.onFailure { error ->
+            QlhLogger.w(
+                "MainViewModel",
+                "Android task worker unavailable: ${error.message ?: error.javaClass.simpleName}",
+            )
+        }
+    }
+
     override fun onCleared() {
         getApplication<Application>().stopService(AndroidPresenceService.stopIntent(getApplication()))
+        getApplication<Application>().stopService(TaskWorkerService.stopIntent(getApplication()))
         super.onCleared()
     }
 
@@ -1193,6 +1268,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             ensureAndroidBootstrap(force = true)
             autoRegisterAndroidNode(force = true)
+            ensureAndroidTaskWorker()
         }
     }
 
@@ -1205,6 +1281,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             _uiState.value = _uiState.value.copy(serverHost = host)
             ensureAndroidBootstrap(force = true)
             autoRegisterAndroidNode(force = true)
+            ensureAndroidTaskWorker()
         }
     }
 
@@ -1215,15 +1292,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             _uiState.value = _uiState.value.copy(serverPort = port)
             ensureAndroidBootstrap(force = true)
             autoRegisterAndroidNode(force = true)
+            ensureAndroidTaskWorker()
         }
     }
 
     fun setInferenceMode(mode: String) {
-        if (BuildConfig.IS_LITE && mode != "thin") return
+        if (BuildConfig.IS_LITE && mode != SettingsDataStore.MODE_FALLBACK) return
+        val normalized = SettingsDataStore.normalizeInferenceMode(mode)
         viewModelScope.launch {
-            settings.setInferenceMode(mode)
-            _uiState.value = _uiState.value.copy(inferenceMode = mode)
+            settings.setInferenceMode(normalized)
+            _uiState.value = _uiState.value.copy(inferenceMode = normalized)
             autoRegisterAndroidNode(force = true)
+            ensureAndroidTaskWorker()
             refreshRuntimeStatus()
         }
     }
@@ -1286,6 +1366,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         "已发现 ${models.size} 个 GGUF 模型"
                     }
                 )
+                ensureAndroidTaskWorker()
                 refreshRuntimeStatus()
             }.onFailure { e ->
                 _uiState.value = _uiState.value.copy(
@@ -1335,6 +1416,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     selectedModelSizeBytes = model.sizeBytes,
                     modelMessage = "已选择模型: ${model.name}"
                 )
+                ensureAndroidTaskWorker()
                 refreshRuntimeStatus()
             }.onFailure { e ->
                 _uiState.value = _uiState.value.copy(modelMessage = "选择模型失败: ${e.message}")
@@ -1355,6 +1437,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     modelMessage = if (name.isBlank()) "没有已选择的模型" else "已删除模型: $name"
                 )
                 refreshModels(showMessage = false)
+                ensureAndroidTaskWorker()
                 refreshRuntimeStatus()
             }.onFailure { e ->
                 _uiState.value = _uiState.value.copy(modelMessage = "删除模型失败: ${e.message}")
@@ -1414,6 +1497,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     selectedModelSizeBytes = selected?.sizeBytes ?: 0L,
                     remoteModelMessage = "模型已下载并通过 SHA-256 校验",
                 )
+                ensureAndroidTaskWorker()
                 refreshModels(showMessage = false)
                 refreshRuntimeStatus()
             } catch (error: CancellationException) {

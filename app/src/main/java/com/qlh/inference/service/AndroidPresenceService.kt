@@ -104,7 +104,7 @@ class AndroidPresenceService : Service() {
                                         hostname = hostname.ifBlank { nodeId },
                                         networkType = networkType.ifBlank { "unknown" },
                                         deviceInfo = decodeDeviceInfo(deviceInfoJson),
-                                        clientMode = "thin",
+                                        clientMode = decodeClientMode(deviceInfoJson),
                                         appVariant = if (BuildConfig.IS_LITE) "lite" else "full",
                                         appVersion = BuildConfig.VERSION_NAME,
                                     )
@@ -182,6 +182,11 @@ class AndroidPresenceService : Service() {
         if (json.isBlank()) basicDeviceInfo()
         else runCatching { Gson().fromJson(json, Map::class.java) as Map<String, Any?> }
             .getOrElse { basicDeviceInfo() }
+
+    private fun decodeClientMode(json: String): String =
+        decodeDeviceInfo(json)["client_mode"]?.toString()
+            ?.takeIf { it in setOf("local", "distributed", "fallback") }
+            ?: "distributed"
 
     private fun errorCode(error: Throwable, fallback: String): String =
         (error as? ApiClientHttpException)?.errorCode?.ifBlank { fallback } ?: fallback

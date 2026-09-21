@@ -35,6 +35,7 @@ class ChatRepository(
     private val gson = Gson()
     private var clientNodeIdProvider: (suspend () -> String?)? = null
     private var thinPresenceHook: (suspend () -> Unit)? = null
+    private var allowLocalFallback: () -> Boolean = { false }
 
     fun setThinClientMetadataProvider(provider: suspend () -> String?) {
         clientNodeIdProvider = provider
@@ -42,6 +43,10 @@ class ChatRepository(
 
     fun setThinPresenceHook(hook: suspend () -> Unit) {
         thinPresenceHook = hook
+    }
+
+    fun setLocalFallbackPolicy(policy: () -> Boolean) {
+        allowLocalFallback = policy
     }
 
     // ==================== 会话 ====================
@@ -92,8 +97,6 @@ class ChatRepository(
         imageDataUrls: List<String> = emptyList(),
     ): Result<String> {
         val routeClient = apiClient()
-        val localService = if (routeClient == null) inferenceService() else null
-
         // 1. 保存用户消息到本地（重试时跳过，避免重复）
         if (!skipUserSave) {
             val userMsg = MessageEntity(
@@ -120,7 +123,7 @@ class ChatRepository(
             // ============================================================
             // 全无模式：HTTP → PC 主节点
             // ============================================================
-            return sendViaApi(
+            val remoteResult = sendViaApi(
                 client,
                 sessionId,
                 message,
@@ -130,12 +133,16 @@ class ChatRepository(
                 showThinking,
                 imageDataUrls,
             )
+            if (remoteResult.isSuccess || !allowLocalFallback()) {
+                return remoteResult
+            }
+            QlhLogger.w(TAG, "distributed request failed; trying local fallback")
         }
 
         // ================================================================
         // 全有模式：本地 llama.cpp 推理
         // ================================================================
-        val service = localService ?: inferenceService()
+        val service = inferenceService()
         if (service == null) {
             val errorMsg = MessageEntity(
                 sessionId = sessionId,
@@ -241,7 +248,8 @@ class ChatRepository(
         temperature: Float = 0.7f,
         topP: Float = 0.9f
     ): Flow<String> {
-        val service = inferenceService()
+        val client = apiClient()
+        val service = if (client == null || allowLocalFallback()) inferenceService() else null
         if (service != null) {
             // 全有模式 — 本地流式推理
             return service.generateStream(
@@ -254,7 +262,6 @@ class ChatRepository(
 
         // 全无模式 — 返回错误 Flow（SSE 流式暂未接入）
         return kotlinx.coroutines.flow.flow {
-            val client = apiClient()
             if (client != null) {
                 throw UnsupportedOperationException(
                     "全无模式 SSE 流式暂未实现，请使用非流式 sendMessage()"
@@ -294,7 +301,7 @@ class ChatRepository(
                 sessionId = sessionId.toString(),
                 clientNodeId = clientNodeId,
                 clientNodeType = "android",
-                clientMode = "thin",
+                clientMode = "distributed",
                 routingPreference = "distributed_preferred",
                 clientAppVariant = if (BuildConfig.IS_LITE) "lite" else "full",
                 allowExternal = imageDataUrls.takeIf { it.isNotEmpty() }?.let { true },

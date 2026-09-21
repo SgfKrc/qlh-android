@@ -4,7 +4,7 @@ data class AndroidRuntimeStatus(
     val nativeRuntimeAvailable: Boolean = false,
     val nativeRuntimeError: String? = null,
     val serviceRunning: Boolean = false,
-    val inferenceMode: String = "thin",
+    val inferenceMode: String = "distributed",
     val isLite: Boolean = false,
     val system: SystemStatus = SystemStatus(),
     val memory: MemoryStatus = MemoryStatus(),

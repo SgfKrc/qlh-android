@@ -129,9 +129,9 @@ class MainViewModelLogicTest {
             gpu = sampleGpu(),
             runtime = null,
         )
-        assertEquals("http_thin", payload["connection_type"])
+        assertEquals("tcp_task_worker", payload["connection_type"])
         assertEquals(false, payload["pipeline_worker"])
-        assertEquals("thin", payload["client_mode"])
+        assertEquals("distributed", payload["client_mode"])
         assertEquals("full", payload["app_variant"])
         assertEquals("0.1.0", payload["app_version"])
     }

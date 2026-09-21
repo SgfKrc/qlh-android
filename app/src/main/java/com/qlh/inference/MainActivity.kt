@@ -65,7 +65,7 @@ class MainActivity : ComponentActivity() {
                     viewModel = viewModel,
                     onChooseModelDirectory = { modelDirectoryLauncher.launch(null) },
                     onInferenceModeChanged = { mode ->
-                        if (mode == "full" && !BuildConfig.IS_LITE) {
+                        if (mode != com.qlh.inference.data.SettingsDataStore.MODE_DISTRIBUTED && !BuildConfig.IS_LITE) {
                             runCatching {
                                 ContextCompat.startForegroundService(
                                     this,
@@ -77,6 +77,8 @@ class MainActivity : ComponentActivity() {
                                     "Inference service unavailable: ${error.message ?: error.javaClass.simpleName}",
                                 )
                             }
+                        } else if (!BuildConfig.IS_LITE) {
+                            stopService(Intent(this, InferenceService::class.java))
                         }
                     }
                 )
