@@ -512,6 +512,9 @@ class LocalInferenceEngine(private val context: Context) {
         posBase: Int,
         wantHidden: Boolean,
         keepHead: Boolean = false,
+        // ★ P3 多序列：显式 seq/pos（长度必须等于 nTokens）；都给时走 Seq 版 JNI 入口
+        seqIds: IntArray? = null,
+        positions: IntArray? = null,
     ): Result<LayerForwardOutput> = withContext(Dispatchers.IO) {
         if (!isLoaded) {
             return@withContext Result.failure(IllegalStateException("model_not_loaded"))
@@ -524,10 +527,15 @@ class LocalInferenceEngine(private val context: Context) {
                 val out = FloatArray(estimateEmbeddingWidth(hidden.size, nTokens))
                 // keep-head（nextn）通道给的是末层输出（output_norm 之前）—— 与主仓接力
                 // 上游/中间段同语义；embeddings 通道给的是 output_norm(H)，多一次归一化。
-                val token = if (keepHead) {
-                    nativeLayerForwardHiddenKeepHead(modelPtr, hidden, nTokens, posBase, out)
-                } else {
-                    nativeLayerForwardHidden(modelPtr, hidden, nTokens, posBase, out)
+                // ★ P3 多序列：给了 seqIds/positions 时走显式绑定入口（与主仓同一契约）。
+                val token = when {
+                    keepHead && (seqIds != null || positions != null) ->
+                        nativeLayerForwardHiddenKeepHeadSeq(modelPtr, hidden, nTokens, posBase,
+                                                            null, seqIds, positions, out)
+                    keepHead ->
+                        nativeLayerForwardHiddenKeepHead(modelPtr, hidden, nTokens, posBase, out)
+                    else ->
+                        nativeLayerForwardHidden(modelPtr, hidden, nTokens, posBase, out)
                 }
                 when (token) {
                     // -2 = native 侧报告「load 时未开启 extract_hidden_states」。
@@ -741,6 +749,24 @@ class LocalInferenceEngine(private val context: Context) {
         hidden: FloatArray,
         nTokens: Int,
         posBase: Int,
+        outHidden: FloatArray
+    ): Int
+
+    /**
+     * ★ P3：层段前向（**中间段 + 多序列**，keep-head 语义）—— 显式 `seqIds` / `positions`。
+     *
+     * 与 [nativeLayerForwardHiddenKeepHead] 同语义，只是序列绑定改为逐 token 显式给出
+     * （与主仓 `forward_layers_from_hidden(seq_ids=..., positions=...)` 同一契约）。
+     * 三个数组长度都必须等于 `nTokens`（传 `null` 表示不指定）；长度不符 ⇒ `-1`。
+     */
+    private external fun nativeLayerForwardHiddenKeepHeadSeq(
+        modelPtr: Long,
+        hidden: FloatArray,
+        nTokens: Int,
+        posBase: Int,
+        nSeqId: IntArray?,
+        seqIds: IntArray?,
+        positions: IntArray?,
         outHidden: FloatArray
     ): Int
 

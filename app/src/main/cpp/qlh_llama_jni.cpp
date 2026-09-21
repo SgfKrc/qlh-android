@@ -1194,7 +1194,11 @@ static jint qlh_layer_forward_keep_head_impl(
     jfloatArray j_hidden,
     jint n_tokens,
     jint pos_base,
-    jfloatArray out_hidden
+    jfloatArray out_hidden,
+    // ★ P3 多序列：显式 `n_seq_id / seq_ids / positions`（可为 nullptr ⇒ 单序列旧行为）
+    const jint * n_seq_id,
+    const jint * seq_ids,
+    const jint * positions
 ) {
     if (model_ptr == 0 || j_hidden == nullptr || out_hidden == nullptr || n_tokens <= 0) {
         return -1;
@@ -1234,10 +1238,12 @@ static jint qlh_layer_forward_keep_head_impl(
         return -1;
     }
     for (int i = 0; i < n_tokens; ++i) {
-        batch.pos[i] = pos_base + i;
-        batch.n_seq_id[i] = 1;
-        batch.seq_id[i][0] = 0;
-        batch.logits[i] = 1;   // ★ 每个 token 都标（见上文断言说明）
+        // ★ P3 多序列：给了显式数组就逐 token 绑定（多序列交错推进时不依赖隐式位置递增）
+        batch.pos[i]       = (positions != nullptr) ? (llama_pos) positions[i]
+                                                    : (llama_pos) (pos_base + i);
+        batch.n_seq_id[i]  = (n_seq_id != nullptr && n_seq_id[i] > 0) ? n_seq_id[i] : 1;
+        batch.seq_id[i][0] = (seq_ids != nullptr) ? seq_ids[i] : 0;
+        batch.logits[i]    = 1;   // ★ 每个 token 都标（见上文断言说明）
     }
     batch.n_tokens = n_tokens;
     std::memcpy(batch.embd, hidden.data(), hidden.size() * sizeof(float));
@@ -1301,7 +1307,52 @@ Java_com_qlh_inference_service_LocalInferenceEngine_nativeLayerForwardHiddenKeep
     jfloatArray j_hidden, jint n_tokens, jint pos_base, jfloatArray out_hidden
 ) {
     return qlh_layer_forward_keep_head_impl(env, model_ptr, j_hidden, n_tokens, pos_base,
-                                            out_hidden);
+                                            out_hidden, nullptr, nullptr, nullptr);
+}
+
+// ★ P3：层段前向（中间段，keep-head 语义，**多序列**）—— 显式 seq_ids / positions。
+//
+// 与 `...HiddenKeepHead` 的唯一区别是序列绑定方式：这里逐 token 给出
+// `n_seq_id` / `seq_ids` / `positions`（三者长度都必须等于 nTokens，可为 null 表示不指定），
+// 与主仓 `LlamaCppEngine.forward_layers_from_hidden(seq_ids=..., positions=...)` 同一契约。
+// 多序列交错推进时必须用这个入口 —— 否则 llama.cpp 会按隐式位置递增报
+// "tokens ... have inconsistent sequence positions"。
+//
+// 返回同 `...HiddenKeepHead`：末位 argmax（>=0）/ -1 形状错 / -3 nextn 通道不可用。
+extern "C" JNIEXPORT jint JNICALL
+Java_com_qlh_inference_service_LocalInferenceEngine_nativeLayerForwardHiddenKeepHeadSeq(
+    JNIEnv * env, jobject /* thiz */, jlong model_ptr,
+    jfloatArray j_hidden, jint n_tokens, jint pos_base,
+    jintArray j_n_seq_id, jintArray j_seq_ids, jintArray j_positions,
+    jfloatArray out_hidden
+) {
+    if (n_tokens <= 0) {
+        return -1;
+    }
+    std::vector<jint> n_seq_id;
+    std::vector<jint> seq_ids;
+    std::vector<jint> positions;
+    auto read_optional = [&](jintArray source, std::vector<jint> & target) -> bool {
+        if (source == nullptr) {
+            return true;
+        }
+        if (env->GetArrayLength(source) != (jsize) n_tokens) {
+            return false;   // 形状不符：明确失败，不做静默截断/补齐
+        }
+        target.resize((size_t) n_tokens);
+        env->GetIntArrayRegion(source, 0, (jsize) n_tokens, target.data());
+        return env->ExceptionCheck() == JNI_FALSE;
+    };
+    if (!read_optional(j_n_seq_id, n_seq_id)
+        || !read_optional(j_seq_ids, seq_ids)
+        || !read_optional(j_positions, positions)) {
+        return -1;
+    }
+    return qlh_layer_forward_keep_head_impl(
+        env, model_ptr, j_hidden, n_tokens, pos_base, out_hidden,
+        n_seq_id.empty() ? nullptr : n_seq_id.data(),
+        seq_ids.empty() ? nullptr : seq_ids.data(),
+        positions.empty() ? nullptr : positions.data());
 }
 
 // 层段能力探测：上报本节点能否承层段、hidden 宽度、以及「层段运行必需的批量下限」。
