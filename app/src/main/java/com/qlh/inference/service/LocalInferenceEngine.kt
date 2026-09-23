@@ -543,10 +543,11 @@ class LocalInferenceEngine(private val context: Context) {
                     -2 -> return@withContext Result.failure(
                         IllegalStateException("extract_hidden_not_enabled")
                     )
-                    // -3 = keep-head（nextn）通道不可用：该架构没把末层输出挂到 t_h_nextn。
+                    // -3 = keep-head（层输出）通道不可用：该架构没登记 `t_layer_inp[n_layer]` 槽位
+                    //（未登记者会在 decode 时 GGML_ASSERT；这里只在拿到 -3 时兜底）。
                     // 同样 fail-closed —— 绝不退回 embeddings 通道（那会多一次归一化）。
                     -3 -> return@withContext Result.failure(
-                        IllegalStateException("keep_head_nextn_unavailable")
+                        IllegalStateException("keep_head_layer_out_unavailable")
                     )
                     else -> Result.success(LayerForwardOutput(token, if (token >= 0) out else null))
                 }

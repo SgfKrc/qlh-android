@@ -1031,9 +1031,41 @@ Java_com_qlh_inference_service_LocalInferenceEngine_nativeRpcProbe(
 //   ③ `embd` 注入路径**进程内 bitwise 非确定** ⇒ 验收**只认 per-token argmax**，
 //      不得要求 bitwise 一致（主仓 `RELAY_ACCEPTANCE = "per_token_argmax"`）。
 
-//: M-RoPE 的位置段数（Qwen3.5 的 `rope.dimension_sections` 为 4 段）。与
-//: `relay-gen-dl.cpp` 保持一致；若接入非 M-RoPE 模型需按模型 metadata 调整。
-static const int QLH_LAYER_N_POS_PER_EMBD = 4;
+//: M-RoPE 的位置段数（**不要硬编码**）：由模型自身的 rope 类型决定 —— MROPE / IMROPE ⇒ 4，
+//: 其余（NORM / NEOX…）⇒ 1。Qwen3.5 是 IMROPE（`rope.dimension_sections` 4 段）；
+//: 对 `n_pos_per_embd == 1` 的模型，planar 重建没有意义（`llama_batch_init` 分配的
+//: `n_tokens` 个 pos 就是正确布局）。与主仓 `qlh_keep_head.c` / `llama_engine.py` 同一判定。
+static int qlh_n_pos_per_embd(const llama_model * model) {
+    const enum llama_rope_type rope = (model != nullptr) ? llama_model_rope_type(model)
+                                                         : LLAMA_ROPE_TYPE_NONE;
+    return (rope == LLAMA_ROPE_TYPE_MROPE || rope == LLAMA_ROPE_TYPE_IMROPE) ? 4 : 1;
+}
+
+// ★ M-RoPE 的 **embd 注入通道**位置布局（与主仓 shim 同一修法）：
+//   llama.cpp 在 `batch.token == nullptr`（embd 注入）时按 planar 读 `batch.pos[j*n_tokens + i]`
+//   （`llama-batch.cpp::ubatch_add`：`src_off = batch.token ? 0 : j*batch.n_tokens`），
+//   而 `llama_batch_init()` 只分配 `n_tokens` 个 pos ⇒ 必须重建为 `n_pos * n_tokens`。
+//   ⚠️ 源值取**已经填好的 `batch.pos[i]`**（来自显式 `positions` 或 `pos_base + i`）——
+//   不要改用 `pos_base + i` 重填，否则 `...KeepHeadSeq` 传来的显式多序列位置会被丢弃
+//   （旧实现的实错）。`n_pos <= 1` 时无需重建。
+static bool qlh_rebuild_pos_planar(llama_batch & batch, int n_tokens, int n_pos) {
+    if (n_pos <= 1) {
+        return true;
+    }
+    const size_t pos_len = (size_t) n_pos * (size_t) n_tokens;
+    auto * pos_ext = static_cast<llama_pos *>(malloc(pos_len * sizeof(llama_pos)));
+    if (pos_ext == nullptr) {
+        return false;
+    }
+    for (int j = 0; j < n_pos; ++j) {
+        for (int i = 0; i < n_tokens; ++i) {
+            pos_ext[(size_t) j * (size_t) n_tokens + (size_t) i] = batch.pos[i];
+        }
+    }
+    free(batch.pos);
+    batch.pos = pos_ext;
+    return true;
+}
 
 // 把 f32 hidden 注入 embd 批次并从本节点层段继续前向；返回末位置 argmax token。
 //
@@ -1088,20 +1120,9 @@ static jint qlh_layer_forward_impl(
     std::memcpy(batch.embd, hidden.data(), hidden.size() * sizeof(float));
 
     // ★ 坑②：pos 按 n_pos_per_embd * n_tokens 重建（上游 #28963 调用方修法）。
-    {
-        const size_t pos_len = (size_t) QLH_LAYER_N_POS_PER_EMBD * (size_t) n_tokens;
-        auto * pos_ext = static_cast<llama_pos *>(malloc(pos_len * sizeof(llama_pos)));
-        if (pos_ext == nullptr) {
-            llama_batch_free(batch);
-            return -1;
-        }
-        for (int j = 0; j < QLH_LAYER_N_POS_PER_EMBD; ++j) {
-            for (int i = 0; i < n_tokens; ++i) {
-                pos_ext[(size_t) j * (size_t) n_tokens + (size_t) i] = pos_base + i;
-            }
-        }
-        free(batch.pos);
-        batch.pos = pos_ext;
+    if (!qlh_rebuild_pos_planar(batch, n_tokens, qlh_n_pos_per_embd(qctx->model))) {
+        llama_batch_free(batch);
+        return -1;
     }
 
     jint result = -1;
@@ -1169,6 +1190,39 @@ Java_com_qlh_inference_service_LocalInferenceEngine_nativeLayerForwardHidden(
     return qlh_layer_forward_impl(env, model_ptr, j_hidden, n_tokens, pos_base, out_hidden);
 }
 
+// ★ 2026-09-23：中间段的「层输出（`output_norm` **之前**）」改用 `layer_inp` 的
+//   `lid == n_layer` 槽位（与主仓 `scripts/model_tools/keep_head_shim/qlh_keep_head.c` 同一通道）。
+//
+//   为什么不再用 nextn：各架构把 `t_h_nextn` 挂在**不同位置** —— qwen2 在 `output_norm` 之前
+//   （QLH 2026-09-20 补丁），而 **qwen35 在之后**（那里的消费方是 MTP head）⇒ 同一个 nextn 通道
+//   在 Qwen3.5 上会多一次 RMSNorm，接力首步即分叉（主仓 9B 实测 1/32 → 修后 32/32）。
+//   `layer_inp` 的 `n_layer` 槽位在语义上**只会**是"末层输出"，与架构无关：槽位由
+//   `src/llama-context.cpp` 多分配一个、由各架构 graph 在 `output_norm` 之前登记
+//   （llama / qwen2 / qwen3 / qwen35 / qwen3moe / qwen35moe / qwen3next / gemma4 / openai-moe）。
+//   ⚠️ **未登记该槽位的架构会在 decode 时 GGML_ABORT**（不是可回退的错误码）⇒ 接入新架构前
+//   必须先确认它登记了该槽位。
+static void qlh_layer_out_set(llama_context * ctx, const llama_model * model, bool enable) {
+    if (ctx == nullptr || model == nullptr) {
+        return;
+    }
+    llama_set_embeddings_layer_inp(ctx, (uint32_t) llama_model_n_layer(model), enable);
+}
+
+// 取「末位 token 的层输出（`output_norm` 之前）」——`layer_inp` 通道给的是**稠密**
+// `[n_tokens, n_embd]`，故按行偏移取末位。返回 nullptr ⇒ 通道不可用（调用方 fail-closed）。
+static const float * qlh_layer_out_get(llama_context * ctx, const llama_model * model,
+                                       int n_tokens) {
+    if (ctx == nullptr || model == nullptr || n_tokens <= 0) {
+        return nullptr;
+    }
+    const float * base = llama_get_embeddings_layer_inp(ctx,
+            (uint32_t) llama_model_n_layer(model));
+    if (base == nullptr) {
+        return nullptr;
+    }
+    return base + (size_t) (n_tokens - 1) * (size_t) llama_model_n_embd_inp(model);
+}
+
 // ---------------------------------------------------------------------------
 // ★ 2026-09-21：keep-head 中间段 —— 与主仓 `scripts/model_tools/keep_head_shim/qlh_keep_head.c`
 //   **同语义**（任何一侧改动必须同步，判据同为 per-token argmax）。
@@ -1179,15 +1233,18 @@ Java_com_qlh_inference_service_LocalInferenceEngine_nativeLayerForwardHidden(
 //   同通道的端到端对照 first_mismatch=2）。拿它当中间段输出，下游会收到被多归一化一次
 //   的激活 ⇒ 三段链路必然分叉。
 //
-//   解：走补丁导出的 nextn 通道 —— `llama_set_embeddings_nextn(ctx, true, false)` +
-//   `llama_get_embeddings_nextn_ith(ctx, i)`，取**末层输出（output_norm 之前）**。
+//   解：走补丁导出的 **`layer_inp` 的 `lid == n_layer` 槽位**（= 第 n_layer 层的输入 =
+//   末层输出，`output_norm` **之前**）—— 见上方 `qlh_layer_out_set/get`。**不再用 nextn 通道**：
+//   各架构 `t_h_nextn` 的挂点不同（qwen2 在 norm 之前，qwen35 在**之后** —— 后者是 MTP head 的
+//   消费方），同一个 nextn 通道在 Qwen3.5 上会多一次 RMSNorm，接力首步即分叉。
 //
-//   ⚠️ 前提：批次的**每个 token** 都必须标记输出（`batch.logits[i] = 1`）。`t_h_nextn`
-//      只对「有输出的行」计算，只标末位却按 n_tokens 读会撞 GGML_ASSERT
-//      "tensor read out of bounds"（主仓 shim 实测踩过，此处同样遵守）。
+//   ⚠️ 前提：批次的**每个 token** 都标记输出（`batch.logits[i] = 1`）—— 旧 nextn 通道只对
+//      「有输出的行」计算末层 hidden，只标末位却按 n_tokens 读会撞 GGML_ASSERT
+//      "tensor read out of bounds"（主仓 shim 实测踩过）。走 layer_inp 后这条不再是硬约束，
+//      保持全开可以不必依赖具体的 sched 行为。
 //
-//   返回：末位置 argmax（≥0）；-1 形状/参数错；-3 = nextn 通道不可用（该架构没把末层
-//   输出挂到 t_h_nextn，或补丁未生效）—— 调用方必须 fail-closed，不得退回 embeddings 通道。
+//   返回：末位置 argmax（≥0）；-1 形状/参数错；-3 = **层输出通道不可用**（该架构没登记
+//   `t_layer_inp[n_layer]` 槽位）—— 调用方必须 fail-closed，不得退回 embeddings 通道。
 static jint qlh_layer_forward_keep_head_impl(
     JNIEnv * env,
     jlong model_ptr,
@@ -1229,12 +1286,12 @@ static jint qlh_layer_forward_keep_head_impl(
         llama_memory_clear(mem, true);
     }
 
-    // ★ 开启 nextn 导出（unmasked ⇒ rows 按 token 稠密存放）
-    llama_set_embeddings_nextn(qctx->ctx, true, false);
+    // ★ 开启层输出导出（`layer_inp` 的 `lid == n_layer` 槽位；稠密 [n_tokens, n_embd]）
+    qlh_layer_out_set(qctx->ctx, qctx->model, true);
 
     llama_batch batch = llama_batch_init(n_tokens, n_embd_inp, /*n_seq_max=*/1);
     if (batch.embd == nullptr) {
-        llama_set_embeddings_nextn(qctx->ctx, false, false);
+        qlh_layer_out_set(qctx->ctx, qctx->model, false);
         return -1;
     }
     for (int i = 0; i < n_tokens; ++i) {
@@ -1248,22 +1305,12 @@ static jint qlh_layer_forward_keep_head_impl(
     batch.n_tokens = n_tokens;
     std::memcpy(batch.embd, hidden.data(), hidden.size() * sizeof(float));
 
-    // pos 按 n_pos_per_embd * n_tokens 重建（与 Hidden 版同一修法）。
-    {
-        const size_t pos_len = (size_t) QLH_LAYER_N_POS_PER_EMBD * (size_t) n_tokens;
-        auto * pos_ext = static_cast<llama_pos *>(malloc(pos_len * sizeof(llama_pos)));
-        if (pos_ext == nullptr) {
-            llama_batch_free(batch);
-            llama_set_embeddings_nextn(qctx->ctx, false, false);
-            return -1;
-        }
-        for (int j = 0; j < QLH_LAYER_N_POS_PER_EMBD; ++j) {
-            for (int i = 0; i < n_tokens; ++i) {
-                pos_ext[(size_t) j * (size_t) n_tokens + (size_t) i] = pos_base + i;
-            }
-        }
-        free(batch.pos);
-        batch.pos = pos_ext;
+    // pos 按 n_pos_per_embd * n_tokens 重建（与 Hidden 版同一修法）；源值取已填好的
+    // `batch.pos`（保留显式 `positions`，不要用 `pos_base + i` 覆盖）。
+    if (!qlh_rebuild_pos_planar(batch, n_tokens, qlh_n_pos_per_embd(qctx->model))) {
+        llama_batch_free(batch);
+        qlh_layer_out_set(qctx->ctx, qctx->model, false);
+        return -1;
     }
 
     jint result = -1;
@@ -1280,23 +1327,24 @@ static jint qlh_layer_forward_keep_head_impl(
             }
             result = (jint) best;
         }
-        const float * hidden_out = llama_get_embeddings_nextn_ith(qctx->ctx, n_tokens - 1);
+        const float * hidden_out = qlh_layer_out_get(qctx->ctx, qctx->model, n_tokens);
         if (hidden_out == nullptr) {
             llama_batch_free(batch);
-            llama_set_embeddings_nextn(qctx->ctx, false, false);
-            return -3;  // nextn 通道不可用 ⇒ 调用方 fail-closed
+            qlh_layer_out_set(qctx->ctx, qctx->model, false);
+            return -3;  // 层输出通道不可用 ⇒ 调用方 fail-closed
         }
         env->SetFloatArrayRegion(out_hidden, 0, (jsize) n_embd_inp, hidden_out);
         if (env->ExceptionCheck()) {
             llama_batch_free(batch);
-            llama_set_embeddings_nextn(qctx->ctx, false, false);
+            qlh_layer_out_set(qctx->ctx, qctx->model, false);
             return -1;
         }
     }
 
     llama_batch_free(batch);
-    // 复位：nextn 导出只服务本次中间段调用，不污染后续普通推理。
-    llama_set_embeddings_nextn(qctx->ctx, false, false);
+    // 复位：层输出导出只服务本次中间段调用，不污染后续普通推理
+    //（该槽位会占 n_embd * n_batch 的缓冲，见 llama-context.cpp 的 output_reserve）。
+    qlh_layer_out_set(qctx->ctx, qctx->model, false);
     return result;
 }
 
@@ -1318,7 +1366,7 @@ Java_com_qlh_inference_service_LocalInferenceEngine_nativeLayerForwardHiddenKeep
 // 多序列交错推进时必须用这个入口 —— 否则 llama.cpp 会按隐式位置递增报
 // "tokens ... have inconsistent sequence positions"。
 //
-// 返回同 `...HiddenKeepHead`：末位 argmax（>=0）/ -1 形状错 / -3 nextn 通道不可用。
+// 返回同 `...HiddenKeepHead`：末位 argmax（>=0）/ -1 形状错 / -3 层输出通道不可用。
 extern "C" JNIEXPORT jint JNICALL
 Java_com_qlh_inference_service_LocalInferenceEngine_nativeLayerForwardHiddenKeepHeadSeq(
     JNIEnv * env, jobject /* thiz */, jlong model_ptr,
@@ -1383,7 +1431,7 @@ Java_com_qlh_inference_service_LocalInferenceEngine_nativeLayerForwardInfo(
     // 裁层 GGUF 天然只含尾段层 ⇒ `n_layer` 即本节点实际负责的层数；
     // 层区间的**源模型**编号由主仓按 `layer_range` 下发，不在此臆测。
     map_put(env, map, put_method, "hidden_dtype", "float32");
-    map_put(env, map, put_method, "n_pos_per_embd", std::to_string(QLH_LAYER_N_POS_PER_EMBD));
+    map_put(env, map, put_method, "n_pos_per_embd", std::to_string(qlh_n_pos_per_embd(qctx->model)));
     map_put(env, map, put_method, "acceptance", "per_token_argmax");
     // ★ 2026-09-20：能否承**中间段**取决于 load 时是否开了隐藏态导出。
     //   末段（只要 argmax）不受该开关影响 ⇒ 两个能力分别上报。
@@ -1394,11 +1442,12 @@ Java_com_qlh_inference_service_LocalInferenceEngine_nativeLayerForwardInfo(
         map_put(env, map, put_method, "middle_reason",
                 "extract_hidden_states not enabled at load time");
     }
-    // ★ 2026-09-21：中间段的**正确**通道。`extract_hidden`（embeddings 通道）给的是
+    // ★ 2026-09-23：中间段的**正确**通道。`extract_hidden`（embeddings 通道）给的是
     //   `output_norm(H)`，比层接力所需的 hidden 多一次归一化，两者不可混用；
-    //   keep-head 走 nextn（末层输出，norm 之前）⇒ 与主仓 D→L / L→L / 三段语义一致。
+    //   keep-head 走 **`layer_inp` 的 `lid == n_layer` 槽位**（末层输出，`output_norm` 之前）
+    //   ⇒ 与主仓 D→L / L→L / 三段语义一致，且不随各架构 `t_h_nextn` 的挂点变化。
     //   能力单独上报：调用方据此选择通道，而不是靠 extract_hidden 猜。
     map_put(env, map, put_method, "keep_head_middle", "true");
-    map_put(env, map, put_method, "middle_channel", "keep_head_nextn");
+    map_put(env, map, put_method, "middle_channel", "keep_head_layer_out");
     return map;
 }
