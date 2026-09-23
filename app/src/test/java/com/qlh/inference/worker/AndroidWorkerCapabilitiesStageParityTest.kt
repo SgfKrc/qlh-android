@@ -42,7 +42,12 @@ class AndroidWorkerCapabilitiesStageParityTest {
         ),
     )
 
-    private fun offer(stageType: String, version: Int = TaskWorkerProtocol.VERSION): TaskWorkerEnvelope =
+    private fun offer(
+        stageType: String,
+        version: Int = TaskWorkerProtocol.VERSION,
+        // ★ 2026-09-23：可选注入 `middle_channel`（缺省 = 不发该字段 ⇒ 旧行为）。
+        middleChannel: String? = null,
+    ): TaskWorkerEnvelope =
         TaskWorkerProtocol.buildStageOffer(
             identity = TaskWorkerAttemptIdentity(
                 workflowId = "wf_parity_stage_01",
@@ -70,7 +75,7 @@ class AndroidWorkerCapabilitiesStageParityTest {
                         "n_embd" to 4,
                         "dtype" to "float32",
                     ),
-                )
+                ) + (middleChannel?.let { mapOf("middle_channel" to it) } ?: emptyMap())
             } else {
                 emptyMap()
             },
@@ -167,6 +172,69 @@ class AndroidWorkerCapabilitiesStageParityTest {
             assertEquals("invalid_hidden_payload", e.code)
             assertEquals(0, layerCalls)
         }
+    }
+
+    @Test
+    fun `layer_forward passes middle_channel through to the executor`() = runBlocking {
+        // ★ 2026-09-23：`middle_channel=keep_head_layer_out` 必须一路透传到 `LayerForwardRequest`
+        //   —— 否则中间段仍走 `extract_hidden`（= `output_norm(H)`，多一次归一化）。
+        var seen: LayerForwardRequest? = null
+        val executor = wiredExecutor(
+            onLayer = { req ->
+                seen = req
+                Result.success(LayerForwardResult(tokenArgmax = 5, hiddenOut = null))
+            },
+        )
+        val result = executor.execute(offer("layer_forward", middleChannel = "keep_head_layer_out"))
+        assertEquals("keep_head_layer_out", seen?.middleChannel)
+        // 实际生效的通道要回记在 metadata 里，便于对账。
+        assertEquals("keep_head_layer_out", result.metadata["middle_channel"])
+    }
+
+    @Test
+    fun `layer_forward defaults to extract_hidden when middle_channel is absent`() = runBlocking {
+        var seen: LayerForwardRequest? = null
+        val executor = wiredExecutor(
+            onLayer = { req ->
+                seen = req
+                Result.success(LayerForwardResult(tokenArgmax = 6, hiddenOut = null))
+            },
+        )
+        val result = executor.execute(offer("layer_forward"))
+        assertEquals("extract_hidden", seen?.middleChannel)
+        assertEquals("extract_hidden", result.metadata["middle_channel"])
+    }
+
+    @Test
+    fun `unknown middle_channel is rejected by the protocol when building the offer`() {
+        // 协议层在**构造** stage_offer 时就会校验值域 ⇒ 非法通道根本发不出去。
+        try {
+            offer("layer_forward", middleChannel = "bogus_channel")
+            fail("unknown middle_channel must be rejected while building the offer")
+        } catch (e: TaskWorkerProtocolException) {
+            assertTrue(e.message.orEmpty().contains("middle_channel"))
+        }
+    }
+
+    @Test
+    fun `layer_forward executor also rejects an unknown middle_channel`() = runBlocking {
+        // 执行器也可能被**直接**调用（不经协议层）⇒ 兜底校验同样要 fail-closed。
+        var layerCalls = 0
+        val executor = wiredExecutor(
+            onLayer = {
+                layerCalls++
+                Result.success(LayerForwardResult(tokenArgmax = 1, hiddenOut = null))
+            },
+        )
+        val env = offer("layer_forward")
+        val tampered = env.copy(payload = env.payload + ("middle_channel" to "bogus_channel"))
+        try {
+            executor.execute(tampered)
+            fail("unknown middle_channel must fail closed")
+        } catch (e: AndroidFullWorkerStageException) {
+            assertEquals("unsupported_middle_channel", e.code)
+        }
+        assertEquals(0, layerCalls)
     }
 
     private fun floatArrayToBase64(values: FloatArray): String {

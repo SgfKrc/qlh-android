@@ -373,7 +373,10 @@ object TaskWorkerProtocol {
                 envelope.messageType == STAGE_OFFER &&
                 envelope.payload["stage_type"] == LAYER_FORWARD_STAGE
             ) {
-                layerForwardOfferFields
+                // ★ 2026-09-23：可选层段字段只在**真的出现**时放宽
+                //   （`requireExact` 是双向精确匹配，写进必填集合会破坏旧对端）。
+                layerForwardOfferFields +
+                    layerForwardOptionalFields.filter { envelope.payload.containsKey(it) }.toSet()
             } else {
                 emptySet()
             }
@@ -406,9 +409,33 @@ object TaskWorkerProtocol {
             capabilities.keys,
             expectedCapabilityFields +
                 (if (capabilities.containsKey("resource_gate")) setOf("resource_gate") else emptySet()) +
-                (if (capabilities.containsKey("layer_ranges")) setOf("layer_ranges") else emptySet()),
+                (if (capabilities.containsKey("layer_ranges")) setOf("layer_ranges") else emptySet()) +
+                // ★ 2026-09-23：中间段通道与 M-RoPE 位置分量数（均可选，向后兼容）
+                (if (capabilities.containsKey("middle_channel")) setOf("middle_channel") else emptySet()) +
+                (if (capabilities.containsKey("n_pos_per_embd")) setOf("n_pos_per_embd") else emptySet()),
             "payload.capabilities",
         )
+        if (capabilities.containsKey("middle_channel")) {
+            val channel = capabilities["middle_channel"] as? String
+            if (channel == null || channel !in layerForwardMiddleChannels) {
+                fail(
+                    "capabilities.middle_channel must be one of " +
+                        layerForwardMiddleChannels.sorted().joinToString(", "),
+                    "invalid_capabilities",
+                    "payload.capabilities.middle_channel",
+                )
+            }
+        }
+        if (capabilities.containsKey("n_pos_per_embd")) {
+            val nPos = (capabilities["n_pos_per_embd"] as? Number)?.toInt()
+            if (nPos == null || nPos !in setOf(1, 4)) {
+                fail(
+                    "capabilities.n_pos_per_embd must be 1 or 4",
+                    "invalid_capabilities",
+                    "payload.capabilities.n_pos_per_embd",
+                )
+            }
+        }
         val stageTypes = stringList(capabilities, "stage_types")
         if (!AndroidWorkerCapabilities.areAllStageTypesSupported(stageTypes)) {
             fail(
@@ -592,6 +619,22 @@ object TaskWorkerProtocol {
         setOf("layer_range", "handoff_at", "hidden_sha256", "hidden_spec")
 
     /**
+     * ★ 2026-09-23：`layer_forward` 的**可选**层段字段（出现才允许）。
+     *
+     * ⚠️ 不能直接并进 [layerForwardOfferFields]：`requireExact` 是**双向精确**匹配 ⇒ 一旦写进
+     * 必填集合，缺该字段的旧对端会被判 `field_mismatch`（与主仓同一坑，实测）。因此这里按
+     * 「payload 里是否真的出现」动态放宽，且**仅**在 v3 + `layer_forward` 下生效。
+     */
+    private val layerForwardOptionalFields = setOf("middle_channel")
+
+    /**
+     * `middle_channel` 的允许值 —— 与主仓 `_LAYER_FORWARD_MIDDLE_CHANNELS` **同集合**：
+     * * `extract_hidden` —— 旧的默认通道，返回 `output_norm(H)`（多一次归一化）；
+     * * `keep_head_layer_out` —— `layer_inp` 的 `lid == n_layer` 槽位，返回**末层输出**。
+     */
+    private val layerForwardMiddleChannels = setOf("extract_hidden", "keep_head_layer_out")
+
+    /**
      * ★ 2026-09-20（v3 层段）：`layer_forward` stage_offer 的专项字段校验。
      *
      * 与主仓 `src/task_worker_protocol.py` 的 v3 分支**逐条对称**：
@@ -641,6 +684,19 @@ object TaskWorkerProtocol {
                 "unsupported_hidden_dtype",
                 "payload.hidden_spec.dtype",
             )
+        }
+        // ★ 2026-09-23：`middle_channel` 可选；一旦出现必须落在允许集合内（fail-closed）。
+        //   缺失 = `extract_hidden`（旧行为，向后兼容）。
+        if (payload.containsKey("middle_channel")) {
+            val channel = payload["middle_channel"] as? String
+            if (channel == null || channel !in layerForwardMiddleChannels) {
+                fail(
+                    "middle_channel must be one of " +
+                        layerForwardMiddleChannels.sorted().joinToString(", "),
+                    "unsupported_middle_channel",
+                    "payload.middle_channel",
+                )
+            }
         }
     }
 

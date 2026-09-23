@@ -111,6 +111,10 @@ object AndroidWorkerCapabilities {
         resourceAdmitted: Boolean = false,
         resourceReason: String = "resource_gate_not_confirmed",
         layerRanges: List<List<Int>> = emptyList(),
+        // ★ 2026-09-23：中间段通道能力与 M-RoPE 位置分量数（来自 native 的 `layerForwardInfo()`）。
+        //   `null` = 未声明 ⇒ 不写这两个键（协议侧它们都是可选的）。
+        middleChannel: String? = null,
+        nPosPerEmbd: Int? = null,
     ): Map<String, Any?> {
         val normalizedReason = if (resourceAdmitted) "" else resourceReason.ifBlank {
             "resource_gate_not_confirmed"
@@ -136,6 +140,11 @@ object AndroidWorkerCapabilities {
             ),
         )
         if (normalizedRanges.isNotEmpty()) capabilities["layer_ranges"] = normalizedRanges
+        // ★ 2026-09-23：把 native 上报的「中间段通道 / M-RoPE 位置分量数」并入 capabilities，
+        //   让调度侧能**知道**本节点中间段实际可走哪条通道（值域与协议侧同集合），
+        //   而不是靠 `extract_hidden` 去猜。
+        if (middleChannel != null) capabilities["middle_channel"] = middleChannel
+        if (nPosPerEmbd != null && nPosPerEmbd > 0) capabilities["n_pos_per_embd"] = nPosPerEmbd
         return capabilities
     }
 }

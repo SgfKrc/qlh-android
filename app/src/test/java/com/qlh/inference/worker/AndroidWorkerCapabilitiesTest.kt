@@ -52,4 +52,31 @@ class AndroidWorkerCapabilitiesTest {
         )
         TaskWorkerProtocol.validate(hello)
     }
+
+    @Test
+    fun `middle_channel and n_pos_per_embd are advertised when native reports them`() {
+        // ★ 2026-09-23：native `layerForwardInfo()` 上报 ⇒ worker capabilities 里要能看到
+        //   中间段通道与 M-RoPE 位置分量数；缺省不写这两个键（向后兼容）。
+        val advertised = AndroidWorkerCapabilities.build(
+            modelId = "qwen3_5_9b",
+            resourceAdmitted = true,
+            middleChannel = "keep_head_layer_out",
+            nPosPerEmbd = 4,
+        )
+        assertEquals("keep_head_layer_out", advertised["middle_channel"])
+        assertEquals(4, (advertised["n_pos_per_embd"] as? Number)?.toInt())
+        TaskWorkerProtocol.validate(
+            TaskWorkerProtocol.buildHello(
+                nodeId = "android_worker_01",
+                capabilities = advertised,
+                messageId = "msg_capabilities_channel_01",
+                sentAtMs = 1_700_000_000_000,
+            ),
+        )
+
+        // 不传 ⇒ 两个键都不出现（旧行为不变）。
+        val plain = AndroidWorkerCapabilities.build(modelId = "qwen3_5_9b")
+        assertTrue(!plain.containsKey("middle_channel"))
+        assertTrue(!plain.containsKey("n_pos_per_embd"))
+    }
 }

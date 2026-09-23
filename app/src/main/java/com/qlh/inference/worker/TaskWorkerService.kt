@@ -102,6 +102,14 @@ class TaskWorkerService : Service() {
             ?.getOrNull()
             ?.map { listOf(it.startLayer, it.endLayerExclusive) }
             .orEmpty()
+        // ★ 2026-09-23：native 的中间段能力（`layerForwardInfo()` 是 suspend，且要求模型已加载）
+        //   ⇒ 这里预取一次，capabilities lambda（非 suspend）后续直接读；模型未加载时留空
+        //   （协议侧这两个键都是可选的，缺失即不写）。
+        val layerForwardInfo = QlhApplication.instance.inferenceService
+            ?.engine
+            ?.layerForwardInfo()
+            ?.getOrNull()
+            .orEmpty()
         val expectedModelIdentity = {
             AndroidWorkerCapabilities.modelIdentity(
                 modelId, modelFormat, modelRevision, modelSha256, resourceAdmitted,
@@ -129,6 +137,8 @@ class TaskWorkerService : Service() {
                     resourceAdmitted = resourceAdmitted,
                     resourceReason = resourceReason,
                     layerRanges = layerRanges,
+                    middleChannel = layerForwardInfo["middle_channel"],
+                    nPosPerEmbd = layerForwardInfo["n_pos_per_embd"]?.toIntOrNull(),
                 )
             },
             stageHandler = AndroidFullWorkerStageExecutor(
@@ -154,6 +164,10 @@ class TaskWorkerService : Service() {
                             nTokens = req.nTokens,
                             posBase = req.posBase,
                             wantHidden = req.wantHidden,
+                            // ★ 2026-09-23：中间段通道由 stage_offer 的 `middle_channel` 决定 ——
+                            //   `keep_head_layer_out` ⇒ keep-head（**末层输出**，`output_norm` 之前），
+                            //   其余 ⇒ 旧的 `extract_hidden`（`output_norm(H)`，多一次归一化）。
+                            keepHead = req.middleChannel == "keep_head_layer_out",
                         ).map { out ->
                             LayerForwardResult(
                                 tokenArgmax = out.tokenArgmax,

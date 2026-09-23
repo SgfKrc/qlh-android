@@ -266,4 +266,77 @@ class TaskWorkerProtocolTest {
             )
         }
     }
+
+    @Test
+    fun `v3 layer_forward accepts a known middle_channel and rejects unknown ones`() {
+        // ★ 2026-09-23：`middle_channel` 是 v3 层段的**可选**字段（值域与主仓同集合）。
+        TaskWorkerProtocol.validate(layerForwardOffer(middleChannel = "keep_head_layer_out"))
+        TaskWorkerProtocol.validate(layerForwardOffer(middleChannel = "extract_hidden"))
+        // 缺省（不发该字段）= 旧行为，必须仍然通过（向后兼容）。
+        TaskWorkerProtocol.validate(layerForwardOffer(middleChannel = null))
+        expectProtocolError("unsupported_middle_channel") {
+            TaskWorkerProtocol.validate(layerForwardOffer(middleChannel = "bogus_channel"))
+        }
+    }
+
+    @Test
+    fun `hello capabilities may advertise middle_channel and n_pos_per_embd`() {
+        TaskWorkerProtocol.validate(
+            TaskWorkerProtocol.buildHello(
+                nodeId = "android_worker_01",
+                capabilities = mapOf(
+                    "stage_types" to listOf("full_inference", "layer_forward"),
+                    "engines" to listOf("llama_cpp"),
+                    "models" to emptyList<Map<String, Any?>>(),
+                    "max_concurrency" to 1,
+                    "middle_channel" to "keep_head_layer_out",
+                    "n_pos_per_embd" to 4,
+                ),
+                messageId = "msg_capabilities_channel_01",
+                sentAtMs = 1_700_000_000_000,
+            ),
+        )
+        // 值域外的声明必须 fail-closed（不能靠调度侧猜）。
+        expectProtocolError("invalid_capabilities") {
+            TaskWorkerProtocol.validate(
+                TaskWorkerProtocol.buildHello(
+                    nodeId = "android_worker_01",
+                    capabilities = mapOf(
+                        "stage_types" to listOf("full_inference"),
+                        "engines" to listOf("llama_cpp"),
+                        "models" to emptyList<Map<String, Any?>>(),
+                        "max_concurrency" to 1,
+                        "n_pos_per_embd" to 3,
+                    ),
+                    messageId = "msg_capabilities_channel_02",
+                    sentAtMs = 1_700_000_000_000,
+                ),
+            )
+        }
+    }
+
+    /** 构造一个最小合法 v3 层段 offer；`middleChannel=null` ⇒ 不发该字段（旧行为）。 */
+    private fun layerForwardOffer(middleChannel: String?): TaskWorkerEnvelope =
+        TaskWorkerProtocol.buildStageOffer(
+            identity = identity,
+            requestId = "request_channel_01",
+            stageType = "layer_forward",
+            providerId = "remote_android_worker_01",
+            leaseExpiresAtMs = 2_000,
+            rootInput = mapOf(
+                "hidden_f32" to java.util.Base64.getEncoder().encodeToString(ByteArray(16)),
+                "context_size" to 2048,
+                "want_hidden" to true,
+            ),
+            dependencies = emptyMap(),
+            modelIdentity = model,
+            messageId = "msg_channel_01",
+            sentAtMs = 1_000,
+            stageFields = mapOf(
+                "layer_range" to listOf(4, 8),
+                "handoff_at" to 4,
+                "hidden_sha256" to "c".repeat(64),
+                "hidden_spec" to mapOf("n_tokens" to 1, "n_embd" to 4, "dtype" to "float32"),
+            ) + (middleChannel?.let { mapOf("middle_channel" to it) } ?: emptyMap()),
+        )
 }

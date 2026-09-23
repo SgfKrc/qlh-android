@@ -27,6 +27,13 @@ data class LayerForwardRequest(
     val nEmbd: Int,
     val posBase: Int,
     val wantHidden: Boolean,
+    /**
+     * ★ 2026-09-23：**中间段取 hidden 的通道**（来自 stage_offer 的 `middle_channel`）。
+     *
+     * `"keep_head_layer_out"` ⇒ 走 keep-head 通道（**末层输出**，`output_norm` 之前，
+     * 层段接力所需的形态）；其余（含缺省 `"extract_hidden"`）⇒ 旧通道 `output_norm(H)`。
+     */
+    val middleChannel: String = "extract_hidden",
 ) {
     override fun equals(other: Any?): Boolean = this === other
     override fun hashCode(): Int = System.identityHashCode(this)
@@ -211,6 +218,15 @@ class AndroidFullWorkerStageExecutor(
         // 中间段（要产出 hidden）必须由 load 时开 extract_hidden_states；
         // 末段只需 argmax，不开也能跑 ⇒ 是否中间段由调用方显式声明。
         val wantHidden = (rootInput["want_hidden"] as? Boolean) ?: false
+        // ★ 2026-09-23：中间段取 hidden 的通道（缺省 = 旧的 `extract_hidden`）。
+        //   协议层已做值域校验，这里再兜一次 fail-closed（执行器也可能被直接调用）。
+        val middleChannel = (payload["middle_channel"] as? String) ?: "extract_hidden"
+        if (middleChannel != "extract_hidden" && middleChannel != "keep_head_layer_out") {
+            throw AndroidFullWorkerStageException(
+                "unsupported_middle_channel",
+                "middle_channel must be extract_hidden or keep_head_layer_out (got [$middleChannel])",
+            )
+        }
         val loaderResult = if (wantHidden || layerRange.isNotEmpty()) {
             ensureModelLoadedForLayer(
                 layerRange,
@@ -239,6 +255,7 @@ class AndroidFullWorkerStageExecutor(
                 nEmbd = nEmbd,
                 posBase = posBase,
                 wantHidden = wantHidden,
+                middleChannel = middleChannel,
             ),
         ).getOrElse { error ->
             throw AndroidFullWorkerStageException(
@@ -265,6 +282,8 @@ class AndroidFullWorkerStageExecutor(
             metadata = mapOf(
                 "model" to (advertised["model_id"] as? String).orEmpty(),
                 "stage" to "layer_forward",
+                // ★ 2026-09-23：回记实际生效的中间段通道，便于对账（缺省即 extract_hidden）。
+                "middle_channel" to middleChannel,
                 "handoff_at" to handoffAt,
                 "tail" to (!wantHidden).toString(),
             ),
