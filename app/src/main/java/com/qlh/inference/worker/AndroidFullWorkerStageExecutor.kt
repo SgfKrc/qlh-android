@@ -1,5 +1,6 @@
 package com.qlh.inference.worker
 
+import kotlin.math.pow
 import kotlin.math.roundToInt
 
 /** Stable worker-side failures; TaskWorkerClient maps these to protocol error codes. */
@@ -34,6 +35,14 @@ data class LayerForwardRequest(
      * 层段接力所需的形态）；其余（含缺省 `"extract_hidden"`）⇒ 旧通道 `output_norm(H)`。
      */
     val middleChannel: String = "extract_hidden",
+    /**
+     * ★ 2026-09-23（A12）：**多序列显式位置**（来自 stage_offer 的 `seq_ids` / `positions`）。
+     *
+     * 长度必须等于 [nTokens]（协议层已校验）；`null` = 单序列旧行为。多序列交错推进时必须给，
+     * 否则 llama.cpp 会按隐式位置递增报 "tokens … have inconsistent sequence positions"。
+     */
+    val seqIds: IntArray? = null,
+    val positions: IntArray? = null,
 ) {
     override fun equals(other: Any?): Boolean = this === other
     override fun hashCode(): Int = System.identityHashCode(this)
@@ -189,16 +198,17 @@ class AndroidFullWorkerStageExecutor(
                 "hidden_spec.n_tokens/n_embd must be positive",
             )
         }
-        if (dtype != "float32") {
-            // 仅支持 f32：跨框架接力以 f32 为基线（见主仓 relay 合同）。
+        if (dtype != "float32" && dtype != "float16") {
+            // ★ 2026-09-23（对称性缺口 A13）：与主仓协议对齐 —— `float32` / `float16` 都接受；
+            //   f16 在本段就地转 f32 再喂 JNI（native 侧只吃 f32）。
             throw AndroidFullWorkerStageException(
                 "unsupported_hidden_dtype",
-                "Android layer_forward accepts float32 hidden (got [${dtype ?: "null"}])",
+                "Android layer_forward accepts float32 or float16 hidden (got [${dtype ?: "null"}])",
             )
         }
         val rootInput = payload["root_input"] as? Map<*, *>
             ?: throw AndroidFullWorkerStageException("invalid_stage_input", "root_input must be an object")
-        val hidden = readHiddenPayload(rootInput, nTokens, nEmbd)
+        val hidden = readHiddenPayload(rootInput, nTokens, nEmbd, dtype ?: "float32")
             ?: throw AndroidFullWorkerStageException(
                 "invalid_hidden_payload",
                 "root_input must carry hidden_f32 (base64) of length n_tokens * n_embd",
@@ -227,6 +237,10 @@ class AndroidFullWorkerStageExecutor(
                 "middle_channel must be extract_hidden or keep_head_layer_out (got [$middleChannel])",
             )
         }
+        // ★ 2026-09-23（A12）：多序列显式位置（可选）。协议层已校验形状与取值，这里**再兜一次**
+        //   fail-closed —— 存在但非法时抛错，绝不静默退化成单序列（那会让多序列链路悄悄算错）。
+        val seqIds = optionalIntList(payload, "seq_ids", nTokens)
+        val positions = optionalIntList(payload, "positions", nTokens)
         val loaderResult = if (wantHidden || layerRange.isNotEmpty()) {
             ensureModelLoadedForLayer(
                 layerRange,
@@ -256,6 +270,8 @@ class AndroidFullWorkerStageExecutor(
                 posBase = posBase,
                 wantHidden = wantHidden,
                 middleChannel = middleChannel,
+                seqIds = seqIds,
+                positions = positions,
             ),
         ).getOrElse { error ->
             throw AndroidFullWorkerStageException(
@@ -291,23 +307,94 @@ class AndroidFullWorkerStageExecutor(
     }
 
     /** 从 `root_input` 读 hidden：支持 `hidden_f32`（base64）或 `hidden_f32_b64`。 */
-    private fun readHiddenPayload(rootInput: Map<*, *>, nTokens: Int, nEmbd: Int): FloatArray? {
-        val encoded = (rootInput["hidden_f32"] as? String)
-            ?: (rootInput["hidden_f32_b64"] as? String)
+    /**
+     * 解析**可选**的整数数组字段（`seq_ids` / `positions`）。
+     *
+     * ⚠️ fail-closed：字段**存在但形状/取值非法**时抛错，绝不静默退化成单序列 ——
+     * 否则多序列链路会「看起来在跑、其实算错」。字段不存在 ⇒ 返回 `null`（单序列旧行为）。
+     */
+    private fun optionalIntList(payload: Map<String, Any?>, field: String,
+                                expectedSize: Int): IntArray? {
+        if (!payload.containsKey(field)) return null
+        val list = payload[field] as? List<*>
+            ?: throw AndroidFullWorkerStageException(
+                "invalid_$field", "$field must be a list of length $expectedSize")
+        if (list.size != expectedSize) {
+            throw AndroidFullWorkerStageException(
+                "invalid_$field", "$field must have $expectedSize entries (got ${list.size})")
+        }
+        val out = IntArray(list.size)
+        for (i in list.indices) {
+            val number = (list[i] as? Number)?.toInt()
+            if (number == null || number < 0) {
+                throw AndroidFullWorkerStageException(
+                    "invalid_$field", "$field entries must be non-negative integers")
+            }
+            out[i] = number
+        }
+        return out
+    }
+
+    /**
+     * 解析 `root_input` 里的 hidden（**f32 与 f16 都支持**，little-endian + base64）。
+     *
+     * ★ 2026-09-23（A13 对称性缺口）：主仓协议允许 `hidden_spec.dtype` 为 `float32` **或**
+     * `float16`，而这里原先只解析 `hidden_f32` ⇒ 会造成「协商通过、执行必失败」的隐性不对称。
+     * 现在按 `dtype` 取对应字段（`hidden_f32` / `hidden_f16`，各带 `_b64` 别名），
+     * f16 就在本段转成 f32（native 侧只吃 f32）。
+     */
+    private fun readHiddenPayload(
+        rootInput: Map<*, *>,
+        nTokens: Int,
+        nEmbd: Int,
+        dtype: String,
+    ): FloatArray? {
+        val elementBytes = when (dtype) {
+            "float32" -> 4
+            "float16" -> 2
+            else -> return null
+        }
+        val suffix = if (dtype == "float16") "f16" else "f32"
+        val encoded = (rootInput["hidden_$suffix"] as? String)
+            ?: (rootInput["hidden_${suffix}_b64"] as? String)
             ?: return null
         val bytes = try {
             java.util.Base64.getDecoder().decode(encoded)
         } catch (_: IllegalArgumentException) {
             return null
         }
-        val expected = nTokens.toLong() * nEmbd.toLong() * 4L
+        val expected = nTokens.toLong() * nEmbd.toLong() * elementBytes.toLong()
         if (bytes.size.toLong() != expected) return null
         val out = FloatArray(nTokens * nEmbd)
         val buf = java.nio.ByteBuffer.wrap(bytes).order(java.nio.ByteOrder.LITTLE_ENDIAN)
-        for (i in out.indices) {
-            out[i] = buf.float
+        if (elementBytes == 4) {
+            for (i in out.indices) {
+                out[i] = buf.float
+            }
+        } else {
+            for (i in out.indices) {
+                out[i] = halfToFloat(buf.short.toInt())
+            }
         }
         return out
+    }
+
+    /**
+     * IEEE-754 **半精度 → float**（`hidden_f16` 的 wire 口径：LE 的 16 位二进制）。
+     *
+     * 覆盖三种形态：规格化、非规格化（含 ±0）、Inf/NaN —— 后者在数值链路里本应被上游挡住，
+     * 但解析层不能把它们变成垃圾值。实现用 `pow` 而不是位拼装，避免非规格化的精度损失。
+     */
+    private fun halfToFloat(bits: Int): Float {
+        val sign = if ((bits shr 15) and 0x1 == 1) -1.0f else 1.0f
+        val exponent = (bits shr 10) and 0x1F
+        val mantissa = bits and 0x3FF
+        return when {
+            exponent == 0 -> sign * mantissa.toFloat() * 2f.pow(-24)
+            exponent == 0x1F && mantissa == 0 -> sign * Float.POSITIVE_INFINITY
+            exponent == 0x1F -> Float.NaN
+            else -> sign * (1.0f + mantissa.toFloat() / 1024f) * 2f.pow(exponent - 15)
+        }
     }
 
     private fun sha256Hex(data: FloatArray): String {

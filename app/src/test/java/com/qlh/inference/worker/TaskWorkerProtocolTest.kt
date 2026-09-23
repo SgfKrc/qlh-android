@@ -315,16 +315,27 @@ class TaskWorkerProtocolTest {
         }
     }
 
-    /** 构造一个最小合法 v3 层段 offer；`middleChannel=null` ⇒ 不发该字段（旧行为）。 */
-    private fun layerForwardOffer(middleChannel: String?): TaskWorkerEnvelope =
-        TaskWorkerProtocol.buildStageOffer(
+    /**
+     * 构造一个最小合法 v3 层段 offer。
+     *
+     * `middleChannel` / `extraFields` 缺省 ⇒ 不发对应可选字段（旧行为）；
+     * `hiddenDtype="float16"` 时 `root_input` 放 `hidden_f16`（1×4 ⇒ 8 字节）。
+     */
+    private fun layerForwardOffer(
+        middleChannel: String? = null,
+        hiddenDtype: String = "float32",
+        extraFields: Map<String, Any?> = emptyMap(),
+    ): TaskWorkerEnvelope {
+        val hiddenField = if (hiddenDtype == "float16") "hidden_f16" else "hidden_f32"
+        val hiddenBytes = if (hiddenDtype == "float16") 8 else 16
+        return TaskWorkerProtocol.buildStageOffer(
             identity = identity,
             requestId = "request_channel_01",
             stageType = "layer_forward",
             providerId = "remote_android_worker_01",
             leaseExpiresAtMs = 2_000,
             rootInput = mapOf(
-                "hidden_f32" to java.util.Base64.getEncoder().encodeToString(ByteArray(16)),
+                hiddenField to java.util.Base64.getEncoder().encodeToString(ByteArray(hiddenBytes)),
                 "context_size" to 2048,
                 "want_hidden" to true,
             ),
@@ -336,7 +347,32 @@ class TaskWorkerProtocolTest {
                 "layer_range" to listOf(4, 8),
                 "handoff_at" to 4,
                 "hidden_sha256" to "c".repeat(64),
-                "hidden_spec" to mapOf("n_tokens" to 1, "n_embd" to 4, "dtype" to "float32"),
-            ) + (middleChannel?.let { mapOf("middle_channel" to it) } ?: emptyMap()),
+                "hidden_spec" to mapOf("n_tokens" to 1, "n_embd" to 4, "dtype" to hiddenDtype),
+            ) + (middleChannel?.let { mapOf("middle_channel" to it) } ?: emptyMap()) + extraFields,
         )
+    }
+
+    @Test
+    fun `v3 layer_forward accepts float16 hidden and explicit multi-sequence positions`() {
+        // ★ A13：`dtype` 与主仓对齐（`float32` / `float16` 都接受）
+        TaskWorkerProtocol.validate(layerForwardOffer(hiddenDtype = "float16"))
+
+        // ★ A12：`seq_ids` / `positions` 可选；长度必须等于 `hidden_spec.n_tokens`（这里 1）
+        TaskWorkerProtocol.validate(
+            layerForwardOffer(extraFields = mapOf(
+                "seq_ids" to listOf(0),
+                "positions" to listOf(0),
+            )),
+        )
+        expectProtocolError("invalid_seq_ids") {
+            TaskWorkerProtocol.validate(
+                layerForwardOffer(extraFields = mapOf("seq_ids" to listOf(0, 1))),
+            )
+        }
+        expectProtocolError("invalid_positions") {
+            TaskWorkerProtocol.validate(
+                layerForwardOffer(extraFields = mapOf("positions" to listOf(-1))),
+            )
+        }
+    }
 }

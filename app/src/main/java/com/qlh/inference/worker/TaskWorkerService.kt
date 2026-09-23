@@ -168,6 +168,9 @@ class TaskWorkerService : Service() {
                             //   `keep_head_layer_out` ⇒ keep-head（**末层输出**，`output_norm` 之前），
                             //   其余 ⇒ 旧的 `extract_hidden`（`output_norm(H)`，多一次归一化）。
                             keepHead = req.middleChannel == "keep_head_layer_out",
+                            // ★ 2026-09-23（A12）：多序列显式位置（协议层已校验；null = 单序列）。
+                            seqIds = req.seqIds,
+                            positions = req.positions,
                         ).map { out ->
                             LayerForwardResult(
                                 tokenArgmax = out.tokenArgmax,

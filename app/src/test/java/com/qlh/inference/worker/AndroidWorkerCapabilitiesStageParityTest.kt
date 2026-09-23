@@ -45,10 +45,35 @@ class AndroidWorkerCapabilitiesStageParityTest {
     private fun offer(
         stageType: String,
         version: Int = TaskWorkerProtocol.VERSION,
-        // ★ 2026-09-23：可选注入 `middle_channel`（缺省 = 不发该字段 ⇒ 旧行为）。
+        // ★ 2026-09-23：可选注入 `middle_channel` / 多序列位置 / f16 hidden（缺省 = 旧行为）。
         middleChannel: String? = null,
-    ): TaskWorkerEnvelope =
-        TaskWorkerProtocol.buildStageOffer(
+        hiddenDtype: String = "float32",
+        seqIds: List<Int>? = null,
+        positions: List<Int>? = null,
+    ): TaskWorkerEnvelope {
+        val rootInput = rootInputByStage.getValue(stageType).toMutableMap()
+        if (stageType == "layer_forward" && hiddenDtype == "float16") {
+            rootInput.remove("hidden_f32")
+            rootInput["hidden_f16"] = floatsToF16Base64(floatArrayOf(0f, 1f, 2f, 3f))
+        }
+        val layerFields = if (stageType == "layer_forward") {
+            mapOf(
+                "layer_range" to listOf(4, 8),
+                "handoff_at" to 4,
+                "hidden_sha256" to "b".repeat(64),
+                "hidden_spec" to mapOf(
+                    "n_tokens" to 1,
+                    "n_embd" to 4,
+                    "dtype" to hiddenDtype,
+                ),
+            ) +
+                (middleChannel?.let { mapOf("middle_channel" to it) } ?: emptyMap()) +
+                (seqIds?.let { mapOf("seq_ids" to it) } ?: emptyMap()) +
+                (positions?.let { mapOf("positions" to it) } ?: emptyMap())
+        } else {
+            emptyMap()
+        }
+        return TaskWorkerProtocol.buildStageOffer(
             identity = TaskWorkerAttemptIdentity(
                 workflowId = "wf_parity_stage_01",
                 stageId = "stage_1",
@@ -60,26 +85,36 @@ class AndroidWorkerCapabilitiesStageParityTest {
             stageType = stageType,
             providerId = "remote_android_worker_01",
             leaseExpiresAtMs = 2_000,
-            rootInput = rootInputByStage.getValue(stageType),
+            rootInput = rootInput,
             dependencies = emptyMap(),
             modelIdentity = model,
             messageId = "msg_parity_stage01",
             sentAtMs = 1_000,
-            stageFields = if (stageType == "layer_forward") {
-                mapOf(
-                    "layer_range" to listOf(4, 8),
-                    "handoff_at" to 4,
-                    "hidden_sha256" to "b".repeat(64),
-                    "hidden_spec" to mapOf(
-                        "n_tokens" to 1,
-                        "n_embd" to 4,
-                        "dtype" to "float32",
-                    ),
-                ) + (middleChannel?.let { mapOf("middle_channel" to it) } ?: emptyMap())
-            } else {
-                emptyMap()
-            },
+            stageFields = layerFields,
         ).copy(version = version)
+    }
+
+    /** f32 → IEEE-754 半精度（LE 16 位）base64 —— 与执行器的 `halfToFloat` 对称。 */
+    private fun floatsToF16Base64(values: FloatArray): String {
+        val buf = java.nio.ByteBuffer.allocate(values.size * 2)
+            .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+        for (value in values) buf.putShort(floatToHalf(value))
+        return java.util.Base64.getEncoder().encodeToString(buf.array())
+    }
+
+    /** 只覆盖本测试用到的简单值（0..3，全为规格化数）。 */
+    private fun floatToHalf(value: Float): Short {
+        if (value == 0f) return 0
+        val bits = java.lang.Float.floatToIntBits(value)
+        val sign = (bits ushr 16) and 0x8000
+        val exponent = ((bits ushr 23) and 0xFF) - 127 + 15
+        val mantissa = bits and 0x7FFFFF
+        return when {
+            exponent <= 0 -> sign.toShort()                       // 下溢 ⇒ 0（测试用不到）
+            exponent >= 0x1F -> (sign or 0x7C00).toShort()         // 上溢 ⇒ Inf
+            else -> (sign or (exponent shl 10) or (mantissa ushr 13)).toShort()
+        }
+    }
 
     /** 构造一个**已接线**的执行器：两条路径都成功，便于观察分派去向。 */
     private fun wiredExecutor(
@@ -233,6 +268,57 @@ class AndroidWorkerCapabilitiesStageParityTest {
             fail("unknown middle_channel must fail closed")
         } catch (e: AndroidFullWorkerStageException) {
             assertEquals("unsupported_middle_channel", e.code)
+        }
+        assertEquals(0, layerCalls)
+    }
+
+    @Test
+    fun `layer_forward accepts float16 hidden and decodes it to f32`() = runBlocking {
+        // ★ A13：f16 hidden 必须能解析（原先只认 `hidden_f32` ⇒ 协商通过但执行必失败）。
+        var seen: LayerForwardRequest? = null
+        val executor = wiredExecutor(
+            onLayer = { req ->
+                seen = req
+                Result.success(LayerForwardResult(tokenArgmax = 9, hiddenOut = null))
+            },
+        )
+        executor.execute(offer("layer_forward", hiddenDtype = "float16"))
+        // 1×4 的 f16 解码成 f32 后宽度不变（这里只验形状与解析路径）
+        assertEquals(4, seen?.hidden?.size)
+    }
+
+    @Test
+    fun `layer_forward passes explicit multi-sequence positions through`() = runBlocking {
+        // ★ A12：`seq_ids` / `positions` 要一路透传到 `LayerForwardRequest`。
+        var seen: LayerForwardRequest? = null
+        val executor = wiredExecutor(
+            onLayer = { req ->
+                seen = req
+                Result.success(LayerForwardResult(tokenArgmax = 3, hiddenOut = null))
+            },
+        )
+        executor.execute(offer("layer_forward", seqIds = listOf(0), positions = listOf(7)))
+        assertEquals(listOf(0), seen?.seqIds?.toList())
+        assertEquals(listOf(7), seen?.positions?.toList())
+    }
+
+    @Test
+    fun `invalid multi-sequence positions fail closed in the executor`() = runBlocking {
+        // 执行器可能被直接调用（不经协议层）⇒ 形状不符必须 fail-closed，不能静默退化成单序列。
+        var layerCalls = 0
+        val executor = wiredExecutor(
+            onLayer = {
+                layerCalls++
+                Result.success(LayerForwardResult(tokenArgmax = 1, hiddenOut = null))
+            },
+        )
+        val env = offer("layer_forward", seqIds = listOf(0))
+        val tampered = env.copy(payload = env.payload + ("positions" to listOf(0, 0)))
+        try {
+            executor.execute(tampered)
+            fail("mismatched positions length must fail closed")
+        } catch (e: AndroidFullWorkerStageException) {
+            assertEquals("invalid_positions", e.code)
         }
         assertEquals(0, layerCalls)
     }

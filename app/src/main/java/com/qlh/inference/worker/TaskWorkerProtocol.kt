@@ -625,7 +625,7 @@ object TaskWorkerProtocol {
      * 必填集合，缺该字段的旧对端会被判 `field_mismatch`（与主仓同一坑，实测）。因此这里按
      * 「payload 里是否真的出现」动态放宽，且**仅**在 v3 + `layer_forward` 下生效。
      */
-    private val layerForwardOptionalFields = setOf("middle_channel")
+    private val layerForwardOptionalFields = setOf("middle_channel", "seq_ids", "positions")
 
     /**
      * `middle_channel` 的允许值 —— 与主仓 `_LAYER_FORWARD_MIDDLE_CHANNELS` **同集合**：
@@ -677,10 +677,11 @@ object TaskWorkerProtocol {
             )
         }
         val dtype = spec["dtype"] as? String
-        if (dtype != "float32") {
-            // 跨框架层接力以 f32 为基线（与主仓 relay 合同一致）。
+        if (dtype != "float32" && dtype != "float16") {
+            // ★ 2026-09-23：与主仓 `_validate_payload` 对齐（那边允许 float32 / float16）——
+            //   两侧不一致会造成「主仓发得出、Android 收不了」的隐性不对称（A13）。
             fail(
-                "hidden_spec.dtype must be float32",
+                "hidden_spec.dtype must be float32 or float16",
                 "unsupported_hidden_dtype",
                 "payload.hidden_spec.dtype",
             )
@@ -695,6 +696,30 @@ object TaskWorkerProtocol {
                         layerForwardMiddleChannels.sorted().joinToString(", "),
                     "unsupported_middle_channel",
                     "payload.middle_channel",
+                )
+            }
+        }
+        // ★ 2026-09-23（A12）：**多序列显式位置**（可选）—— 长度必须等于 `hidden_spec.n_tokens`，
+        //   每个元素是非负整数；与主仓 `_validate_payload` 的同一约束、同一错误码前缀。
+        for (field in listOf("seq_ids", "positions")) {
+            if (!payload.containsKey(field)) continue
+            val values = payload[field] as? List<*>
+            if (values == null || values.size != nTokens) {
+                fail(
+                    "$field must be a list of length n_tokens ($nTokens)",
+                    "invalid_$field",
+                    "payload.$field",
+                )
+            }
+            val bad = values.any { item ->
+                val number = (item as? Number)?.toInt()
+                number == null || number < 0
+            }
+            if (bad) {
+                fail(
+                    "$field entries must be non-negative integers",
+                    "invalid_$field",
+                    "payload.$field",
                 )
             }
         }
