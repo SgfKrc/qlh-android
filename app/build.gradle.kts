@@ -13,11 +13,7 @@ if (keystorePropertiesFile.exists()) {
     keystorePropertiesFile.inputStream().use { keystoreProperties.load(it) }
 }
 
-val keystoreLitePropertiesFile = rootProject.file("keystore-lite.properties")
-val keystoreLiteProperties = Properties()
-if (keystoreLitePropertiesFile.exists()) {
-    keystoreLitePropertiesFile.inputStream().use { keystoreLiteProperties.load(it) }
-}
+// ★ 2026-09-30：`keystore-lite.properties` / lite 专属签名随 full/lite 合并一并移除。
 
 android {
     namespace = "com.qlh.inference"
@@ -25,32 +21,37 @@ android {
     ndkVersion = "27.2.12479018"
 
     defaultConfig {
+        // ★ 2026-09-30 产品基线整改：**放弃 full/lite 区分** —— 原先 `full`/`lite` 两个
+        //   productFlavor 合并为单一默认变体（能力面 = 原 full：内置 llama 运行时）。
+        //   理由：产品基线以 TUI 为主，Android 侧不再需要"瘦客户端"变体；
+        //   `IS_LITE` 仍是既有 Kotlin 分支读取的符号，统一置 `false`（代码分支保留，零行为回归）。
+        applicationId = "com.qlh.inference"
+        buildConfigField("boolean", "IS_LITE", "false")
         minSdk = 26
         targetSdk = 34
         versionCode = 6
         versionName = "0.1.8.3"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        ndk {
+            abiFilters += listOf("arm64-v8a")
+        }
+
+        externalNativeBuild {
+            cmake {
+                cppFlags += listOf("-std=c++17")
+                arguments += listOf(
+                    "-DANDROID_STL=c++_shared",
+                    // Android 15+ 的 16 KB page 设备要求 ELF LOAD 段 16 KB 对齐；
+                    // NDK r27 通过该开关带上 -Wl,-z,max-page-size=16384（无需改源码）。
+                    "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON",
+                )
+            }
+        }
     }
 
     signingConfigs {
-        if (keystorePropertiesFile.exists()) {
-            create("releaseFull") {
-                storeFile = rootProject.file(keystoreProperties["storeFile"] as String)
-                storePassword = keystoreProperties["storePassword"] as String
-                keyAlias = keystoreProperties["keyAlias"] as String
-                keyPassword = keystoreProperties["keyPassword"] as String
-            }
-        }
-        if (keystoreLitePropertiesFile.exists()) {
-            create("releaseLite") {
-                storeFile = rootProject.file(keystoreLiteProperties["storeFile"] as String)
-                storePassword = keystoreLiteProperties["storePassword"] as String
-                keyAlias = keystoreLiteProperties["keyAlias"] as String
-                keyPassword = keystoreLiteProperties["keyPassword"] as String
-            }
-        }
-        // 向后兼容的回退签名（无 flavor 构建时使用）
         if (keystorePropertiesFile.exists()) {
             create("release") {
                 storeFile = rootProject.file(keystoreProperties["storeFile"] as String)
@@ -63,7 +64,8 @@ android {
 
     buildTypes {
         release {
-            // 签名由 productFlavors 分别指定，避免 lite 被 buildType 回退到 full 签名
+            // ★ 2026-09-30：full/lite 合并后只有一套签名（`keystore.properties`）。
+            signingConfig = signingConfigs.findByName("release")
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(
@@ -75,50 +77,6 @@ android {
             isMinifyEnabled = false
             applicationIdSuffix = ".debug"
             versionNameSuffix = "-debug"
-        }
-    }
-
-    flavorDimensions += "version"
-    productFlavors {
-        create("full") {
-            dimension = "version"
-            applicationId = "com.qlh.inference"
-            versionNameSuffix = ""
-            buildConfigField("boolean", "IS_LITE", "false")
-            signingConfig = signingConfigs.findByName("releaseFull")
-
-            ndk {
-                abiFilters += listOf("arm64-v8a")
-            }
-
-            externalNativeBuild {
-                cmake {
-                    cppFlags += listOf("-std=c++17")
-                    arguments += listOf(
-                        "-DANDROID_STL=c++_shared",
-                        // Android 15+ 的 16 KB page 设备要求 ELF LOAD 段 16 KB 对齐；
-                        // NDK r27 通过该开关带上 -Wl,-z,max-page-size=16384（无需改源码）。
-                        "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON",
-                    )
-                }
-            }
-        }
-        create("lite") {
-            dimension = "version"
-            applicationId = "com.qlh.inference.lite"
-            versionNameSuffix = "-lite"
-            buildConfigField("boolean", "IS_LITE", "true")
-            signingConfig = signingConfigs.findByName("releaseLite")
-
-            ndk {
-                abiFilters += listOf("arm64-v8a")
-            }
-
-            externalNativeBuild {
-                cmake {
-                    arguments += listOf("-DQLH_LITE=ON")
-                }
-            }
         }
     }
 
