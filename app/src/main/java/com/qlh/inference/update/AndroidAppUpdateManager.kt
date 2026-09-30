@@ -142,8 +142,18 @@ class AndroidAppUpdateManager(context: Context) {
         }
     }
 
-    fun canRequestPackageInstalls(): Boolean =
-        Build.VERSION.SDK_INT < Build.VERSION_CODES.O || appContext.packageManager.canRequestPackageInstalls()
+    fun canRequestPackageInstalls(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return true
+        // ★ 2026-09-30（真机 Y700 / Android 15 实测）：该 API 在**未声明**
+        //   `REQUEST_INSTALL_PACKAGES` 时抛 `SecurityException: Need to declare
+        //   android.permission.REQUEST_INSTALL_PACKAGES to call this api`。
+        //   Manifest 现已声明该权限；这里再兜一层——权限**探测**属于"读状态"，
+        //   绝不能把宿主 Activity 的 `onResume` 打崩（实测调用链：
+        //   `MainActivity.onResume:D91` → `MainViewModel.refreshAppInstallPermission:D1007`
+        //   → 此处未捕获 ⇒ `FATAL EXCEPTION: main`，**每次进前台必崩**）。
+        return runCatching { appContext.packageManager.canRequestPackageInstalls() }
+            .getOrDefault(false)
+    }
 
     fun openInstallPermissionSettings(): Result<Unit> = runCatching {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {

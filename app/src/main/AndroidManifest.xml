@@ -15,6 +15,12 @@
     <!-- 通知权限（Android 13+） -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!-- ★ 应用内更新：`PackageManager.canRequestPackageInstalls()`（未知来源安装）要求
+         调用方**声明**该权限，否则抛 SecurityException（实测真机 logcat：
+         `Need to declare android.permission.REQUEST_INSTALL_PACKAGES to call this api`）。
+         应用内更新确实需要它（`AndroidAppUpdateManager.launchInstaller`）。 -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
     <application
         android:name=".QlhApplication"
         android:allowBackup="true"
