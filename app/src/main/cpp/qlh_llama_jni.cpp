@@ -1070,13 +1070,51 @@ static bool qlh_rebuild_pos_planar(llama_batch & batch, int n_tokens, int n_pos)
 // 把 f32 hidden 注入 embd 批次并从本节点层段继续前向；返回末位置 argmax token。
 //
 // out_hidden 非空时，额外把「末位置的输出 hidden」拷回它（供中间层段节点继续接力）。
+static bool qlh_read_optional_ints(
+    JNIEnv * env,
+    jintArray source,
+    int expected_size,
+    std::vector<jint> & target
+) {
+    if (source == nullptr) {
+        return true;
+    }
+    if (env->GetArrayLength(source) != expected_size) {
+        return false;
+    }
+    target.resize((size_t) expected_size);
+    env->GetIntArrayRegion(source, 0, expected_size, target.data());
+    if (env->ExceptionCheck()) {
+        return false;
+    }
+    return std::all_of(target.begin(), target.end(), [](jint value) { return value >= 0; });
+}
+
+static bool qlh_layer_batch_starts_at_zero(
+    jint pos_base,
+    const jint * positions,
+    int n_tokens
+) {
+    if (positions == nullptr) {
+        return pos_base == 0;
+    }
+    for (int i = 0; i < n_tokens; ++i) {
+        if (positions[i] == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static jint qlh_layer_forward_impl(
     JNIEnv * env,
     jlong model_ptr,
     jfloatArray j_hidden,
     jint n_tokens,
     jint pos_base,
-    jfloatArray out_hidden
+    jfloatArray out_hidden,
+    const jint * seq_ids,
+    const jint * positions
 ) {
     if (model_ptr == 0 || j_hidden == nullptr || n_tokens <= 0) {
         return -1;
@@ -1099,11 +1137,12 @@ static jint qlh_layer_forward_impl(
         return -1;
     }
 
-    // 每步从零重算（与 relay-gen-dl 默认模式一致）：避免跨步 KV 复用带来的
-    // 序列号/位置耦合，先把正确性钉死；增量模式（keep-kv）是后续优化位。
-    llama_memory_t mem = llama_get_memory(qctx->ctx);
-    if (mem) {
-        llama_memory_clear(mem, true);
+    // Position zero starts a new prompt; incremental decode calls retain this cache.
+    if (qlh_layer_batch_starts_at_zero(pos_base, positions, n_tokens)) {
+        llama_memory_t mem = llama_get_memory(qctx->ctx);
+        if (mem) {
+            llama_memory_clear(mem, true);
+        }
     }
 
     llama_batch batch = llama_batch_init(n_tokens, n_embd_inp, /*n_seq_max=*/1);
@@ -1111,9 +1150,10 @@ static jint qlh_layer_forward_impl(
         return -1;
     }
     for (int i = 0; i < n_tokens; ++i) {
-        batch.pos[i] = pos_base + i;
+        batch.pos[i] = (positions != nullptr) ? (llama_pos) positions[i]
+                                               : (llama_pos) (pos_base + i);
         batch.n_seq_id[i] = 1;
-        batch.seq_id[i][0] = 0;
+        batch.seq_id[i][0] = (seq_ids != nullptr) ? seq_ids[i] : 0;
         batch.logits[i] = (i + 1 == n_tokens) ? 1 : 0;
     }
     batch.n_tokens = n_tokens;
@@ -1177,7 +1217,29 @@ Java_com_qlh_inference_service_LocalInferenceEngine_nativeLayerForwardToken(
     JNIEnv * env, jobject /* thiz */, jlong model_ptr,
     jfloatArray j_hidden, jint n_tokens, jint pos_base
 ) {
-    return qlh_layer_forward_impl(env, model_ptr, j_hidden, n_tokens, pos_base, nullptr);
+    return qlh_layer_forward_impl(env, model_ptr, j_hidden, n_tokens, pos_base,
+                                  nullptr, nullptr, nullptr);
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_qlh_inference_service_LocalInferenceEngine_nativeLayerForwardTokenSeq(
+    JNIEnv * env, jobject /* thiz */, jlong model_ptr,
+    jfloatArray j_hidden, jint n_tokens, jint pos_base,
+    jintArray j_seq_ids, jintArray j_positions
+) {
+    if (n_tokens <= 0 || (j_seq_ids == nullptr && j_positions == nullptr)) {
+        return -1;
+    }
+    std::vector<jint> seq_ids;
+    std::vector<jint> positions;
+    if (!qlh_read_optional_ints(env, j_seq_ids, n_tokens, seq_ids)
+        || !qlh_read_optional_ints(env, j_positions, n_tokens, positions)) {
+        return -1;
+    }
+    return qlh_layer_forward_impl(env, model_ptr, j_hidden, n_tokens, pos_base,
+                                  nullptr,
+                                  seq_ids.empty() ? nullptr : seq_ids.data(),
+                                  positions.empty() ? nullptr : positions.data());
 }
 
 // 层段前向（中间段）：除 argmax 外，把末位置输出 hidden 拷回 out_hidden，
@@ -1187,7 +1249,29 @@ Java_com_qlh_inference_service_LocalInferenceEngine_nativeLayerForwardHidden(
     JNIEnv * env, jobject /* thiz */, jlong model_ptr,
     jfloatArray j_hidden, jint n_tokens, jint pos_base, jfloatArray out_hidden
 ) {
-    return qlh_layer_forward_impl(env, model_ptr, j_hidden, n_tokens, pos_base, out_hidden);
+    return qlh_layer_forward_impl(env, model_ptr, j_hidden, n_tokens, pos_base,
+                                  out_hidden, nullptr, nullptr);
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_qlh_inference_service_LocalInferenceEngine_nativeLayerForwardHiddenSeq(
+    JNIEnv * env, jobject /* thiz */, jlong model_ptr,
+    jfloatArray j_hidden, jint n_tokens, jint pos_base, jfloatArray out_hidden,
+    jintArray j_seq_ids, jintArray j_positions
+) {
+    if (n_tokens <= 0 || (j_seq_ids == nullptr && j_positions == nullptr)) {
+        return -1;
+    }
+    std::vector<jint> seq_ids;
+    std::vector<jint> positions;
+    if (!qlh_read_optional_ints(env, j_seq_ids, n_tokens, seq_ids)
+        || !qlh_read_optional_ints(env, j_positions, n_tokens, positions)) {
+        return -1;
+    }
+    return qlh_layer_forward_impl(env, model_ptr, j_hidden, n_tokens, pos_base,
+                                  out_hidden,
+                                  seq_ids.empty() ? nullptr : seq_ids.data(),
+                                  positions.empty() ? nullptr : positions.data());
 }
 
 // ★ 2026-09-23：中间段的「层输出（`output_norm` **之前**）」改用 `layer_inp` 的
@@ -1280,10 +1364,12 @@ static jint qlh_layer_forward_keep_head_impl(
         return -1;
     }
 
-    // 与 Hidden 版一致：每步从零重算，先把正确性钉死（增量 KV 是后续优化位）。
-    llama_memory_t mem = llama_get_memory(qctx->ctx);
-    if (mem) {
-        llama_memory_clear(mem, true);
+    // Position zero starts a new prompt; incremental decode calls retain this cache.
+    if (qlh_layer_batch_starts_at_zero(pos_base, positions, n_tokens)) {
+        llama_memory_t mem = llama_get_memory(qctx->ctx);
+        if (mem) {
+            llama_memory_clear(mem, true);
+        }
     }
 
     // ★ 开启层输出导出（`layer_inp` 的 `lid == n_layer` 槽位；稠密 [n_tokens, n_embd]）
@@ -1380,20 +1466,9 @@ Java_com_qlh_inference_service_LocalInferenceEngine_nativeLayerForwardHiddenKeep
     std::vector<jint> n_seq_id;
     std::vector<jint> seq_ids;
     std::vector<jint> positions;
-    auto read_optional = [&](jintArray source, std::vector<jint> & target) -> bool {
-        if (source == nullptr) {
-            return true;
-        }
-        if (env->GetArrayLength(source) != (jsize) n_tokens) {
-            return false;   // 形状不符：明确失败，不做静默截断/补齐
-        }
-        target.resize((size_t) n_tokens);
-        env->GetIntArrayRegion(source, 0, (jsize) n_tokens, target.data());
-        return env->ExceptionCheck() == JNI_FALSE;
-    };
-    if (!read_optional(j_n_seq_id, n_seq_id)
-        || !read_optional(j_seq_ids, seq_ids)
-        || !read_optional(j_positions, positions)) {
+    if (!qlh_read_optional_ints(env, j_n_seq_id, n_tokens, n_seq_id)
+        || !qlh_read_optional_ints(env, j_seq_ids, n_tokens, seq_ids)
+        || !qlh_read_optional_ints(env, j_positions, n_tokens, positions)) {
         return -1;
     }
     return qlh_layer_forward_keep_head_impl(

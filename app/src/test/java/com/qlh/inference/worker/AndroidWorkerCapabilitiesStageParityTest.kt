@@ -323,6 +323,20 @@ class AndroidWorkerCapabilitiesStageParityTest {
         assertEquals(0, layerCalls)
     }
 
+    @Test
+    fun `explicit positions without seq ids retain the default sequence`() = runBlocking {
+        var seen: LayerForwardRequest? = null
+        val executor = wiredExecutor(
+            onLayer = { req ->
+                seen = req
+                Result.success(LayerForwardResult(tokenArgmax = 3, hiddenOut = null))
+            },
+        )
+        executor.execute(offer("layer_forward", positions = listOf(7)))
+        assertEquals(null, seen?.seqIds)
+        assertEquals(listOf(7), seen?.positions?.toList())
+    }
+
     private fun floatArrayToBase64(values: FloatArray): String {
         val buf = java.nio.ByteBuffer.allocate(values.size * 4)
             .order(java.nio.ByteOrder.LITTLE_ENDIAN)

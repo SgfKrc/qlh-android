@@ -522,6 +522,13 @@ class LocalInferenceEngine(private val context: Context) {
         if (nTokens <= 0) {
             return@withContext Result.failure(IllegalArgumentException("nTokens must be positive"))
         }
+        if ((seqIds != null && seqIds.size != nTokens) ||
+            (positions != null && positions.size != nTokens)
+        ) {
+            return@withContext Result.failure(
+                IllegalArgumentException("seqIds and positions must each have nTokens entries when provided")
+            )
+        }
         try {
             if (wantHidden) {
                 val out = FloatArray(estimateEmbeddingWidth(hidden.size, nTokens))
@@ -532,6 +539,9 @@ class LocalInferenceEngine(private val context: Context) {
                     keepHead && (seqIds != null || positions != null) ->
                         nativeLayerForwardHiddenKeepHeadSeq(modelPtr, hidden, nTokens, posBase,
                                                             null, seqIds, positions, out)
+                    !keepHead && (seqIds != null || positions != null) ->
+                        nativeLayerForwardHiddenSeq(modelPtr, hidden, nTokens, posBase, out,
+                                                    seqIds, positions)
                     keepHead ->
                         nativeLayerForwardHiddenKeepHead(modelPtr, hidden, nTokens, posBase, out)
                     else ->
@@ -552,7 +562,11 @@ class LocalInferenceEngine(private val context: Context) {
                     else -> Result.success(LayerForwardOutput(token, if (token >= 0) out else null))
                 }
             } else {
-                val token = nativeLayerForwardToken(modelPtr, hidden, nTokens, posBase)
+                val token = if (seqIds != null || positions != null) {
+                    nativeLayerForwardTokenSeq(modelPtr, hidden, nTokens, posBase, seqIds, positions)
+                } else {
+                    nativeLayerForwardToken(modelPtr, hidden, nTokens, posBase)
+                }
                 Result.success(LayerForwardOutput(token, null))
             }
         } catch (e: Exception) {
@@ -719,6 +733,15 @@ class LocalInferenceEngine(private val context: Context) {
         posBase: Int
     ): Int
 
+    private external fun nativeLayerForwardTokenSeq(
+        modelPtr: Long,
+        hidden: FloatArray,
+        nTokens: Int,
+        posBase: Int,
+        seqIds: IntArray?,
+        positions: IntArray?,
+    ): Int
+
     /**
      * 层段前向（**中间段**）：除 argmax 外，额外把末位置的输出 hidden 拷回
      * `outHidden`，供上层交给下一段继续接力。
@@ -731,6 +754,16 @@ class LocalInferenceEngine(private val context: Context) {
         nTokens: Int,
         posBase: Int,
         outHidden: FloatArray
+    ): Int
+
+    private external fun nativeLayerForwardHiddenSeq(
+        modelPtr: Long,
+        hidden: FloatArray,
+        nTokens: Int,
+        posBase: Int,
+        outHidden: FloatArray,
+        seqIds: IntArray?,
+        positions: IntArray?,
     ): Int
 
     /**
