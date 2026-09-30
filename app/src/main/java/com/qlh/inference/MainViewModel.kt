@@ -1241,7 +1241,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val system = provider.getSystemStatus()
         val memory = provider.getMemoryStatus()
         val gpu = provider.getGpuStatus()
+        // The startup path launches the task worker before the asynchronous
+        // runtime-status refresh completes.  A null UI status must not be
+        // interpreted as "native unavailable": doing so permanently publishes
+        // pipeline_worker=false for the first worker lease even when the JNI
+        // library is present and loadable.  Probe synchronously as a fallback;
+        // the normal refreshed status still wins once available.
         val runtime = _uiState.value.runtimeStatus
+            ?: createPassiveRuntimeStatus(_uiState.value.inferenceMode)
         return buildAndroidPresencePayload(
             inferenceMode = _uiState.value.inferenceMode,
             appVariant = if (BuildConfig.IS_LITE) "lite" else "full",
