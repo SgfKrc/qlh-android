@@ -26,6 +26,7 @@ import com.qlh.inference.network.ServerModelSummary
 import com.qlh.inference.network.ServerModelsResponse
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
@@ -220,6 +221,96 @@ class MainViewModelLogicTest {
         assertFalse(json.contains("token"))
         assertFalse(json.contains("password"))
         assertFalse(json.contains("secret"))
+    }
+
+    // ---- ★ 2026-09-30：能力字段必须同源（防「能力撒谎」）----
+
+    /**
+     * `pipeline_worker` / `backend_id` / `capabilities` 三者**必须同源**。
+     *
+     * 真机实测（Y700 / Android 15）曾出现 `pipeline_worker:true` +
+     * `backend_id:"llama_cpp"` + `capabilities:[]` 的自相矛盾上报 ——
+     * 根因是 task worker 的 device_info 组装**无条件硬写**前两者，
+     * 覆盖了按 `nativeRuntimeAvailable` 算出的值。
+     * 调度侧 `_client_supports_forward_layers` / `_node_supports_forward_layers`
+     * 优先读 `capabilities`、读不到才用 `backend_id` 兜底 ⇒ 字段打架时会一起说谎。
+     */
+    private fun assertCapabilityFieldsAreConsistent(payload: Map<String, Any?>) {
+        val pipelineWorker = payload["pipeline_worker"] as? Boolean
+        val backendId = payload["backend_id"] as? String
+        @Suppress("UNCHECKED_CAST")
+        val capabilities = payload["capabilities"] as? List<String>
+        assertNotNull(pipelineWorker)
+        assertNotNull(backendId)
+        assertNotNull(capabilities)
+        if (pipelineWorker == true) {
+            assertEquals("声明 pipeline_worker=true 就必须同时给出 backend_id",
+                "llama_cpp", backendId)
+            assertTrue("声明 pipeline_worker=true 就必须同时声明 forward_layers",
+                capabilities!!.contains("forward_layers"))
+        } else {
+            assertEquals("未声明 pipeline_worker 时 backend_id 必须为空", "", backendId)
+            assertTrue("未声明 pipeline_worker 时能力列表必须为空", capabilities!!.isEmpty())
+        }
+    }
+
+    private fun presencePayload(nativeRuntimeAvailable: Boolean): Map<String, Any?> =
+        buildAndroidPresencePayload(
+            inferenceMode = "distributed",
+            appVariant = "full",
+            appVersion = "0.1.0",
+            system = sampleSystem(),
+            memory = sampleMemory(),
+            gpu = sampleGpu(),
+            runtime = AndroidRuntimeStatus(
+                nativeRuntimeAvailable = nativeRuntimeAvailable, isLite = false),
+        )
+
+    @Test
+    fun `capability fields stay consistent without native runtime`() {
+        val payload = presencePayload(nativeRuntimeAvailable = false)
+        assertEquals(false, payload["pipeline_worker"])
+        assertCapabilityFieldsAreConsistent(payload)
+    }
+
+    @Test
+    fun `capability fields stay consistent with native runtime`() {
+        val payload = presencePayload(nativeRuntimeAvailable = true)
+        assertEquals(true, payload["pipeline_worker"])
+        assertEquals("llama_cpp", payload["backend_id"])
+        assertCapabilityFieldsAreConsistent(payload)
+    }
+
+    /**
+     * ★ 该红必须红守卫：`buildTaskWorkerDeviceInfo` **不得**改写能力三项。
+     *
+     * 修复前它 `put("pipeline_worker", true)` + `put("backend_id", "llama_cpp")`，
+     * 在 native runtime 未就绪时就会造出 `pipeline_worker:true` + `capabilities:[]`
+     * 的矛盾上报（真机实测形态）。本用例断言 worker 组装后的三项与 presence 真源**逐项相同**。
+     */
+    @Test
+    fun `task worker device info must not override capability fields`() {
+        val presence = presencePayload(nativeRuntimeAvailable = false)
+        val worker = buildTaskWorkerDeviceInfo(presence)
+
+        assertEquals("worker 专属字段应被补上",
+            "tcp_task_worker", worker["connection_type"])
+        assertEquals(true, worker["task_worker"])
+        for (key in listOf("pipeline_worker", "backend_id", "capabilities")) {
+            assertEquals(
+                "buildTaskWorkerDeviceInfo 不得改写 $key（能力三项必须同源）",
+                presence[key], worker[key],
+            )
+        }
+        assertCapabilityFieldsAreConsistent(worker)
+
+        // 就绪情形同样不得被改写。
+        val readyPresence = presencePayload(nativeRuntimeAvailable = true)
+        val readyWorker = buildTaskWorkerDeviceInfo(readyPresence)
+        for (key in listOf("pipeline_worker", "backend_id", "capabilities")) {
+            assertEquals(readyPresence[key], readyWorker[key])
+        }
+        assertCapabilityFieldsAreConsistent(readyWorker)
     }
 
     // ---- MainUiState 默认值 ----

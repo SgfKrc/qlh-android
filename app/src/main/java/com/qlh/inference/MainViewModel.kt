@@ -1184,11 +1184,22 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         // capability builder omits layer_forward when no artifacts exist.
         val resourceAdmitted = hasModelIdentity
         val resourceReason = if (resourceAdmitted) "" else "model_identity_not_verified"
-        val deviceInfo = buildAndroidPresenceDeviceInfo().toMutableMap().apply {
-            put("connection_type", "tcp_task_worker")
-            put("pipeline_worker", true)
-            put("task_worker", true)
-            put("backend_id", "llama_cpp")
+        // ★ 2026-09-30（审计「能力撒谎」）：`pipeline_worker` / `backend_id` / `capabilities`
+        //   必须**同源**。此前这里无条件硬写前两者，而 `capabilities` 仍来自
+        //   `buildAndroidPresenceDeviceInfo()`（按 `nativeRuntimeAvailable` 计算）——
+        //   真机实测因此出现 `pipeline_worker:true` + `backend_id:"llama_cpp"` +
+        //   `capabilities:[]` 的**自相矛盾**上报；而调度侧 `_client_supports_forward_layers` /
+        //   `_node_supports_forward_layers` 优先读 `capabilities`、读不到才用 `backend_id` 兜底
+        //   ⇒ 一旦设备 native runtime 真没就绪，字段会一起说谎。
+        //   组装逻辑抽到 `buildTaskWorkerDeviceInfo`（纯函数）以便被单测锁死。
+        val deviceInfo = buildTaskWorkerDeviceInfo(buildAndroidPresenceDeviceInfo())
+        if ((deviceInfo["pipeline_worker"] as? Boolean) != true) {
+            QlhLogger.w(
+                "MainViewModel",
+                "native 运行时未就绪：不上报 pipeline_worker/backend_id" +
+                    "（上报值=${deviceInfo["pipeline_worker"]}, " +
+                    "能力=${deviceInfo["capabilities"]}）",
+            )
         }
         runCatching {
             ContextCompat.startForegroundService(

@@ -190,6 +190,25 @@ fun formatAuthError(error: Throwable): String = when (error) {
     }
 }
 
+/**
+ * 把 presence payload 转成 **task worker** 的 device_info。
+ *
+ * ★ 2026-09-30（审计「能力撒谎」）：`pipeline_worker` / `backend_id` / `capabilities`
+ * 三者必须**同源**。真机（Y700 / Android 15）实测曾出现
+ * `pipeline_worker:true` + `backend_id:"llama_cpp"` + `capabilities:[]` 的自相矛盾上报 ——
+ * 根因是这里**无条件硬写**前两者，覆盖了按 `nativeRuntimeAvailable` 算出的值。
+ * 而调度侧 `_client_supports_forward_layers` / `_node_supports_forward_layers`
+ * 优先读 `capabilities`、读不到才用 `backend_id` 兜底 ⇒ 字段打架时会一起说谎。
+ *
+ * 因此本函数**只补 worker 专属字段**（`connection_type` / `task_worker`），
+ * 能力三项一律沿用 presence 真源。
+ */
+fun buildTaskWorkerDeviceInfo(presence: Map<String, Any?>): Map<String, Any?> =
+    presence.toMutableMap().apply {
+        put("connection_type", "tcp_task_worker")
+        put("task_worker", true)
+    }
+
 /** Android 节点 presence 设备信息 payload（纯组装；不包含模型绝对路径/密钥）。 */
 fun buildAndroidPresencePayload(
     inferenceMode: String,
