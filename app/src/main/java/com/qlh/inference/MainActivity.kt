@@ -65,7 +65,10 @@ class MainActivity : ComponentActivity() {
                     viewModel = viewModel,
                     onChooseModelDirectory = { modelDirectoryLauncher.launch(null) },
                     onInferenceModeChanged = { mode ->
-                        if (mode != com.qlh.inference.data.SettingsDataStore.MODE_DISTRIBUTED && !BuildConfig.IS_LITE) {
+                        // Distributed Route A still needs the lightweight
+                        // InferenceService shell to load a crop on stage offer;
+                        // starting it does not load the selected full model.
+                        if (!BuildConfig.IS_LITE) {
                             runCatching {
                                 ContextCompat.startForegroundService(
                                     this,
@@ -77,8 +80,6 @@ class MainActivity : ComponentActivity() {
                                     "Inference service unavailable: ${error.message ?: error.javaClass.simpleName}",
                                 )
                             }
-                        } else if (!BuildConfig.IS_LITE) {
-                            stopService(Intent(this, InferenceService::class.java))
                         }
                     }
                 )

@@ -501,7 +501,8 @@ class TaskWorkerClient(
     private val host: String,
     private val port: Int,
     private val nodeId: String,
-    private val capabilities: () -> Map<String, Any?>,
+    /** Read at hello time so model/layer artifacts are never frozen at service start. */
+    private val capabilities: suspend () -> Map<String, Any?>,
     private val registration: TaskWorkerRegistration? = null,
     private val transportFactory: TaskWorkerTransportFactory =
         SocketTaskWorkerTransportFactory(registration = registration),

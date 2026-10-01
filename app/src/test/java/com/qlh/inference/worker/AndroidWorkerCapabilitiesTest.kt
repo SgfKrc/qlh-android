@@ -79,4 +79,50 @@ class AndroidWorkerCapabilitiesTest {
         assertTrue(!plain.containsKey("middle_channel"))
         assertTrue(!plain.containsKey("n_pos_per_embd"))
     }
+
+    @Test
+    fun `layer-only worker advertises ranges without full inference`() {
+        val capabilities = AndroidWorkerCapabilities.build(
+            modelId = "qwen3-5-2b",
+            modelFormat = "gguf",
+            modelRevision = "local-a86078042c3e",
+            modelSha256 = "a".repeat(64),
+            resourceAdmitted = true,
+            layerRanges = listOf(listOf(4, 16)),
+            fullInferenceAvailable = false,
+        )
+        assertEquals(listOf("layer_forward"), capabilities["stage_types"])
+        assertEquals(listOf(listOf(4, 16)), capabilities["layer_ranges"])
+        TaskWorkerProtocol.validate(
+            TaskWorkerProtocol.buildHello(
+                nodeId = "android_layer_only_01",
+                capabilities = capabilities,
+                messageId = "msg_capabilities_layer_only_01",
+                sentAtMs = 1_700_000_000_000,
+            ),
+        )
+    }
+
+    @Test
+    fun `layer-only worker marks alias identity explicitly`() {
+        val capabilities = AndroidWorkerCapabilities.build(
+            modelId = "layer-aaaaaaaaaaaaaaaa",
+            modelFormat = "gguf",
+            modelRevision = "local-aaaaaaaaaaaa",
+            modelSha256 = "a".repeat(64),
+            resourceAdmitted = true,
+            layerRanges = listOf(listOf(4, 16)),
+            fullInferenceAvailable = false,
+            layerWorker = true,
+        )
+        assertEquals(true, capabilities["layer_worker"])
+        TaskWorkerProtocol.validate(
+            TaskWorkerProtocol.buildHello(
+                nodeId = "android_layer_alias_01",
+                capabilities = capabilities,
+                messageId = "msg_capabilities_layer_alias_01",
+                sentAtMs = 1_700_000_000_000,
+            ),
+        )
+    }
 }

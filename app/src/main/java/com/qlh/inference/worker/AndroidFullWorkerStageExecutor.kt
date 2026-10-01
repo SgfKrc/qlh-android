@@ -60,6 +60,7 @@ data class LayerForwardResult(
  */
 class AndroidFullWorkerStageExecutor(
     private val expectedModelIdentity: () -> Map<String, Any?>?,
+    private val allowLayerIdentityAlias: () -> Boolean = { false },
     private val ensureModelLoaded: suspend (contextSize: Int) -> Result<Unit>,
     private val generate: suspend (
         prompt: String,
@@ -108,7 +109,16 @@ class AndroidFullWorkerStageExecutor(
         }
         val advertised = expectedModelIdentity()
         val requested = payload["model_identity"] as? Map<*, *>
-        if (advertised == null || requested == null || !sameIdentity(advertised, requested)) {
+        val advertisedIdentity = advertised ?: emptyMap()
+        val requestedIdentity = requested ?: emptyMap<Any?, Any?>()
+        val identityMatches = when {
+            stageType == "layer_forward" && allowLayerIdentityAlias() ->
+                advertised != null && requested != null &&
+                    sameLayerIdentity(advertisedIdentity, requestedIdentity)
+            else -> advertised != null && requested != null &&
+                sameIdentity(advertisedIdentity, requestedIdentity)
+        }
+        if (!identityMatches) {
             throw AndroidFullWorkerStageException(
                 "model_identity_mismatch",
                 "Stage model identity does not match the Android worker",
@@ -117,8 +127,8 @@ class AndroidFullWorkerStageExecutor(
         // ★ 2026-09-20：按 stage 类型分派。两种 stage 的输入形态完全不同
         //   （整模型要 prompt；层段要 hidden + 层区间），不能共用一条路径。
         return when (stageType) {
-            "layer_forward" -> executeLayerForward(payload, advertised)
-            else -> executeFullInference(payload, advertised)
+            "layer_forward" -> executeLayerForward(payload, advertisedIdentity)
+            else -> executeFullInference(payload, advertisedIdentity)
         }
     }
 
@@ -440,6 +450,11 @@ class AndroidFullWorkerStageExecutor(
 
     private fun sameIdentity(expected: Map<String, Any?>, requested: Map<*, *>): Boolean =
         listOf("model_id", "engine", "format", "revision", "sha256").all { key ->
+            expected[key] == requested[key]
+        }
+
+    private fun sameLayerIdentity(expected: Map<String, Any?>, requested: Map<*, *>): Boolean =
+        listOf("engine", "format", "sha256").all { key ->
             expected[key] == requested[key]
         }
 

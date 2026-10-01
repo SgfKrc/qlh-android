@@ -111,6 +111,10 @@ object AndroidWorkerCapabilities {
         resourceAdmitted: Boolean = false,
         resourceReason: String = "resource_gate_not_confirmed",
         layerRanges: List<List<Int>> = emptyList(),
+        /** False for a layer-only worker that must never accept full-model offers. */
+        fullInferenceAvailable: Boolean = true,
+        /** True when the advertised identity is a source-SHA layer alias. */
+        layerWorker: Boolean = false,
         // ★ 2026-09-23：中间段通道能力与 M-RoPE 位置分量数（来自 native 的 `layerForwardInfo()`）。
         //   `null` = 未声明 ⇒ 不写这两个键（协议侧它们都是可选的）。
         middleChannel: String? = null,
@@ -128,6 +132,8 @@ object AndroidWorkerCapabilities {
         val capabilities = linkedMapOf<String, Any?>(
             "stage_types" to if (normalizedRanges.isEmpty()) {
                 listOf("full_inference")
+            } else if (!fullInferenceAvailable) {
+                listOf("layer_forward")
             } else {
                 SUPPORTED_STAGE_TYPES
             },
@@ -140,6 +146,7 @@ object AndroidWorkerCapabilities {
             ),
         )
         if (normalizedRanges.isNotEmpty()) capabilities["layer_ranges"] = normalizedRanges
+        if (layerWorker) capabilities["layer_worker"] = true
         // ★ 2026-09-23：把 native 上报的「中间段通道 / M-RoPE 位置分量数」并入 capabilities，
         //   让调度侧能**知道**本节点中间段实际可走哪条通道（值域与协议侧同集合），
         //   而不是靠 `extract_hidden` 去猜。

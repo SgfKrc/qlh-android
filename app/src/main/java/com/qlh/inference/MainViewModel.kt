@@ -1172,18 +1172,53 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         if (secret.isBlank() || host.isBlank() || port !in 1..65535) return
 
         val selected = modelManager.getSelectedModel()
-        val modelSha256 = modelManager.getSelectedModelSha256()
-        val modelId = selected?.name
+        val selectedSha256 = modelManager.getSelectedModelSha256()
+        val selectedModelId = selected?.name
             ?.substringBeforeLast('.', selected.name)
             ?.takeIf { it.isNotBlank() }
             .orEmpty()
-        val hasModelIdentity = modelId.isNotBlank() &&
-            modelSha256.matches(Regex("[a-fA-F0-9]{64}"))
-        // Full-model execution needs only the verified model identity. Layer
-        // execution additionally depends on advertised ranges; the worker
-        // capability builder omits layer_forward when no artifacts exist.
-        val resourceAdmitted = hasModelIdentity
+        val hasFullModelIdentity = selectedModelId.isNotBlank() &&
+            selectedSha256.matches(Regex("[a-fA-F0-9]{64}"))
+
+        // Route A is deliberately layer-only: a worker may have verified crop
+        // artifacts without selecting or loading the source GGUF. Resolve the
+        // source digest locally and the logical model id from the coordinator.
+        val layerArtifacts = modelManager.listLayerArtifacts(
+            expectedModelSha256 = if (hasFullModelIdentity) selectedSha256 else "",
+            verifyArtifactDigest = true,
+        ).getOrNull().orEmpty()
+        val layerSourceSha256 = layerArtifacts
+            .map { it.sourceModelSha256.trim().lowercase() }
+            .firstOrNull { it.matches(Regex("[a-fA-F0-9]{64}")) }
+            .orEmpty()
+        val coordinatorModel = if (!hasFullModelIdentity && layerSourceSha256.isNotBlank()) {
+            apiClient().getCurrentModel().getOrNull()
+        } else {
+            null
+        }
+        val layerAlias = layerSourceSha256.takeIf { it.isNotBlank() }
+            ?.let { "layer-${it.take(16)}" }
+            .orEmpty()
+        val modelId = if (hasFullModelIdentity) {
+            selectedModelId
+        } else {
+            coordinatorModel?.modelId?.takeIf { it.isNotBlank() } ?: layerAlias
+        }
+        val modelSha256 = if (hasFullModelIdentity) selectedSha256 else layerSourceSha256
+        val layerOnlyIdentity = !hasFullModelIdentity &&
+            modelSha256.matches(Regex("[a-fA-F0-9]{64}")) &&
+            layerArtifacts.isNotEmpty()
+        val resourceAdmitted = hasFullModelIdentity || layerOnlyIdentity
+        // An admitted resource must carry an empty reason_code: the scheduler
+        // treats any non-empty reason as a closed resource gate. The log keeps
+        // the distinction between full-model and layer-only admission.
         val resourceReason = if (resourceAdmitted) "" else "model_identity_not_verified"
+        QlhLogger.i(
+            "MainViewModel",
+            "task worker identity: modelId=$modelId sha=${modelSha256.take(12)} " +
+                "full=$hasFullModelIdentity layerOnly=$layerOnlyIdentity ranges=" +
+                layerArtifacts.map { "[${it.startLayer},${it.endLayerExclusive})" },
+        )
         // ★ 2026-09-30（审计「能力撒谎」）：`pipeline_worker` / `backend_id` / `capabilities`
         //   必须**同源**。此前这里无条件硬写前两者，而 `capabilities` 仍来自
         //   `buildAndroidPresenceDeviceInfo()`（按 `nativeRuntimeAvailable` 计算）——
@@ -1220,6 +1255,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         ?.let { "local-${it.take(12)}" } ?: "local",
                     resourceAdmitted = resourceAdmitted,
                     resourceReason = resourceReason,
+                    fullInferenceAvailable = hasFullModelIdentity,
                 ),
             )
         }.onFailure { error ->

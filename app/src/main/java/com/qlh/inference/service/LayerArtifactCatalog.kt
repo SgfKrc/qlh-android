@@ -43,7 +43,9 @@ object LayerArtifactManifestParser {
             "manifest layer range must be non-empty"
         }
         LayerArtifactDescriptor(
-            artifactName = File(artifact).name,
+            // Manifests are often generated on Windows and contain backslash
+            // paths. Android's File.name does not treat '\\' as a separator.
+            artifactName = artifact.substringAfterLast('/').substringAfterLast('\\'),
             startLayer = range.first,
             endLayerExclusive = range.second,
             artifactSha256 = artifactSha,

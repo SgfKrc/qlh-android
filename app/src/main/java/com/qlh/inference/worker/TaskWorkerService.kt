@@ -10,14 +10,19 @@ import android.os.Binder
 import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 import com.qlh.inference.BuildConfig
 import com.qlh.inference.MainActivity
 import com.qlh.inference.QlhApplication
 import com.qlh.inference.R
+import com.qlh.inference.logging.QlhLogger
+import com.qlh.inference.service.InferenceService
+import com.qlh.inference.service.ModelManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 /** Foreground lifecycle shell for the Android Full Worker client. */
@@ -93,27 +98,55 @@ class TaskWorkerService : Service() {
         val modelSha256 = intent.getStringExtra(EXTRA_MODEL_SHA256).orEmpty().trim()
         val resourceAdmitted = intent.getBooleanExtra(EXTRA_RESOURCE_ADMITTED, false)
         val resourceReason = intent.getStringExtra(EXTRA_RESOURCE_REASON).orEmpty().trim()
-        val layerRanges = QlhApplication.instance.inferenceService
-            ?.modelManager
-            ?.listLayerArtifacts(
-                expectedModelSha256 = modelSha256,
-                verifyArtifactDigest = true,
-            )
-            ?.getOrNull()
-            ?.map { listOf(it.startLayer, it.endLayerExclusive) }
-            .orEmpty()
-        // ★ 2026-09-23：native 的中间段能力（`layerForwardInfo()` 是 suspend，且要求模型已加载）
-        //   ⇒ 这里预取一次，capabilities lambda（非 suspend）后续直接读；模型未加载时留空
-        //   （协议侧这两个键都是可选的，缺失即不写）。
-        val layerForwardInfo = QlhApplication.instance.inferenceService
-            ?.engine
-            ?.layerForwardInfo()
-            ?.getOrNull()
-            .orEmpty()
+        val fullInferenceAvailable = intent.getBooleanExtra(EXTRA_FULL_INFERENCE_AVAILABLE, true)
+        // The distributed route must be able to advertise crop artifacts before
+        // the local inference service has loaded anything (or even exists yet).
+        val modelManager = QlhApplication.instance.inferenceService?.modelManager
+            ?: ModelManager(this)
+        if (QlhApplication.instance.inferenceService == null && !BuildConfig.IS_LITE) {
+            runCatching {
+                ContextCompat.startForegroundService(this, Intent(this, InferenceService::class.java))
+            }.onFailure { error ->
+                QlhLogger.w("TaskWorkerService", "inference service start failed: ${error.message}")
+            }
+        }
         val expectedModelIdentity = {
             AndroidWorkerCapabilities.modelIdentity(
                 modelId, modelFormat, modelRevision, modelSha256, resourceAdmitted,
             )
+        }
+        val buildCapabilities: suspend () -> Map<String, Any?> = suspend {
+            val layerRanges = modelManager.listLayerArtifacts(
+                expectedModelSha256 = modelSha256,
+                verifyArtifactDigest = true,
+            ).getOrNull()
+                ?.map { listOf(it.startLayer, it.endLayerExclusive) }
+                .orEmpty()
+            val layerForwardInfo = QlhApplication.instance.inferenceService
+                ?.engine
+                ?.layerForwardInfo()
+                ?.getOrNull()
+                .orEmpty()
+            val capabilities = AndroidWorkerCapabilities.build(
+                modelId = modelId,
+                modelFormat = modelFormat,
+                modelRevision = modelRevision,
+                modelSha256 = modelSha256,
+                resourceAdmitted = resourceAdmitted,
+                resourceReason = resourceReason,
+                layerRanges = layerRanges,
+                fullInferenceAvailable = fullInferenceAvailable,
+                layerWorker = !fullInferenceAvailable && layerRanges.isNotEmpty(),
+                middleChannel = layerForwardInfo["middle_channel"],
+                nPosPerEmbd = layerForwardInfo["n_pos_per_embd"]?.toIntOrNull(),
+            )
+            QlhLogger.i(
+                "TaskWorkerService",
+                "hello capabilities: stages=${capabilities["stage_types"]} " +
+                    "ranges=${capabilities["layer_ranges"]} model=${modelId.ifBlank { "<none>" }} " +
+                    "sha=${modelSha256.take(12)} admitted=$resourceAdmitted full=$fullInferenceAvailable",
+            )
+            capabilities
         }
         stopWorker()
         client = TaskWorkerClient(
@@ -128,27 +161,16 @@ class TaskWorkerService : Service() {
                 deviceInfo = deviceInfo,
                 modelSha256 = modelSha256,
             ),
-            capabilities = {
-                AndroidWorkerCapabilities.build(
-                    modelId = modelId,
-                    modelFormat = modelFormat,
-                    modelRevision = modelRevision,
-                    modelSha256 = modelSha256,
-                    resourceAdmitted = resourceAdmitted,
-                    resourceReason = resourceReason,
-                    layerRanges = layerRanges,
-                    middleChannel = layerForwardInfo["middle_channel"],
-                    nPosPerEmbd = layerForwardInfo["n_pos_per_embd"]?.toIntOrNull(),
-                )
-            },
+            capabilities = buildCapabilities,
             stageHandler = AndroidFullWorkerStageExecutor(
                 expectedModelIdentity = expectedModelIdentity,
+                allowLayerIdentityAlias = { !fullInferenceAvailable },
                 ensureModelLoaded = { contextSize ->
-                    QlhApplication.instance.inferenceService?.ensureModelLoaded(contextSize)
+                    awaitInferenceService()?.ensureModelLoaded(contextSize)
                         ?: Result.failure(IllegalStateException("inference_service_unavailable"))
                 },
                 generate = { prompt, maxTokens, temperature, topP ->
-                    QlhApplication.instance.inferenceService?.generate(
+                    awaitInferenceService()?.generate(
                         prompt, maxTokens, temperature, topP,
                     ) ?: Result.failure(IllegalStateException("inference_service_unavailable"))
                 },
@@ -158,7 +180,7 @@ class TaskWorkerService : Service() {
                 //      （引擎会按需卸载重载）。这是刻意的 fail-closed：
                 //      宁可重载一次，也不静默降级成取不到 hidden。
                 layerForward = { req ->
-                    QlhApplication.instance.inferenceService?.engine?.let { engine ->
+                    awaitInferenceService()?.engine?.let { engine ->
                         engine.layerForward(
                             hidden = req.hidden,
                             nTokens = req.nTokens,
@@ -180,7 +202,7 @@ class TaskWorkerService : Service() {
                     } ?: Result.failure(IllegalStateException("inference_service_unavailable"))
                 },
                 ensureModelLoadedForLayer = { range, contextSize, embeddingWidth, wantHidden, sha256 ->
-                    QlhApplication.instance.inferenceService
+                    awaitInferenceService()
                         ?.ensureLayerModelLoaded(
                             layerRange = range,
                             contextSize = contextSize,
@@ -192,6 +214,14 @@ class TaskWorkerService : Service() {
                 },
             ),
         ).also { it.start() }
+    }
+
+    private suspend fun awaitInferenceService(): InferenceService? {
+        repeat(50) {
+            QlhApplication.instance.inferenceService?.let { return it }
+            delay(100L)
+        }
+        return QlhApplication.instance.inferenceService
     }
 
     private fun stopWorker() {
@@ -247,6 +277,7 @@ class TaskWorkerService : Service() {
         const val EXTRA_MODEL_SHA256 = "model_sha256"
         const val EXTRA_RESOURCE_ADMITTED = "resource_admitted"
         const val EXTRA_RESOURCE_REASON = "resource_reason"
+        const val EXTRA_FULL_INFERENCE_AVAILABLE = "full_inference_available"
         const val EXTRA_REASON = "reason"
 
         fun startIntent(
@@ -264,6 +295,7 @@ class TaskWorkerService : Service() {
             modelSha256: String = "",
             resourceAdmitted: Boolean = false,
             resourceReason: String = "resource_gate_not_confirmed",
+            fullInferenceAvailable: Boolean = true,
         ): Intent = Intent(
             context,
             TaskWorkerService::class.java,
@@ -281,6 +313,7 @@ class TaskWorkerService : Service() {
             .putExtra(EXTRA_MODEL_SHA256, modelSha256)
             .putExtra(EXTRA_RESOURCE_ADMITTED, resourceAdmitted)
             .putExtra(EXTRA_RESOURCE_REASON, resourceReason)
+            .putExtra(EXTRA_FULL_INFERENCE_AVAILABLE, fullInferenceAvailable)
 
         fun stopIntent(context: Context): Intent = Intent(context, TaskWorkerService::class.java)
             .setAction(ACTION_STOP)

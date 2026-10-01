@@ -410,6 +410,7 @@ object TaskWorkerProtocol {
             expectedCapabilityFields +
                 (if (capabilities.containsKey("resource_gate")) setOf("resource_gate") else emptySet()) +
                 (if (capabilities.containsKey("layer_ranges")) setOf("layer_ranges") else emptySet()) +
+                (if (capabilities.containsKey("layer_worker")) setOf("layer_worker") else emptySet()) +
                 // ★ 2026-09-23：中间段通道与 M-RoPE 位置分量数（均可选，向后兼容）
                 (if (capabilities.containsKey("middle_channel")) setOf("middle_channel") else emptySet()) +
                 (if (capabilities.containsKey("n_pos_per_embd")) setOf("n_pos_per_embd") else emptySet()),
@@ -473,6 +474,13 @@ object TaskWorkerProtocol {
                     fail("layer_ranges must contain [start, end) integer ranges", "invalid_capabilities", "payload.capabilities.layer_ranges[$index]")
                 }
             }
+        }
+        if (capabilities.containsKey("layer_worker") && capabilities["layer_worker"] !is Boolean) {
+            fail(
+                "capabilities.layer_worker must be boolean",
+                "invalid_capabilities",
+                "payload.capabilities.layer_worker",
+            )
         }
     }
 
