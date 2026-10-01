@@ -531,7 +531,8 @@ class LocalInferenceEngine(private val context: Context) {
         }
         try {
             if (wantHidden) {
-                val out = FloatArray(estimateEmbeddingWidth(hidden.size, nTokens))
+                val embeddingWidth = estimateEmbeddingWidth(hidden.size, nTokens)
+                val out = FloatArray(embeddingWidth * nTokens)
                 // keep-head（nextn）通道给的是末层输出（output_norm 之前）—— 与主仓接力
                 // 上游/中间段同语义；embeddings 通道给的是 output_norm(H)，多一次归一化。
                 // ★ P3 多序列：给了 seqIds/positions 时走显式绑定入口（与主仓同一契约）。

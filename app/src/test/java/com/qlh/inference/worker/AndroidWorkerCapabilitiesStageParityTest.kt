@@ -50,8 +50,12 @@ class AndroidWorkerCapabilitiesStageParityTest {
         hiddenDtype: String = "float32",
         seqIds: List<Int>? = null,
         positions: List<Int>? = null,
+        nTokens: Int = 1,
     ): TaskWorkerEnvelope {
         val rootInput = rootInputByStage.getValue(stageType).toMutableMap()
+        if (stageType == "layer_forward" && nTokens != 1) {
+            rootInput["hidden_f32"] = floatArrayToBase64(FloatArray(nTokens * 4) { it.toFloat() })
+        }
         if (stageType == "layer_forward" && hiddenDtype == "float16") {
             rootInput.remove("hidden_f32")
             rootInput["hidden_f16"] = floatsToF16Base64(floatArrayOf(0f, 1f, 2f, 3f))
@@ -62,7 +66,7 @@ class AndroidWorkerCapabilitiesStageParityTest {
                 "handoff_at" to 4,
                 "hidden_sha256" to "b".repeat(64),
                 "hidden_spec" to mapOf(
-                    "n_tokens" to 1,
+                    "n_tokens" to nTokens,
                     "n_embd" to 4,
                     "dtype" to hiddenDtype,
                 ),
@@ -163,6 +167,37 @@ class AndroidWorkerCapabilitiesStageParityTest {
         assertEquals(42, result.output["token_argmax"])
         assertEquals(listOf(4, 8), result.output["layer_range"])
         assertEquals("layer_forward", result.metadata["stage"])
+    }
+
+    @Test
+    fun `intermediate layer result carries raw hidden bytes for the next stage`() = runBlocking {
+        val hidden = floatArrayOf(0.25f, -1.5f, 3.0f, 4.5f)
+        val executor = wiredExecutor(
+            onLayer = {
+                Result.success(LayerForwardResult(tokenArgmax = 7, hiddenOut = hidden))
+            },
+        )
+
+        val result = executor.execute(offer("layer_forward"))
+        val encoded = result.output["hidden_out_f32"] as? String
+        assertTrue(!encoded.isNullOrBlank())
+        assertEquals(16, java.util.Base64.getDecoder().decode(encoded).size)
+        assertEquals(64, (result.output["hidden_out_sha256"] as? String)?.length)
+    }
+
+    @Test
+    fun `intermediate prefill result preserves every token hidden row`() = runBlocking {
+        val hidden = FloatArray(8) { it.toFloat() }
+        val executor = wiredExecutor(
+            onLayer = {
+                Result.success(LayerForwardResult(tokenArgmax = 7, hiddenOut = hidden))
+            },
+        )
+
+        val result = executor.execute(offer("layer_forward", nTokens = 2))
+        val encoded = result.output["hidden_out_f32"] as? String
+        assertTrue(!encoded.isNullOrBlank())
+        assertEquals(hidden.size * 4, java.util.Base64.getDecoder().decode(encoded).size)
     }
 
     @Test

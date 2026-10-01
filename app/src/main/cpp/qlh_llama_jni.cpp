@@ -1154,7 +1154,7 @@ static jint qlh_layer_forward_impl(
                                                : (llama_pos) (pos_base + i);
         batch.n_seq_id[i] = 1;
         batch.seq_id[i][0] = (seq_ids != nullptr) ? seq_ids[i] : 0;
-        batch.logits[i] = (i + 1 == n_tokens) ? 1 : 0;
+        batch.logits[i] = (out_hidden != nullptr || i + 1 == n_tokens) ? 1 : 0;
     }
     batch.n_tokens = n_tokens;
     std::memcpy(batch.embd, hidden.data(), hidden.size() * sizeof(float));
@@ -1193,14 +1193,26 @@ static jint qlh_layer_forward_impl(
                 llama_batch_free(batch);
                 return -1;
             }
-            if (env->GetArrayLength(out_hidden) != (jsize) n_embd_inp) {
+            if (env->GetArrayLength(out_hidden) != (jsize) n_tokens * n_embd_inp) {
                 llama_batch_free(batch);
                 return -1;
             }
-            env->SetFloatArrayRegion(out_hidden, 0, (jsize) n_embd_inp, hidden_out);
-            if (env->ExceptionCheck()) {
-                llama_batch_free(batch);
-                return -1;
+            for (int i = 0; i < n_tokens; ++i) {
+                const float * token_hidden = llama_get_embeddings_ith(qctx->ctx, i);
+                if (token_hidden == nullptr) {
+                    llama_batch_free(batch);
+                    return -1;
+                }
+                env->SetFloatArrayRegion(
+                    out_hidden,
+                    (jsize) i * n_embd_inp,
+                    (jsize) n_embd_inp,
+                    token_hidden
+                );
+                if (env->ExceptionCheck()) {
+                    llama_batch_free(batch);
+                    return -1;
+                }
             }
         }
     }
@@ -1304,7 +1316,7 @@ static const float * qlh_layer_out_get(llama_context * ctx, const llama_model * 
     if (base == nullptr) {
         return nullptr;
     }
-    return base + (size_t) (n_tokens - 1) * (size_t) llama_model_n_embd_inp(model);
+    return base;
 }
 
 // ---------------------------------------------------------------------------
@@ -1354,7 +1366,7 @@ static jint qlh_layer_forward_keep_head_impl(
     if (arr_len != (jsize) n_tokens * n_embd_inp) {
         return -1;
     }
-    if (env->GetArrayLength(out_hidden) != (jsize) n_embd_inp) {
+    if (env->GetArrayLength(out_hidden) != (jsize) n_tokens * n_embd_inp) {
         return -1;
     }
 
@@ -1419,11 +1431,18 @@ static jint qlh_layer_forward_keep_head_impl(
             qlh_layer_out_set(qctx->ctx, qctx->model, false);
             return -3;  // 层输出通道不可用 ⇒ 调用方 fail-closed
         }
-        env->SetFloatArrayRegion(out_hidden, 0, (jsize) n_embd_inp, hidden_out);
-        if (env->ExceptionCheck()) {
-            llama_batch_free(batch);
-            qlh_layer_out_set(qctx->ctx, qctx->model, false);
-            return -1;
+        for (int i = 0; i < n_tokens; ++i) {
+            env->SetFloatArrayRegion(
+                out_hidden,
+                (jsize) i * n_embd_inp,
+                (jsize) n_embd_inp,
+                hidden_out + (size_t) i * n_embd_inp
+            );
+            if (env->ExceptionCheck()) {
+                llama_batch_free(batch);
+                qlh_layer_out_set(qctx->ctx, qctx->model, false);
+                return -1;
+            }
         }
     }
 

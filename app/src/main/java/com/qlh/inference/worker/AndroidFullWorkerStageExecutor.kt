@@ -292,6 +292,10 @@ class AndroidFullWorkerStageExecutor(
         output["n_tokens"] = nTokens
         result.hiddenOut?.let { out ->
             output["hidden_out_sha256"] = sha256Hex(out)
+            // The digest is useful for auditing, but the next stage also
+            // needs the actual tensor. Keep the wire representation explicit
+            // and symmetric with root_input.hidden_f32.
+            output["hidden_out_f32"] = encodeFloat32(out)
         }
         return TaskWorkerStageExecution(
             output = output,
@@ -377,6 +381,14 @@ class AndroidFullWorkerStageExecutor(
             }
         }
         return out
+    }
+
+    private fun encodeFloat32(values: FloatArray): String {
+        val bytes = java.nio.ByteBuffer
+            .allocate(values.size * 4)
+            .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+        values.forEach(bytes::putFloat)
+        return java.util.Base64.getEncoder().encodeToString(bytes.array())
     }
 
     /**
