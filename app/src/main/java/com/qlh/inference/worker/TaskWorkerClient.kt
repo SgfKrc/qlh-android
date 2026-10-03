@@ -664,10 +664,14 @@ class TaskWorkerClient(
     private suspend fun handleOffer(connection: TaskWorkerTransport, envelope: TaskWorkerEnvelope) {
         val payload = envelope.payload
         val identity = identityFrom(payload)
+        // ★ 回程必须**原样回显** offer 里的 `provider_id` —— 它是主节点的 Provider 口径
+        //   （`remote_<node_id>`），不是本节点的裸 nodeId。此前一律回裸 nodeId，被主节点
+        //   以 `attempt_identity_mismatch` 拒掉，真机表现为 Stage 响应一直等到超时。
+        val providerId = (payload["provider_id"] as? String)?.takeIf { it.isNotBlank() } ?: nodeId
         val expires = (payload["lease_expires_at_ms"] as Number).toLong()
         if (!machine.offer(identity, expires, clockMs())) {
             connection.send(TaskWorkerProtocol.buildStageAccept(
-                identity, nodeId, false, "worker_busy_or_lease_invalid", true,
+                identity, providerId, false, "worker_busy_or_lease_invalid", true,
                 newMessageId("accept"), clockMs(),
             ))
             return
@@ -677,13 +681,13 @@ class TaskWorkerClient(
             machine.fail(identity, "worker_execution_not_configured", retryable = true)
             publish()
             connection.send(TaskWorkerProtocol.buildStageAccept(
-                identity, nodeId, false, "worker_execution_not_configured", true,
+                identity, providerId, false, "worker_execution_not_configured", true,
                 newMessageId("accept"), clockMs(),
             ))
             return
         }
         connection.send(TaskWorkerProtocol.buildStageAccept(
-            identity, nodeId, true, "", false, newMessageId("accept"), clockMs(),
+            identity, providerId, true, "", false, newMessageId("accept"), clockMs(),
         ))
         machine.markRunning(identity, clockMs())
         publish()
@@ -691,7 +695,7 @@ class TaskWorkerClient(
             try {
                 val execution = handler.execute(envelope)
                 val output = TaskWorkerProtocol.buildStageResult(
-                    identity, nodeId, execution.output, execution.metadata,
+                    identity, providerId, execution.output, execution.metadata,
                     newMessageId("result"), clockMs(),
                 )
                 val digest = output.payload["output_sha256"] as String
@@ -703,7 +707,7 @@ class TaskWorkerClient(
                 if (machine.snapshot().activeAttempt.identity == identity && machine.snapshot().activeAttempt.state == TaskWorkerAttemptState.CANCELLING) {
                     machine.cancelled(identity)
                     connection.send(TaskWorkerProtocol.buildStageCancelled(
-                        identity, nodeId, "cancelled", newMessageId("cancelled"), clockMs(),
+                        identity, providerId, "cancelled", newMessageId("cancelled"), clockMs(),
                     ))
                     publish()
                 }
@@ -712,7 +716,7 @@ class TaskWorkerClient(
                     ?: "worker_execution_failed"
                 if (machine.fail(identity, errorCode, retryable = true)) {
                     connection.send(TaskWorkerProtocol.buildStageError(
-                        identity, nodeId, errorCode, true,
+                        identity, providerId, errorCode, true,
                         newMessageId("error"), clockMs(),
                     ))
                     publish()
@@ -723,12 +727,15 @@ class TaskWorkerClient(
 
     private suspend fun handleCancel(connection: TaskWorkerTransport, envelope: TaskWorkerEnvelope) {
         val identity = identityFrom(envelope.payload)
+        // 与 handleOffer 同理：回程原样回显主节点的 `provider_id`。
+        val providerId = (envelope.payload["provider_id"] as? String)
+            ?.takeIf { it.isNotBlank() } ?: nodeId
         if (machine.requestCancel(clockMs(), expectedIdentity = identity) == identity) {
             executionJob?.cancel()
             if (stageHandler == null) {
                 machine.cancelled(identity)
                 connection.send(TaskWorkerProtocol.buildStageCancelled(
-                    identity, nodeId, "cancelled", newMessageId("cancelled"), clockMs(),
+                    identity, providerId, "cancelled", newMessageId("cancelled"), clockMs(),
                 ))
                 publish()
             }
