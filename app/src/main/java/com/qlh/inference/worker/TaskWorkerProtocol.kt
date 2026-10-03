@@ -408,14 +408,30 @@ object TaskWorkerProtocol {
         requireExact(
             capabilities.keys,
             expectedCapabilityFields +
+                (if (capabilities.containsKey("runtime_profile")) setOf("runtime_profile") else emptySet()) +
                 (if (capabilities.containsKey("resource_gate")) setOf("resource_gate") else emptySet()) +
                 (if (capabilities.containsKey("layer_ranges")) setOf("layer_ranges") else emptySet()) +
                 (if (capabilities.containsKey("layer_worker")) setOf("layer_worker") else emptySet()) +
                 // ★ 2026-09-23：中间段通道与 M-RoPE 位置分量数（均可选，向后兼容）
                 (if (capabilities.containsKey("middle_channel")) setOf("middle_channel") else emptySet()) +
                 (if (capabilities.containsKey("n_pos_per_embd")) setOf("n_pos_per_embd") else emptySet()),
-            "payload.capabilities",
+                "payload.capabilities",
         )
+        if (capabilities.containsKey("runtime_profile")) {
+            val profile = capabilities["runtime_profile"] as? String
+            if (profile == null || profile !in setOf(
+                    AndroidWorkerCapabilities.DEFAULT_RUNTIME_PROFILE,
+                    "torch_cpu",
+                    "torch_cuda",
+                    AndroidWorkerCapabilities.UNSPECIFIED_RUNTIME_PROFILE,
+                )) {
+                fail(
+                    "capabilities.runtime_profile is not a supported release profile",
+                    "invalid_capabilities",
+                    "payload.capabilities.runtime_profile",
+                )
+            }
+        }
         if (capabilities.containsKey("middle_channel")) {
             val channel = capabilities["middle_channel"] as? String
             if (channel == null || channel !in layerForwardMiddleChannels) {

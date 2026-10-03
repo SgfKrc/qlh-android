@@ -2,6 +2,21 @@ package com.qlh.inference.worker
 
 /** Builds the conservative capability snapshot sent by an Android Full Worker. */
 object AndroidWorkerCapabilities {
+    /** Release/runtime profile names shared with the Python worker protocol. */
+    const val DEFAULT_RUNTIME_PROFILE: String = "llama_cpp_only"
+    const val UNSPECIFIED_RUNTIME_PROFILE: String = "unspecified"
+    private val SUPPORTED_RUNTIME_PROFILES = setOf(
+        DEFAULT_RUNTIME_PROFILE,
+        "torch_cpu",
+        "torch_cuda",
+        UNSPECIFIED_RUNTIME_PROFILE,
+    )
+
+    fun normalizeRuntimeProfile(value: String?): String {
+        val normalized = value?.trim()?.lowercase().orEmpty()
+        return normalized.takeIf { it in SUPPORTED_RUNTIME_PROFILES }
+            ?: UNSPECIFIED_RUNTIME_PROFILE
+    }
     /**
      * 本 Android worker 支持的推理引擎集合 —— **能力探测的单一来源**。
      *
@@ -115,6 +130,8 @@ object AndroidWorkerCapabilities {
         fullInferenceAvailable: Boolean = true,
         /** True when the advertised identity is a source-SHA layer alias. */
         layerWorker: Boolean = false,
+        /** Runtime profile selected by the Android release variant. */
+        runtimeProfile: String = DEFAULT_RUNTIME_PROFILE,
         // ★ 2026-09-23：中间段通道能力与 M-RoPE 位置分量数（来自 native 的 `layerForwardInfo()`）。
         //   `null` = 未声明 ⇒ 不写这两个键（协议侧它们都是可选的）。
         middleChannel: String? = null,
@@ -140,6 +157,7 @@ object AndroidWorkerCapabilities {
             "engines" to SUPPORTED_ENGINES,
             "models" to (model?.let { listOf(it) } ?: emptyList<Map<String, Any?>>()),
             "max_concurrency" to 1,
+            "runtime_profile" to normalizeRuntimeProfile(runtimeProfile),
             "resource_gate" to mapOf(
                 "admitted" to resourceAdmitted,
                 "reason_code" to normalizedReason,

@@ -99,6 +99,9 @@ class TaskWorkerService : Service() {
         val resourceAdmitted = intent.getBooleanExtra(EXTRA_RESOURCE_ADMITTED, false)
         val resourceReason = intent.getStringExtra(EXTRA_RESOURCE_REASON).orEmpty().trim()
         val fullInferenceAvailable = intent.getBooleanExtra(EXTRA_FULL_INFERENCE_AVAILABLE, true)
+        val runtimeProfile = AndroidWorkerCapabilities.normalizeRuntimeProfile(
+            deviceInfo["runtime_profile"]?.toString(),
+        )
         // The distributed route must be able to advertise crop artifacts before
         // the local inference service has loaded anything (or even exists yet).
         val modelManager = QlhApplication.instance.inferenceService?.modelManager
@@ -137,6 +140,7 @@ class TaskWorkerService : Service() {
                 layerRanges = layerRanges,
                 fullInferenceAvailable = fullInferenceAvailable,
                 layerWorker = !fullInferenceAvailable && layerRanges.isNotEmpty(),
+                runtimeProfile = runtimeProfile,
                 middleChannel = layerForwardInfo["middle_channel"],
                 nPosPerEmbd = layerForwardInfo["n_pos_per_embd"]?.toIntOrNull(),
             )
@@ -144,7 +148,8 @@ class TaskWorkerService : Service() {
                 "TaskWorkerService",
                 "hello capabilities: stages=${capabilities["stage_types"]} " +
                     "ranges=${capabilities["layer_ranges"]} model=${modelId.ifBlank { "<none>" }} " +
-                    "sha=${modelSha256.take(12)} admitted=$resourceAdmitted full=$fullInferenceAvailable",
+                    "sha=${modelSha256.take(12)} profile=$runtimeProfile " +
+                    "admitted=$resourceAdmitted full=$fullInferenceAvailable",
             )
             capabilities
         }

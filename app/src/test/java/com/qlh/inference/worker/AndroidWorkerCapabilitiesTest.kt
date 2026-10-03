@@ -9,6 +9,7 @@ class AndroidWorkerCapabilitiesTest {
     fun `resource gate defaults closed and withholds model identity`() {
         val capabilities = AndroidWorkerCapabilities.build(modelId = "qwen_1_8b")
         assertEquals(1, capabilities["max_concurrency"])
+        assertEquals(AndroidWorkerCapabilities.DEFAULT_RUNTIME_PROFILE, capabilities["runtime_profile"])
         assertTrue((capabilities["models"] as List<*>).isEmpty())
         assertEquals(
             mapOf("admitted" to false, "reason_code" to "resource_gate_not_confirmed"),
@@ -121,6 +122,36 @@ class AndroidWorkerCapabilitiesTest {
                 nodeId = "android_layer_alias_01",
                 capabilities = capabilities,
                 messageId = "msg_capabilities_layer_alias_01",
+                sentAtMs = 1_700_000_000_000,
+            ),
+        )
+    }
+
+    @Test
+    fun `runtime profile is carried by hello capabilities`() {
+        val capabilities = AndroidWorkerCapabilities.build(
+            runtimeProfile = "llama_cpp_only",
+        )
+        assertEquals("llama_cpp_only", capabilities["runtime_profile"])
+        TaskWorkerProtocol.validate(
+            TaskWorkerProtocol.buildHello(
+                nodeId = "android_profile_01",
+                capabilities = capabilities,
+                messageId = "msg_capabilities_profile_01",
+                sentAtMs = 1_700_000_000_000,
+            ),
+        )
+    }
+
+    @Test
+    fun `unknown runtime profile is fail-closed to unspecified`() {
+        val capabilities = AndroidWorkerCapabilities.build(runtimeProfile = "torch_edge")
+        assertEquals(AndroidWorkerCapabilities.UNSPECIFIED_RUNTIME_PROFILE, capabilities["runtime_profile"])
+        TaskWorkerProtocol.validate(
+            TaskWorkerProtocol.buildHello(
+                nodeId = "android_profile_02",
+                capabilities = capabilities,
+                messageId = "msg_capabilities_profile_02",
                 sentAtMs = 1_700_000_000_000,
             ),
         )

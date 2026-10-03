@@ -235,6 +235,14 @@ fun buildAndroidPresencePayload(
     } else {
         ""
     },
+    // Full Android ships the native llama.cpp runtime; expose the same
+    // release profile as the worker hello so scheduler views agree with the
+    // presence/device_info advertisement.
+    "runtime_profile" to if (runtime?.nativeRuntimeAvailable == true && !runtime.isLite) {
+        "llama_cpp_only"
+    } else {
+        "unspecified"
+    },
     "client_mode" to SettingsDataStore.normalizeInferenceMode(inferenceMode),
     "app_variant" to appVariant,
     "app_version" to appVersion,

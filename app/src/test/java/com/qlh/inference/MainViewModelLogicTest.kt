@@ -135,6 +135,7 @@ class MainViewModelLogicTest {
         assertEquals("distributed", payload["client_mode"])
         assertEquals("full", payload["app_variant"])
         assertEquals("0.1.0", payload["app_version"])
+        assertEquals("unspecified", payload["runtime_profile"])
     }
 
     @Test
@@ -182,6 +183,7 @@ class MainViewModelLogicTest {
     @Test
     fun `payload reflects runtime gpu and backend status when present`() {
         val runtime = AndroidRuntimeStatus(
+            nativeRuntimeAvailable = true,
             gpu = GpuStatus(supportsGpuOffload = true, backendDevices = "gpu:0"),
             backend = BackendStatus(engine = "llama.cpp", supportsGpuOffload = true),
         )
@@ -194,6 +196,7 @@ class MainViewModelLogicTest {
             gpu = sampleGpu(),
             runtime = runtime,
         )
+        assertEquals("llama_cpp_only", payload["runtime_profile"])
         @Suppress("UNCHECKED_CAST")
         val gpu = payload["gpu"] as Map<String, Any?>
         assertEquals(true, gpu["supports_gpu_offload"])
