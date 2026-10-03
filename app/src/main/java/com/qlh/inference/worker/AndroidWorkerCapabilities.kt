@@ -118,6 +118,59 @@ object AndroidWorkerCapabilities {
         null
     }
 
+    /** 设备自荐的层容量；见 [computeLayerBudget]。 */
+    data class LayerBudget(
+        val availableBytes: Long,
+        val perLayerBytes: Long,
+        val maxLayers: Int,
+        val localCut: Boolean,
+    ) {
+        fun toMap(): Map<String, Any> = mapOf(
+            "available_bytes" to availableBytes,
+            "per_layer_bytes" to perLayerBytes,
+            "max_layers" to maxLayers,
+            "local_cut" to localCut,
+        )
+    }
+
+    /**
+     * 按可用内存与单层字节推算本节点可承载的层数上限。
+     *
+     * 与 `layer_ranges` 分工：`layer_ranges` 是"当前已就绪、马上能跑的区间"，
+     * `layer_budget` 是"本地裁层之后能承载的层数上限"。主仓调度据此可以把任意
+     * 连续区间分给本节点，而不是被预置工件的那一段钉死。
+     *
+     * 任一项缺少依据就返回 `null`（**不猜**）：此时不上报 `layer_budget`，
+     * 调度退回只按 `layer_ranges` 与容量账分配。
+     *
+     * @param availableBytes 可用于承载层段权重的可用内存
+     * @param modelFileBytes 已选模型工件的字节数
+     * @param coveredLayers 该工件覆盖的层数（整模＝模型总层数）
+     * @param safetyFactor 给 KV 缓存与运行时留的余量系数（0 < f <= 1）
+     * @param localCut 是否具备本地裁层条件（整模与裁层工具都就位）
+     */
+    fun computeLayerBudget(
+        availableBytes: Long,
+        modelFileBytes: Long,
+        coveredLayers: Int,
+        safetyFactor: Double = 0.6,
+        localCut: Boolean = false,
+    ): LayerBudget? {
+        if (availableBytes <= 0L || modelFileBytes <= 0L || coveredLayers <= 0) return null
+        if (safetyFactor <= 0.0 || safetyFactor > 1.0) return null
+        val perLayerBytes = modelFileBytes / coveredLayers
+        if (perLayerBytes <= 0L) return null
+        val budgetBytes = (availableBytes * safetyFactor).toLong()
+        val maxLayers = (budgetBytes / perLayerBytes).toInt()
+        if (maxLayers <= 0) return null
+        return LayerBudget(
+            availableBytes = budgetBytes,
+            perLayerBytes = perLayerBytes,
+            maxLayers = maxLayers,
+            localCut = localCut,
+        )
+    }
+
     fun build(
         modelId: String = "",
         modelFormat: String = "gguf",
@@ -136,6 +189,8 @@ object AndroidWorkerCapabilities {
         //   `null` = 未声明 ⇒ 不写这两个键（协议侧它们都是可选的）。
         middleChannel: String? = null,
         nPosPerEmbd: Int? = null,
+        /** 设备自荐的层容量（本地裁层后可承载的层数上限）；null = 缺少依据，不上报。 */
+        layerBudget: LayerBudget? = null,
     ): Map<String, Any?> {
         val normalizedReason = if (resourceAdmitted) "" else resourceReason.ifBlank {
             "resource_gate_not_confirmed"
@@ -170,6 +225,10 @@ object AndroidWorkerCapabilities {
         //   而不是靠 `extract_hidden` 去猜。
         if (middleChannel != null) capabilities["middle_channel"] = middleChannel
         if (nPosPerEmbd != null && nPosPerEmbd > 0) capabilities["n_pos_per_embd"] = nPosPerEmbd
+        // ★ 2026-10-03：设备自荐的层容量（本地裁层后可承载的层数上限）。
+        //   与 `layer_ranges` 区别：后者是手上工件现成能跑的区间，前者是能自裁并
+        //   承载的上限 ⇒ 有了它，主仓调度才能分配任意连续区间。
+        if (layerBudget != null) capabilities["layer_budget"] = layerBudget.toMap()
         return capabilities
     }
 }

@@ -119,17 +119,32 @@ class TaskWorkerService : Service() {
             )
         }
         val buildCapabilities: suspend () -> Map<String, Any?> = suspend {
-            val layerRanges = modelManager.listLayerArtifacts(
+            val layerArtifacts = modelManager.listLayerArtifacts(
                 expectedModelSha256 = modelSha256,
                 verifyArtifactDigest = true,
-            ).getOrNull()
-                ?.map { listOf(it.startLayer, it.endLayerExclusive) }
-                .orEmpty()
+            ).getOrNull().orEmpty()
+            val layerRanges = layerArtifacts
+                .map { listOf(it.startLayer, it.endLayerExclusive) }
             val layerForwardInfo = QlhApplication.instance.inferenceService
                 ?.engine
                 ?.layerForwardInfo()
                 ?.getOrNull()
                 .orEmpty()
+            // ★ 2026-10-03：设备自荐层容量 —— 按可用内存与已选工件推算"能承载多少层"。
+            //   `localCut` 先恒为 false：设备侧本地裁层执行体尚未落地，不虚报能力。
+            // ★ 每层字节必须来自**同一个工件**：用它自己的文件字节 ÷ 它覆盖的层数。
+            //   此前用"目录里最大工件 ÷ 当前工件层数"，两者会错配（拿整模的字节除以
+            //   中段的层数）⇒ 每层字节偏大、可承载层数被低估。
+            val readyArtifact = layerArtifacts.firstOrNull { it.document.sizeBytes > 0 }
+            val layerBudget = AndroidWorkerCapabilities.computeLayerBudget(
+                availableBytes = (deviceInfo["memory"] as? Map<*, *>)
+                    ?.get("available_bytes")
+                    ?.let { (it as? Number)?.toLong() }
+                    ?: 0L,
+                modelFileBytes = readyArtifact?.document?.sizeBytes ?: 0L,
+                coveredLayers = readyArtifact
+                    ?.let { it.endLayerExclusive - it.startLayer } ?: 0,
+            )
             val capabilities = AndroidWorkerCapabilities.build(
                 modelId = modelId,
                 modelFormat = modelFormat,
@@ -143,12 +158,14 @@ class TaskWorkerService : Service() {
                 runtimeProfile = runtimeProfile,
                 middleChannel = layerForwardInfo["middle_channel"],
                 nPosPerEmbd = layerForwardInfo["n_pos_per_embd"]?.toIntOrNull(),
+                layerBudget = layerBudget,
             )
             QlhLogger.i(
                 "TaskWorkerService",
                 "hello capabilities: stages=${capabilities["stage_types"]} " +
                     "ranges=${capabilities["layer_ranges"]} model=${modelId.ifBlank { "<none>" }} " +
                     "sha=${modelSha256.take(12)} profile=$runtimeProfile " +
+                    "budget=${layerBudget?.maxLayers} " +
                     "admitted=$resourceAdmitted full=$fullInferenceAvailable",
             )
             capabilities

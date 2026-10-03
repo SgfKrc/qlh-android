@@ -1,6 +1,9 @@
 package com.qlh.inference.worker
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -22,6 +25,74 @@ class AndroidWorkerCapabilitiesTest {
             sentAtMs = 1_700_000_000_000,
         )
         TaskWorkerProtocol.validate(hello)
+    }
+
+    @Test
+    fun `layer budget derives from available memory and artifact size`() {
+        val budget = AndroidWorkerCapabilities.computeLayerBudget(
+            availableBytes = 8_000_000_000L,
+            modelFileBytes = 1_000_000_000L,
+            coveredLayers = 20,
+            safetyFactor = 0.6,
+        )
+
+        assertNotNull(budget)
+        assertEquals(50_000_000L, budget!!.perLayerBytes)
+        assertEquals(96, budget.maxLayers)
+        assertFalse(budget.localCut)
+    }
+
+    @Test
+    fun `layer budget is withheld without evidence`() {
+        assertNull(AndroidWorkerCapabilities.computeLayerBudget(0L, 1_000L, 10))
+        assertNull(AndroidWorkerCapabilities.computeLayerBudget(1_000L, 0L, 10))
+        assertNull(AndroidWorkerCapabilities.computeLayerBudget(1_000L, 1_000L, 0))
+        assertNull(
+            AndroidWorkerCapabilities.computeLayerBudget(
+                1_000L, 1_000L, 10, safetyFactor = 0.0,
+            ),
+        )
+    }
+
+    @Test
+    fun `build advertises layer budget only when it is known`() {
+        val withBudget = AndroidWorkerCapabilities.build(
+            modelId = "qwen3_5_2b",
+            modelSha256 = "a".repeat(64),
+            resourceAdmitted = true,
+            layerRanges = listOf(listOf(4, 16)),
+            layerBudget = AndroidWorkerCapabilities.LayerBudget(
+                availableBytes = 100L,
+                perLayerBytes = 10L,
+                maxLayers = 8,
+                localCut = true,
+            ),
+        )
+        assertEquals(
+            mapOf(
+                "available_bytes" to 100L,
+                "per_layer_bytes" to 10L,
+                "max_layers" to 8,
+                "local_cut" to true,
+            ),
+            withBudget["layer_budget"],
+        )
+        // 本端协议校验必须接受该可选键，否则真机 hello 会被自己拦下。
+        TaskWorkerProtocol.validate(
+            TaskWorkerProtocol.buildHello(
+                nodeId = "android_worker_01",
+                capabilities = withBudget,
+                messageId = "msg_capabilities_budget",
+                sentAtMs = 1_700_000_000_000,
+            ),
+        )
+
+        val withoutBudget = AndroidWorkerCapabilities.build(
+            modelId = "qwen3_5_2b",
+            modelSha256 = "a".repeat(64),
+            resourceAdmitted = true,
+        )
+        assertFalse(withoutBudget.containsKey("layer_budget"))
     }
 
     @Test

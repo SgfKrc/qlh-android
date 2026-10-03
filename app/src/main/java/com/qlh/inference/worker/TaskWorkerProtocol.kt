@@ -414,7 +414,9 @@ object TaskWorkerProtocol {
                 (if (capabilities.containsKey("layer_worker")) setOf("layer_worker") else emptySet()) +
                 // ★ 2026-09-23：中间段通道与 M-RoPE 位置分量数（均可选，向后兼容）
                 (if (capabilities.containsKey("middle_channel")) setOf("middle_channel") else emptySet()) +
-                (if (capabilities.containsKey("n_pos_per_embd")) setOf("n_pos_per_embd") else emptySet()),
+                (if (capabilities.containsKey("n_pos_per_embd")) setOf("n_pos_per_embd") else emptySet()) +
+                // ★ 2026-10-03：设备自荐的层容量（可选，向后兼容）
+                (if (capabilities.containsKey("layer_budget")) setOf("layer_budget") else emptySet()),
                 "payload.capabilities",
         )
         if (capabilities.containsKey("runtime_profile")) {
@@ -450,6 +452,28 @@ object TaskWorkerProtocol {
                     "capabilities.n_pos_per_embd must be 1 or 4",
                     "invalid_capabilities",
                     "payload.capabilities.n_pos_per_embd",
+                )
+            }
+        }
+        // ★ 2026-10-03：设备自荐的层容量 —— 与 `layer_ranges`（当前已就绪区间）分工不同，
+        //   这里校验的是"本地裁层后能承载的层数上限"。
+        if (capabilities.containsKey("layer_budget")) {
+            val budget = capabilities["layer_budget"] as? Map<*, *>
+            val available = (budget?.get("available_bytes") as? Number)?.toLong()
+            val perLayer = (budget?.get("per_layer_bytes") as? Number)?.toLong()
+            val maxLayers = (budget?.get("max_layers") as? Number)?.toInt()
+            val localCut = budget?.get("local_cut")
+            if (
+                available == null || available < 0L ||
+                perLayer == null || perLayer <= 0L ||
+                maxLayers == null || maxLayers <= 0 || maxLayers > 1024 ||
+                (localCut != null && localCut !is Boolean)
+            ) {
+                fail(
+                    "capabilities.layer_budget must carry available_bytes/per_layer_bytes/" +
+                        "max_layers (max_layers <= 1024) and an optional boolean local_cut",
+                    "invalid_capabilities",
+                    "payload.capabilities.layer_budget",
                 )
             }
         }
