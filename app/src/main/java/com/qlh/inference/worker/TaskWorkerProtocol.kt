@@ -416,7 +416,14 @@ object TaskWorkerProtocol {
                 (if (capabilities.containsKey("middle_channel")) setOf("middle_channel") else emptySet()) +
                 (if (capabilities.containsKey("n_pos_per_embd")) setOf("n_pos_per_embd") else emptySet()) +
                 // ★ 2026-10-03：设备自荐的层容量（可选，向后兼容）
-                (if (capabilities.containsKey("layer_budget")) setOf("layer_budget") else emptySet()),
+                (if (capabilities.containsKey("layer_budget")) setOf("layer_budget") else emptySet()) +
+                // ★ 2026-10-05（DIST-3）：工件段类型（可选，向后兼容）——
+                //   `head`/`middle`/`tail`，让调度侧能拒绝「中间段接末段」。
+                //   ⚠️ 精确字段校验是**协议两侧对称**的：主仓
+                //   `task_worker_protocol._validate_capabilities` 与这里必须同时放行，
+                //   只改一边会让对端 hello 自校验失败 —— hello 根本发不出去，
+                //   连接注册成功后 0.7s 静默断开，双方都不留日志（实测踩到）。
+                (if (capabilities.containsKey("segment_mode")) setOf("segment_mode") else emptySet()),
                 "payload.capabilities",
         )
         if (capabilities.containsKey("runtime_profile")) {
