@@ -159,6 +159,12 @@ class TaskWorkerService : Service() {
                 middleChannel = layerForwardInfo["middle_channel"],
                 nPosPerEmbd = layerForwardInfo["n_pos_per_embd"]?.toIntOrNull(),
                 layerBudget = layerBudget,
+                // ★ 2026-10-05（DIST-3 实测缺口）：段类型（`head`/`middle`/`tail`）。
+                //   与 `layerBudget` 用**同一个** `readyArtifact`，保证"广告的段类型"
+                //   与"广告的层容量"出自同一份工件，不会错配。
+                //   不广告它时，主仓只能看 `layer_ranges` 是否覆盖 —— 于是把只有
+                //   中间层的工件分到末段（2026-10-05 三机实测的失败原因）。
+                segmentMode = readyArtifact?.mode,
             )
             QlhLogger.i(
                 "TaskWorkerService",

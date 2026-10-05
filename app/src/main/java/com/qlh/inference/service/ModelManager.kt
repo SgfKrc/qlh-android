@@ -339,6 +339,8 @@ class ModelManager(private val context: Context) {
                     artifactSha256 = descriptor.artifactSha256,
                     sourceModelSha256 = descriptor.sourceModelSha256,
                     architecture = descriptor.architecture,
+                    // ★ 2026-10-05（DIST-3）：段类型透传（`head`/`middle`/`tail`）。
+                    mode = descriptor.mode,
                 )
             }
             Result.success(output.distinctBy { "${it.startLayer}:${it.endLayerExclusive}:${it.document.uri}" })
@@ -1145,6 +1147,13 @@ class ModelManager(private val context: Context) {
         val artifactSha256: String,
         val sourceModelSha256: String,
         val architecture: String,
+        /**
+         * ★ 2026-10-05（DIST-3 实测缺口）：工件段类型（`head`/`middle`/`tail`），
+         * 来自 manifest 的 `mode`。随能力快照广告给主仓，避免「中间段被分到末段」
+         * —— 中间段工件没有 `lm_head`/`final_norm`，接末段必然执行失败。
+         * `null` = 旧 manifest 未声明。
+         */
+        val mode: String? = null,
     )
 
     data class LayerArtifactHandle(

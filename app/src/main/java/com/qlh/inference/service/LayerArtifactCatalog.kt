@@ -13,6 +13,20 @@ data class LayerArtifactDescriptor(
     val artifactSha256: String,
     val sourceModelSha256: String,
     val architecture: String,
+    /**
+     * ★ 2026-10-05（DIST-3 实测缺口）：工件在源模型里的**段类型**，取值同主仓
+     * `scripts/cut_layers.py` 的 `mode`：`"head"` / `"middle"` / `"tail"`（另有
+     * 整模不算段）。
+     *
+     * 为什么必须广告出去：`layer_ranges` 只说「本节点覆盖哪些层」，**不区分它是
+     * 中间段还是末段** —— 而中间段工件没有 `lm_head`/`final_norm`，被分到末段
+     * 必然执行失败。2026-10-05 三机实测正是如此：Y700 加载 `mid8-24`
+     * （`mode=middle`，`[8,24)`）却按区间被分到末段 `[20,24)`，master 只比对区间
+     * 覆盖就放行 ⇒ `remote worker reported a Stage error`。
+     *
+     * `null` = manifest 未声明（旧工件）⇒ 不广告该键，调度侧按旧行为处理。
+     */
+    val mode: String? = null,
 )
 
 /** Parser for the main repository's layer artifact manifests. */
@@ -51,6 +65,9 @@ object LayerArtifactManifestParser {
             artifactSha256 = artifactSha,
             sourceModelSha256 = sourceSha,
             architecture = string(root, "architecture"),
+            // ★ 2026-10-05：段类型（`head`/`middle`/`tail`）。未声明时留 null，
+            //   不广告该键 —— 与主仓 `cut_layers.py` 的 `mode` 字段同名同值域。
+            mode = string(root, "mode").lowercase().takeIf { it.isNotBlank() },
         )
     }
 

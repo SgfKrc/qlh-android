@@ -191,6 +191,12 @@ object AndroidWorkerCapabilities {
         nPosPerEmbd: Int? = null,
         /** 设备自荐的层容量（本地裁层后可承载的层数上限）；null = 缺少依据，不上报。 */
         layerBudget: LayerBudget? = null,
+        // ★ 2026-10-05（DIST-3 实测缺口）：工件段类型（`head`/`middle`/`tail`），
+        //   来自工件 manifest 的 `mode`。`null` = 未声明 ⇒ 不写该键。
+        //   必须广告：`layer_ranges` 只说覆盖哪些层，不区分中间段/末段；而中间段
+        //   工件没有 lm_head/final_norm，被分到末段必然失败（2026-10-05 三机实测：
+        //   Y700 的 `mid8-24` 被分到末段 `[20,24)`）。
+        segmentMode: String? = null,
     ): Map<String, Any?> {
         val normalizedReason = if (resourceAdmitted) "" else resourceReason.ifBlank {
             "resource_gate_not_confirmed"
@@ -229,6 +235,9 @@ object AndroidWorkerCapabilities {
         //   与 `layer_ranges` 区别：后者是手上工件现成能跑的区间，前者是能自裁并
         //   承载的上限 ⇒ 有了它，主仓调度才能分配任意连续区间。
         if (layerBudget != null) capabilities["layer_budget"] = layerBudget.toMap()
+        // ★ 2026-10-05（DIST-3）：段类型。调度侧据此拒绝「中间段接末段」这类分配
+        //   （中间段工件没有 lm_head/final_norm）。
+        if (segmentMode != null) capabilities["segment_mode"] = segmentMode
         return capabilities
     }
 }
