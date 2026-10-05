@@ -315,6 +315,136 @@ class TaskWorkerProtocolTest {
         }
     }
 
+    @Test
+    fun `hello rejects invalid global segment mode`() {
+        expectProtocolError("invalid_capabilities") {
+            TaskWorkerProtocol.validate(
+                TaskWorkerProtocol.buildHello(
+                    nodeId = "android_worker_01",
+                    capabilities = artifactCapabilities() + ("segment_mode" to "whole"),
+                    messageId = "msg_bad_segment_mode_01",
+                    sentAtMs = 1_700_000_000_000,
+                ),
+            )
+        }
+    }
+
+    @Test
+    fun `hello validates per artifact range mode digest and exact fields`() {
+        TaskWorkerProtocol.validate(
+            TaskWorkerProtocol.buildHello(
+                nodeId = "android_worker_01",
+                capabilities = artifactCapabilities(),
+                messageId = "msg_layer_artifacts_ok_01",
+                sentAtMs = 1_700_000_000_000,
+            ),
+        )
+
+        val invalidItems = listOf(
+            validArtifact() + ("segment_mode" to "whole"),
+            validArtifact() + ("layer_range" to listOf(4.5, 16)),
+            validArtifact() + ("artifact_sha256" to "not-a-digest"),
+            validArtifact() + ("unexpected" to true),
+        )
+        invalidItems.forEachIndexed { index, item ->
+            expectProtocolError(if (index == 3) "invalid_fields" else "invalid_capabilities") {
+                TaskWorkerProtocol.validate(
+                    TaskWorkerProtocol.buildHello(
+                        nodeId = "android_worker_01",
+                        capabilities = artifactCapabilities(item),
+                        messageId = "msg_bad_artifact_item_0$index",
+                        sentAtMs = 1_700_000_000_000,
+                    ),
+                )
+            }
+        }
+    }
+
+    @Test
+    fun `hello rejects artifact without matching advertised model identity`() {
+        val capabilities = artifactCapabilities().toMutableMap()
+        capabilities["models"] = emptyList<Map<String, Any?>>()
+        expectProtocolError("invalid_capabilities") {
+            TaskWorkerProtocol.validate(
+                TaskWorkerProtocol.buildHello(
+                    nodeId = "android_worker_01",
+                    capabilities = capabilities,
+                    messageId = "msg_artifact_model_missing_01",
+                    sentAtMs = 1_700_000_000_000,
+                ),
+            )
+        }
+    }
+
+    @Test
+    fun `hello rejects duplicate model ids ranges and artifact ranges`() {
+        val duplicateModels = artifactCapabilities().toMutableMap()
+        duplicateModels["models"] = listOf(model, model)
+        expectProtocolError("invalid_capabilities") {
+            TaskWorkerProtocol.validate(
+                TaskWorkerProtocol.buildHello(
+                    nodeId = "android_worker_01",
+                    capabilities = duplicateModels,
+                    messageId = "msg_duplicate_models_01",
+                    sentAtMs = 1_700_000_000_000,
+                ),
+            )
+        }
+
+        val duplicateRanges = artifactCapabilities().toMutableMap()
+        duplicateRanges["layer_ranges"] = listOf(listOf(4, 16), listOf(4, 16))
+        expectProtocolError("invalid_capabilities") {
+            TaskWorkerProtocol.validate(
+                TaskWorkerProtocol.buildHello(
+                    nodeId = "android_worker_01",
+                    capabilities = duplicateRanges,
+                    messageId = "msg_duplicate_ranges_01",
+                    sentAtMs = 1_700_000_000_000,
+                ),
+            )
+        }
+
+        val duplicateArtifacts = artifactCapabilities().toMutableMap()
+        duplicateArtifacts["layer_artifacts"] = listOf(validArtifact(), validArtifact())
+        expectProtocolError("invalid_capabilities") {
+            TaskWorkerProtocol.validate(
+                TaskWorkerProtocol.buildHello(
+                    nodeId = "android_worker_01",
+                    capabilities = duplicateArtifacts,
+                    messageId = "msg_duplicate_artifacts_01",
+                    sentAtMs = 1_700_000_000_000,
+                ),
+            )
+        }
+    }
+
+    private fun validArtifact(): Map<String, Any?> = mapOf(
+        "layer_range" to listOf(4, 16),
+        "segment_mode" to "middle",
+        "model_id" to "mid4-16.gguf",
+        "artifact_sha256" to "b".repeat(64),
+        "source_model_sha256" to "a".repeat(64),
+    )
+
+    private fun artifactCapabilities(
+        artifact: Map<String, Any?> = validArtifact(),
+    ): Map<String, Any?> = mapOf(
+        "stage_types" to listOf("layer_forward"),
+        "engines" to listOf("llama_cpp"),
+        "models" to listOf(
+            mapOf(
+                "model_id" to "mid4-16.gguf",
+                "engine" to "llama_cpp",
+                "format" to "gguf",
+                "revision" to "local",
+                "sha256" to "b".repeat(64),
+            ),
+        ),
+        "max_concurrency" to 1,
+        "layer_ranges" to listOf(listOf(4, 16)),
+        "layer_artifacts" to listOf(artifact),
+    )
+
     /**
      * 构造一个最小合法 v3 层段 offer。
      *

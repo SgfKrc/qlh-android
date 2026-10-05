@@ -170,6 +170,42 @@ class AndroidWorkerCapabilitiesStageParityTest {
     }
 
     @Test
+    fun `layer offer resolves and loads the identity for its exact artifact`() = runBlocking {
+        val artifactIdentity = mapOf(
+            "model_id" to "mid4-8.gguf",
+            "engine" to "llama_cpp",
+            "format" to "gguf",
+            "revision" to "local",
+            "sha256" to "c".repeat(64),
+        )
+        var loadedSha = ""
+        val executor = AndroidFullWorkerStageExecutor(
+            expectedModelIdentity = { model },
+            ensureModelLoaded = { Result.success(Unit) },
+            generate = { _, _, _, _ -> Result.success("unused") },
+            layerForward = {
+                Result.success(LayerForwardResult(tokenArgmax = 9, hiddenOut = null))
+            },
+            ensureModelLoadedForLayer = { _, _, _, _, sha256 ->
+                loadedSha = sha256
+                Result.success(Unit)
+            },
+            resolveLayerModelIdentity = { range, _ ->
+                artifactIdentity.takeIf { range == listOf(4, 8) }
+            },
+        )
+        val artifactOffer = offer("layer_forward").let { envelope ->
+            envelope.copy(payload = envelope.payload + ("model_identity" to artifactIdentity))
+        }
+
+        val result = executor.execute(artifactOffer)
+
+        assertEquals(9, result.output["token_argmax"])
+        assertEquals("c".repeat(64), loadedSha)
+        assertEquals("mid4-8.gguf", result.metadata["model"])
+    }
+
+    @Test
     fun `intermediate layer result carries raw hidden bytes for the next stage`() = runBlocking {
         val hidden = floatArrayOf(0.25f, -1.5f, 3.0f, 4.5f)
         val executor = wiredExecutor(

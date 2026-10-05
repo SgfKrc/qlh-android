@@ -5,6 +5,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertThrows
 import org.junit.Test
 
 class AndroidWorkerCapabilitiesTest {
@@ -171,6 +172,133 @@ class AndroidWorkerCapabilitiesTest {
                 capabilities = capabilities,
                 messageId = "msg_capabilities_layer_only_01",
                 sentAtMs = 1_700_000_000_000,
+            ),
+        )
+    }
+
+    @Test
+    fun `multiple artifacts retain range mode and identity without unsafe global mode`() {
+        val artifacts = listOf(
+            AndroidWorkerCapabilities.LayerArtifactCapability(
+                startLayer = 0,
+                endLayerExclusive = 8,
+                segmentMode = "head",
+                modelId = "head0-8.gguf",
+                artifactSha256 = "b".repeat(64),
+                sourceModelSha256 = "a".repeat(64),
+            ),
+            AndroidWorkerCapabilities.LayerArtifactCapability(
+                startLayer = 8,
+                endLayerExclusive = 16,
+                segmentMode = "middle",
+                modelId = "mid8-16.gguf",
+                artifactSha256 = "c".repeat(64),
+                sourceModelSha256 = "a".repeat(64),
+            ),
+        )
+        val capabilities = AndroidWorkerCapabilities.build(
+            resourceAdmitted = true,
+            fullInferenceAvailable = false,
+            layerWorker = true,
+            layerArtifacts = artifacts,
+        )
+
+        assertEquals(listOf(listOf(0, 8), listOf(8, 16)), capabilities["layer_ranges"])
+        assertFalse(capabilities.containsKey("segment_mode"))
+        assertEquals(artifacts.map { it.toMap() }, capabilities["layer_artifacts"])
+        val models = capabilities["models"] as List<*>
+        assertEquals(2, models.size)
+        assertEquals("b".repeat(64), (models[0] as Map<*, *>)["sha256"])
+        assertEquals("c".repeat(64), (models[1] as Map<*, *>)["sha256"])
+        TaskWorkerProtocol.validate(
+            TaskWorkerProtocol.buildHello(
+                nodeId = "android_multi_artifact_01",
+                capabilities = capabilities,
+                messageId = "msg_capabilities_artifacts_01",
+                sentAtMs = 1_700_000_000_000,
+            ),
+        )
+    }
+
+    @Test
+    fun `homogeneous artifacts emit legacy global mode`() {
+        val capabilities = AndroidWorkerCapabilities.build(
+            resourceAdmitted = true,
+            layerArtifacts = listOf(
+                AndroidWorkerCapabilities.LayerArtifactCapability(
+                    4, 8, "middle", "mid4-8.gguf", "b".repeat(64),
+                ),
+                AndroidWorkerCapabilities.LayerArtifactCapability(
+                    8, 12, "middle", "mid8-12.gguf", "c".repeat(64),
+                ),
+            ),
+        )
+
+        assertEquals("middle", capabilities["segment_mode"])
+    }
+
+    @Test
+    fun `artifact identity replaces duplicate base model id`() {
+        val capabilities = AndroidWorkerCapabilities.build(
+            modelId = "tail.gguf",
+            modelSha256 = "a".repeat(64),
+            resourceAdmitted = true,
+            layerArtifacts = listOf(
+                AndroidWorkerCapabilities.LayerArtifactCapability(
+                    12, 16, "tail", "tail.gguf", "b".repeat(64),
+                ),
+            ),
+        )
+
+        val models = capabilities["models"] as List<*>
+        assertEquals(1, models.size)
+        assertEquals("b".repeat(64), (models.single() as Map<*, *>)["sha256"])
+        TaskWorkerProtocol.validate(
+            TaskWorkerProtocol.buildHello(
+                nodeId = "android_duplicate_model_01",
+                capabilities = capabilities,
+                messageId = "msg_capabilities_duplicate_01",
+                sentAtMs = 1_700_000_000_000,
+            ),
+        )
+    }
+
+    @Test
+    fun `builder rejects duplicate artifact ranges and model ids`() {
+        val first = AndroidWorkerCapabilities.LayerArtifactCapability(
+            4, 8, "middle", "mid4-8.gguf", "b".repeat(64),
+        )
+        assertThrows(IllegalArgumentException::class.java) {
+            AndroidWorkerCapabilities.build(
+                resourceAdmitted = true,
+                layerArtifacts = listOf(
+                    first,
+                    AndroidWorkerCapabilities.LayerArtifactCapability(
+                        4, 8, "middle", "mid4-8-v2.gguf", "c".repeat(64),
+                    ),
+                ),
+            )
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            AndroidWorkerCapabilities.build(
+                resourceAdmitted = true,
+                layerArtifacts = listOf(
+                    first,
+                    AndroidWorkerCapabilities.LayerArtifactCapability(
+                        8, 12, "middle", "mid4-8.gguf", "c".repeat(64),
+                    ),
+                ),
+            )
+        }
+    }
+
+    @Test
+    fun `artifact filename is normalized to protocol safe model id`() {
+        assertEquals(
+            "mid_segment_.gguf",
+            AndroidWorkerCapabilities.artifactModelId(
+                "models/mid segment?.gguf",
+                "b".repeat(64),
             ),
         )
     }

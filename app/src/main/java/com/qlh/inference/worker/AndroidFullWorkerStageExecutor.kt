@@ -89,6 +89,11 @@ class AndroidFullWorkerStageExecutor(
         wantHidden: Boolean,
         modelSha256: String,
     ) -> Result<Unit> = { _, contextSize, _, _, _ -> ensureModelLoaded(contextSize) },
+    /** Resolve the exact advertised artifact identity for a range and offered model identity. */
+    private val resolveLayerModelIdentity: suspend (
+        List<Int>,
+        Map<*, *>,
+    ) -> Map<String, Any?>? = { _, _ -> null },
 ) : TaskWorkerStageHandler {
     override suspend fun execute(offer: TaskWorkerEnvelope): TaskWorkerStageExecution {
         if (offer.messageType != TaskWorkerProtocol.STAGE_OFFER) {
@@ -109,14 +114,32 @@ class AndroidFullWorkerStageExecutor(
         }
         val advertised = expectedModelIdentity()
         val requested = payload["model_identity"] as? Map<*, *>
-        val advertisedIdentity = advertised ?: emptyMap()
         val requestedIdentity = requested ?: emptyMap<Any?, Any?>()
+        val offeredLayerRange = if (stageType == "layer_forward") {
+            (payload["layer_range"] as? List<*>)
+                ?.mapNotNull { (it as? Number)?.toInt() }
+                ?.takeIf { it.size == 2 }
+        } else {
+            null
+        }
+        val layerIdentity = offeredLayerRange?.let {
+            resolveLayerModelIdentity(it, requestedIdentity)
+        }
+        val exactLayerIdentityMatches = layerIdentity != null && requested != null &&
+            sameIdentity(layerIdentity, requestedIdentity)
+        val advertisedIdentity = when {
+            exactLayerIdentityMatches -> layerIdentity!!
+            advertised != null -> advertised
+            else -> emptyMap()
+        }
         val identityMatches = when {
-            stageType == "layer_forward" && allowLayerIdentityAlias() ->
-                advertised != null && requested != null &&
-                    sameLayerIdentity(advertisedIdentity, requestedIdentity)
+            stageType == "layer_forward" -> exactLayerIdentityMatches ||
+                (advertised != null && requested != null &&
+                    sameIdentity(advertised, requestedIdentity)) ||
+                (allowLayerIdentityAlias() && advertised != null && requested != null &&
+                    sameLayerIdentity(advertised, requestedIdentity))
             else -> advertised != null && requested != null &&
-                sameIdentity(advertisedIdentity, requestedIdentity)
+                sameIdentity(advertised, requestedIdentity)
         }
         if (!identityMatches) {
             throw AndroidFullWorkerStageException(

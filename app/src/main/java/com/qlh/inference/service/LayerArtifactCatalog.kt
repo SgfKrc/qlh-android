@@ -24,14 +24,15 @@ data class LayerArtifactDescriptor(
      * （`mode=middle`，`[8,24)`）却按区间被分到末段 `[20,24)`，master 只比对区间
      * 覆盖就放行 ⇒ `remote worker reported a Stage error`。
      *
-     * `null` = manifest 未声明（旧工件）⇒ 不广告该键，调度侧按旧行为处理。
+     * Missing or unknown modes are rejected so an ambiguous artifact is never advertised.
      */
-    val mode: String? = null,
+    val mode: String,
 )
 
 /** Parser for the main repository's layer artifact manifests. */
 object LayerArtifactManifestParser {
     private val sha256Pattern = Regex("[0-9a-fA-F]{64}")
+    private val segmentModes = setOf("head", "middle", "tail")
 
     fun parse(raw: String, manifestName: String): Result<LayerArtifactDescriptor> = runCatching {
         val root = JsonParser.parseString(raw).asJsonObject
@@ -56,6 +57,10 @@ object LayerArtifactManifestParser {
         require(range.first >= 0 && range.second > range.first) {
             "manifest layer range must be non-empty"
         }
+        val mode = string(root, "mode").lowercase()
+        require(mode in segmentModes) {
+            "manifest mode must be one of ${segmentModes.sorted().joinToString(", ")}"
+        }
         LayerArtifactDescriptor(
             // Manifests are often generated on Windows and contain backslash
             // paths. Android's File.name does not treat '\\' as a separator.
@@ -65,9 +70,7 @@ object LayerArtifactManifestParser {
             artifactSha256 = artifactSha,
             sourceModelSha256 = sourceSha,
             architecture = string(root, "architecture"),
-            // ★ 2026-10-05：段类型（`head`/`middle`/`tail`）。未声明时留 null，
-            //   不广告该键 —— 与主仓 `cut_layers.py` 的 `mode` 字段同名同值域。
-            mode = string(root, "mode").lowercase().takeIf { it.isNotBlank() },
+            mode = mode,
         )
     }
 

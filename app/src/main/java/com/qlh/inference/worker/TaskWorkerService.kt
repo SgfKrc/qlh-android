@@ -24,6 +24,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import java.util.concurrent.atomic.AtomicReference
 
 /** Foreground lifecycle shell for the Android Full Worker client. */
 class TaskWorkerService : Service() {
@@ -106,6 +107,11 @@ class TaskWorkerService : Service() {
         // the local inference service has loaded anything (or even exists yet).
         val modelManager = QlhApplication.instance.inferenceService?.modelManager
             ?: ModelManager(this)
+        // Capability construction is the integrity boundary: it hashes each
+        // artifact once. Decode offers only consult this immutable verified
+        // snapshot; re-hashing multi-GB GGUF files for every token would make
+        // the stage path unusable.
+        val verifiedLayerArtifacts = AtomicReference<List<ModelManager.LayerArtifact>>(emptyList())
         if (QlhApplication.instance.inferenceService == null && !BuildConfig.IS_LITE) {
             runCatching {
                 ContextCompat.startForegroundService(this, Intent(this, InferenceService::class.java))
@@ -123,8 +129,22 @@ class TaskWorkerService : Service() {
                 expectedModelSha256 = modelSha256,
                 verifyArtifactDigest = true,
             ).getOrNull().orEmpty()
+            verifiedLayerArtifacts.set(layerArtifacts.toList())
             val layerRanges = layerArtifacts
                 .map { listOf(it.startLayer, it.endLayerExclusive) }
+            val advertisedLayerArtifacts = layerArtifacts.map {
+                AndroidWorkerCapabilities.LayerArtifactCapability(
+                    startLayer = it.startLayer,
+                    endLayerExclusive = it.endLayerExclusive,
+                    segmentMode = it.mode,
+                    modelId = AndroidWorkerCapabilities.artifactModelId(
+                        it.document.name,
+                        it.artifactSha256,
+                    ),
+                    artifactSha256 = it.artifactSha256,
+                    sourceModelSha256 = it.sourceModelSha256.ifBlank { null },
+                )
+            }
             val layerForwardInfo = QlhApplication.instance.inferenceService
                 ?.engine
                 ?.layerForwardInfo()
@@ -136,15 +156,23 @@ class TaskWorkerService : Service() {
             //   此前用"目录里最大工件 ÷ 当前工件层数"，两者会错配（拿整模的字节除以
             //   中段的层数）⇒ 每层字节偏大、可承载层数被低估。
             val readyArtifact = layerArtifacts.firstOrNull { it.document.sizeBytes > 0 }
-            val layerBudget = AndroidWorkerCapabilities.computeLayerBudget(
-                availableBytes = (deviceInfo["memory"] as? Map<*, *>)
-                    ?.get("available_bytes")
-                    ?.let { (it as? Number)?.toLong() }
-                    ?: 0L,
-                modelFileBytes = readyArtifact?.document?.sizeBytes ?: 0L,
-                coveredLayers = readyArtifact
-                    ?.let { it.endLayerExclusive - it.startLayer } ?: 0,
-            )
+            // A single node-level budget cannot truthfully describe several
+            // pre-cut artifacts with different bytes/layer.  Until local
+            // cutting exists, exact per-artifact ranges are the contract; only
+            // retain the legacy budget hint when there is one artifact.
+            val layerBudget = if (layerArtifacts.size == 1) {
+                AndroidWorkerCapabilities.computeLayerBudget(
+                    availableBytes = (deviceInfo["memory"] as? Map<*, *>)
+                        ?.get("available_bytes")
+                        ?.let { (it as? Number)?.toLong() }
+                        ?: 0L,
+                    modelFileBytes = readyArtifact?.document?.sizeBytes ?: 0L,
+                    coveredLayers = readyArtifact
+                        ?.let { it.endLayerExclusive - it.startLayer } ?: 0,
+                )
+            } else {
+                null
+            }
             val capabilities = AndroidWorkerCapabilities.build(
                 modelId = modelId,
                 modelFormat = modelFormat,
@@ -159,12 +187,7 @@ class TaskWorkerService : Service() {
                 middleChannel = layerForwardInfo["middle_channel"],
                 nPosPerEmbd = layerForwardInfo["n_pos_per_embd"]?.toIntOrNull(),
                 layerBudget = layerBudget,
-                // ★ 2026-10-05（DIST-3 实测缺口）：段类型（`head`/`middle`/`tail`）。
-                //   与 `layerBudget` 用**同一个** `readyArtifact`，保证"广告的段类型"
-                //   与"广告的层容量"出自同一份工件，不会错配。
-                //   不广告它时，主仓只能看 `layer_ranges` 是否覆盖 —— 于是把只有
-                //   中间层的工件分到末段（2026-10-05 三机实测的失败原因）。
-                segmentMode = readyArtifact?.mode,
+                layerArtifacts = advertisedLayerArtifacts,
             )
             QlhLogger.i(
                 "TaskWorkerService",
@@ -239,6 +262,29 @@ class TaskWorkerService : Service() {
                             expectedEmbeddingWidth = embeddingWidth,
                         )
                         ?: Result.failure(IllegalStateException("inference_service_unavailable"))
+                },
+                resolveLayerModelIdentity = { range, requested ->
+                    verifiedLayerArtifacts.get().firstOrNull {
+                        it.startLayer == range.getOrNull(0) &&
+                            it.endLayerExclusive == range.getOrNull(1) &&
+                            AndroidWorkerCapabilities.artifactModelId(
+                                it.document.name,
+                                it.artifactSha256,
+                            ) == requested["model_id"] &&
+                            it.artifactSha256 == requested["sha256"]
+                    }?.let {
+                        AndroidWorkerCapabilities.LayerArtifactCapability(
+                            startLayer = it.startLayer,
+                            endLayerExclusive = it.endLayerExclusive,
+                            segmentMode = it.mode,
+                            modelId = AndroidWorkerCapabilities.artifactModelId(
+                                it.document.name,
+                                it.artifactSha256,
+                            ),
+                            artifactSha256 = it.artifactSha256,
+                            sourceModelSha256 = it.sourceModelSha256.ifBlank { null },
+                        ).modelIdentity()
+                    }
                 },
             ),
         ).also { it.start() }

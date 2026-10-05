@@ -11,6 +11,63 @@ object AndroidWorkerCapabilities {
         "torch_cuda",
         UNSPECIFIED_RUNTIME_PROFILE,
     )
+    private val SEGMENT_MODES = setOf("head", "middle", "tail")
+    private val SHA256 = Regex("[0-9a-fA-F]{64}")
+    private val SAFE_ID = Regex("^[A-Za-z0-9_.:-]{1,128}$")
+
+    /** One runnable artifact, bound to its own range, mode, and executable identity. */
+    data class LayerArtifactCapability(
+        val startLayer: Int,
+        val endLayerExclusive: Int,
+        val segmentMode: String,
+        val modelId: String,
+        val artifactSha256: String,
+        val sourceModelSha256: String? = null,
+    ) {
+        init {
+            require(startLayer >= 0 && endLayerExclusive > startLayer) {
+                "layer artifact range must be non-empty"
+            }
+            require(segmentMode in SEGMENT_MODES) {
+                "layer artifact segment mode must be head, middle, or tail"
+            }
+            require(SAFE_ID.matches(modelId)) { "layer artifact model id is invalid" }
+            require(SHA256.matches(artifactSha256)) {
+                "layer artifact digest must be a 64-char hex digest"
+            }
+            require(sourceModelSha256 == null || SHA256.matches(sourceModelSha256)) {
+                "layer artifact source model digest must be a 64-char hex digest"
+            }
+        }
+
+        fun toMap(): Map<String, Any> = linkedMapOf<String, Any>(
+            "layer_range" to listOf(startLayer, endLayerExclusive),
+            "segment_mode" to segmentMode,
+            "model_id" to modelId,
+            "artifact_sha256" to artifactSha256.lowercase(),
+        ).also { output ->
+            sourceModelSha256?.let { output["source_model_sha256"] = it.lowercase() }
+        }
+
+        fun modelIdentity(): Map<String, Any?> = mapOf(
+            "model_id" to modelId,
+            "engine" to DEFAULT_ENGINE,
+            "format" to "gguf",
+            "revision" to "local",
+            "sha256" to artifactSha256.lowercase(),
+        )
+    }
+
+    fun isValidSegmentMode(value: String?): Boolean = value in SEGMENT_MODES
+
+    /** Normalize a manifest filename into the protocol's safe model-id alphabet. */
+    fun artifactModelId(artifactName: String, artifactSha256: String): String {
+        val normalized = artifactName
+            .substringAfterLast('/').substringAfterLast('\\')
+            .replace(Regex("[^A-Za-z0-9_.:-]"), "_")
+            .take(128)
+        return normalized.ifBlank { "layer-${artifactSha256.lowercase().take(16)}" }
+    }
 
     fun normalizeRuntimeProfile(value: String?): String {
         val normalized = value?.trim()?.lowercase().orEmpty()
@@ -191,22 +248,36 @@ object AndroidWorkerCapabilities {
         nPosPerEmbd: Int? = null,
         /** 设备自荐的层容量（本地裁层后可承载的层数上限）；null = 缺少依据，不上报。 */
         layerBudget: LayerBudget? = null,
-        // ★ 2026-10-05（DIST-3 实测缺口）：工件段类型（`head`/`middle`/`tail`），
-        //   来自工件 manifest 的 `mode`。`null` = 未声明 ⇒ 不写该键。
-        //   必须广告：`layer_ranges` 只说覆盖哪些层，不区分中间段/末段；而中间段
-        //   工件没有 lm_head/final_norm，被分到末段必然失败（2026-10-05 三机实测：
-        //   Y700 的 `mid8-24` 被分到末段 `[20,24)`）。
-        segmentMode: String? = null,
+        /** Per-artifact records; unlike the legacy global mode these cannot conflate ranges. */
+        layerArtifacts: List<LayerArtifactCapability> = emptyList(),
     ): Map<String, Any?> {
+        require(
+            layerArtifacts.map { it.startLayer to it.endLayerExclusive }.distinct().size ==
+                layerArtifacts.size
+        ) { "layer artifact ranges must be unique" }
+        require(layerArtifacts.map { it.modelId }.distinct().size == layerArtifacts.size) {
+            "layer artifact model ids must be unique"
+        }
         val normalizedReason = if (resourceAdmitted) "" else resourceReason.ifBlank {
             "resource_gate_not_confirmed"
         }
         val model = modelIdentity(
             modelId, modelFormat, modelRevision, modelSha256, resourceAdmitted,
         )
-        val normalizedRanges = layerRanges
+        val advertisedRanges = if (layerArtifacts.isNotEmpty()) {
+            layerArtifacts.map { listOf(it.startLayer, it.endLayerExclusive) }
+        } else {
+            layerRanges
+        }
+        val normalizedRanges = advertisedRanges
             .filter { it.size == 2 && it[0] >= 0 && it[1] > it[0] }
             .distinct()
+        val artifactModels = layerArtifacts.map { it.modelIdentity() }
+        val advertisedModels = buildList {
+            val artifactModelIds = artifactModels.mapNotNull { it["model_id"] }.toSet()
+            if (model?.get("model_id") !in artifactModelIds) model?.let(::add)
+            addAll(artifactModels)
+        }.distinctBy { it["model_id"] }
         val capabilities = linkedMapOf<String, Any?>(
             "stage_types" to if (normalizedRanges.isEmpty()) {
                 listOf("full_inference")
@@ -216,7 +287,7 @@ object AndroidWorkerCapabilities {
                 SUPPORTED_STAGE_TYPES
             },
             "engines" to SUPPORTED_ENGINES,
-            "models" to (model?.let { listOf(it) } ?: emptyList<Map<String, Any?>>()),
+            "models" to advertisedModels,
             "max_concurrency" to 1,
             "runtime_profile" to normalizeRuntimeProfile(runtimeProfile),
             "resource_gate" to mapOf(
@@ -235,9 +306,13 @@ object AndroidWorkerCapabilities {
         //   与 `layer_ranges` 区别：后者是手上工件现成能跑的区间，前者是能自裁并
         //   承载的上限 ⇒ 有了它，主仓调度才能分配任意连续区间。
         if (layerBudget != null) capabilities["layer_budget"] = layerBudget.toMap()
-        // ★ 2026-10-05（DIST-3）：段类型。调度侧据此拒绝「中间段接末段」这类分配
-        //   （中间段工件没有 lm_head/final_norm）。
-        if (segmentMode != null) capabilities["segment_mode"] = segmentMode
+        if (layerArtifacts.isNotEmpty()) {
+            capabilities["layer_artifacts"] = layerArtifacts.map { it.toMap() }
+            // Compatibility for older coordinators is safe only when every artifact agrees.
+            layerArtifacts.map { it.segmentMode }.distinct().singleOrNull()?.let {
+                capabilities["segment_mode"] = it
+            }
+        }
         return capabilities
     }
 }

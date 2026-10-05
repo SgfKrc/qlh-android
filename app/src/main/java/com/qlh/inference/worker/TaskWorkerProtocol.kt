@@ -423,7 +423,8 @@ object TaskWorkerProtocol {
                 //   `task_worker_protocol._validate_capabilities` 与这里必须同时放行，
                 //   只改一边会让对端 hello 自校验失败 —— hello 根本发不出去，
                 //   连接注册成功后 0.7s 静默断开，双方都不留日志（实测踩到）。
-                (if (capabilities.containsKey("segment_mode")) setOf("segment_mode") else emptySet()),
+                (if (capabilities.containsKey("segment_mode")) setOf("segment_mode") else emptySet()) +
+                (if (capabilities.containsKey("layer_artifacts")) setOf("layer_artifacts") else emptySet()),
                 "payload.capabilities",
         )
         if (capabilities.containsKey("runtime_profile")) {
@@ -505,21 +506,145 @@ object TaskWorkerProtocol {
             )
         }
         val models = list(capabilities, "models")
-        models.forEachIndexed { index, item -> validateModelIdentity(item as? Map<*, *>, "payload.capabilities.models[$index]") }
+        val modelIds = mutableSetOf<String>()
+        models.forEachIndexed { index, item ->
+            validateModelIdentity(item as? Map<*, *>, "payload.capabilities.models[$index]")
+            val modelId = (item as Map<*, *>)["model_id"] as String
+            if (!modelIds.add(modelId)) {
+                fail(
+                    "capabilities.models model_id values must be unique",
+                    "invalid_capabilities",
+                    "payload.capabilities.models[$index].model_id",
+                )
+            }
+        }
         val maxConcurrency = integer(capabilities, "max_concurrency")
         if (maxConcurrency != 1) fail("Android workers support one concurrent task", "invalid_capabilities", "payload.capabilities.max_concurrency")
         if (capabilities.containsKey("resource_gate")) {
             validateResourceGate(capabilities["resource_gate"] as? Map<*, *>, "payload.capabilities.resource_gate")
         }
+        val legacyRanges = mutableSetOf<Pair<Int, Int>>()
         if (capabilities.containsKey("layer_ranges")) {
             val ranges = list(capabilities, "layer_ranges")
             ranges.forEachIndexed { index, value ->
-                val range = value as? List<*>
-                val start = (range?.getOrNull(0) as? Number)?.toInt()
-                val end = (range?.getOrNull(1) as? Number)?.toInt()
-                if (range?.size != 2 || start == null || end == null || start < 0 || end <= start) {
-                    fail("layer_ranges must contain [start, end) integer ranges", "invalid_capabilities", "payload.capabilities.layer_ranges[$index]")
+                val range = capabilityLayerRange(
+                    value,
+                    "payload.capabilities.layer_ranges[$index]",
+                )
+                if (!legacyRanges.add(range)) {
+                    fail(
+                        "capabilities.layer_ranges must not contain duplicates",
+                        "invalid_capabilities",
+                        "payload.capabilities.layer_ranges[$index]",
+                    )
                 }
+            }
+        }
+        val globalSegmentMode = if (capabilities.containsKey("segment_mode")) {
+            val mode = capabilities["segment_mode"] as? String
+            if (!AndroidWorkerCapabilities.isValidSegmentMode(mode)) {
+                fail(
+                    "capabilities.segment_mode must be head, middle, or tail",
+                    "invalid_capabilities",
+                    "payload.capabilities.segment_mode",
+                )
+            }
+            mode
+        } else {
+            null
+        }
+        if (capabilities.containsKey("layer_artifacts")) {
+            val artifactModes = mutableSetOf<String>()
+            val artifactRanges = mutableSetOf<Pair<Int, Int>>()
+            list(capabilities, "layer_artifacts").forEachIndexed { index, item ->
+                val field = "payload.capabilities.layer_artifacts[$index]"
+                val artifact = item as? Map<*, *>
+                    ?: fail("layer artifact must be an object", "invalid_capabilities", field)
+                val expectedFields = setOf(
+                    "layer_range", "segment_mode", "model_id", "artifact_sha256",
+                ) + if (artifact.containsKey("source_model_sha256")) {
+                    setOf("source_model_sha256")
+                } else {
+                    emptySet()
+                }
+                requireExact(artifact.keys.map { it.toString() }.toSet(), expectedFields, field)
+                val range = capabilityLayerRange(artifact["layer_range"], "$field.layer_range")
+                if (!artifactRanges.add(range)) {
+                    fail(
+                        "capabilities.layer_artifacts must not contain duplicate ranges",
+                        "invalid_capabilities",
+                        "$field.layer_range",
+                    )
+                }
+                if (legacyRanges.isNotEmpty() && range !in legacyRanges) {
+                    fail(
+                        "layer artifact range must also be present in layer_ranges",
+                        "invalid_capabilities",
+                        "$field.layer_range",
+                    )
+                }
+                val mode = artifact["segment_mode"] as? String
+                if (!AndroidWorkerCapabilities.isValidSegmentMode(mode)) {
+                    fail(
+                        "layer artifact segment_mode must be head, middle, or tail",
+                        "invalid_capabilities",
+                        "$field.segment_mode",
+                    )
+                }
+                artifactModes += mode!!
+                val artifactModelId = artifact["model_id"] as? String
+                if (artifactModelId == null || !safeId.matches(artifactModelId)) {
+                    fail("layer artifact model_id is invalid", "invalid_capabilities", "$field.model_id")
+                }
+                val artifactSha = artifact["artifact_sha256"] as? String
+                if (artifactSha == null || !sha256.matches(artifactSha)) {
+                    fail(
+                        "layer artifact artifact_sha256 is invalid",
+                        "invalid_capabilities",
+                        "$field.artifact_sha256",
+                    )
+                }
+                if (artifact.containsKey("source_model_sha256")) {
+                    val sourceSha = artifact["source_model_sha256"] as? String
+                    if (sourceSha == null || !sha256.matches(sourceSha)) {
+                        fail(
+                            "layer artifact source_model_sha256 is invalid",
+                            "invalid_capabilities",
+                            "$field.source_model_sha256",
+                        )
+                    }
+                }
+                val hasModelIdentity = models.any { modelItem ->
+                    val model = modelItem as? Map<*, *> ?: return@any false
+                    model["model_id"] == artifactModelId &&
+                        model["engine"] == AndroidWorkerCapabilities.DEFAULT_ENGINE &&
+                        model["format"] == "gguf" &&
+                        model["sha256"] == artifactSha
+                }
+                if (!hasModelIdentity) {
+                    fail(
+                        "layer artifact must have a matching capabilities.models identity",
+                        "invalid_capabilities",
+                        field,
+                    )
+                }
+            }
+            if (legacyRanges.isEmpty() || artifactRanges != legacyRanges) {
+                fail(
+                    "layer_artifacts and layer_ranges must advertise the same ranges",
+                    "invalid_capabilities",
+                    "payload.capabilities.layer_artifacts",
+                )
+            }
+            if (
+                globalSegmentMode != null &&
+                (artifactModes.size != 1 || artifactModes.single() != globalSegmentMode)
+            ) {
+                fail(
+                    "global segment_mode must match every layer artifact",
+                    "invalid_capabilities",
+                    "payload.capabilities.segment_mode",
+                )
             }
         }
         if (capabilities.containsKey("layer_worker") && capabilities["layer_worker"] !is Boolean) {
@@ -791,6 +916,29 @@ object TaskWorkerProtocol {
         STAGE_CANCEL -> identityFields + setOf("reason_code")
         STAGE_CANCELLED -> identityFields + setOf("provider_id", "reason_code")
         else -> emptySet()
+    }
+
+    private fun capabilityLayerRange(value: Any?, field: String): Pair<Int, Int> {
+        val range = value as? List<*>
+            ?: fail("layer range must be an array", "invalid_capabilities", field)
+        val start = exactNonNegativeInt(range.getOrNull(0))
+        val end = exactNonNegativeInt(range.getOrNull(1))
+        if (range.size != 2 || start == null || end == null || end <= start) {
+            fail(
+                "layer range must be [start, end) with exact integer bounds",
+                "invalid_capabilities",
+                field,
+            )
+        }
+        return start to end
+    }
+
+    private fun exactNonNegativeInt(value: Any?): Int? {
+        val number = (value as? Number)?.toDouble() ?: return null
+        if (!number.isFinite() || number % 1.0 != 0.0 || number < 0 || number > Int.MAX_VALUE) {
+            return null
+        }
+        return number.toInt()
     }
 
     private fun objectValue(container: Map<String, Any?>, key: String): Map<String, Any?> {

@@ -76,6 +76,8 @@ class InferenceService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
     private val binder = LocalBinder()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    @Volatile
+    private var loadedLayerArtifactSha256: String = ""
 
     // ---- Binder ----
 
@@ -250,12 +252,15 @@ class InferenceService : Service() {
             return Result.failure(IllegalArgumentException("invalid layer range"))
         }
         val gpuLayers = preferredGpuLayers(eng)
+        val expectedDigest = expectedModelSha256.trim().lowercase()
         if (eng.isLoaded && eng.loadedLayerRange == layerRange &&
-            eng.loadedExtractHidden == extractHidden && eng.loadedGpuLayers == gpuLayers
+            eng.loadedExtractHidden == extractHidden && eng.loadedGpuLayers == gpuLayers &&
+            expectedDigest.isNotBlank() && loadedLayerArtifactSha256 == expectedDigest
         ) {
             return validateLayerModel(eng, layerRange, expectedEmbeddingWidth)
         }
         if (eng.isLoaded) eng.unloadModel()
+        loadedLayerArtifactSha256 = ""
 
         suspend fun load(preferFd: Boolean): Result<Unit> {
             val artifact = modelManager.openLayerModelForLlama(
@@ -271,13 +276,18 @@ class InferenceService : Service() {
                 layerRange = layerRange,
             )
             if (loaded.isFailure) return loaded
-            return validateLayerModel(eng, layerRange, expectedEmbeddingWidth)
+            val validation = validateLayerModel(eng, layerRange, expectedEmbeddingWidth)
+            if (validation.isSuccess) {
+                loadedLayerArtifactSha256 = artifact.artifactSha256.lowercase()
+            }
+            return validation
         }
 
         val first = load(preferFd = true)
         if (first.isSuccess) return first
         Log.w(TAG, "layer artifact fd load failed; retrying cached copy")
         if (eng.isLoaded) eng.unloadModel()
+        loadedLayerArtifactSha256 = ""
         return load(preferFd = false)
     }
 
@@ -310,6 +320,7 @@ class InferenceService : Service() {
 
     suspend fun unloadModel(): Result<Unit> {
         val eng = engine ?: return Result.failure(IllegalStateException("Service 未初始化"))
+        loadedLayerArtifactSha256 = ""
         return eng.unloadModel()
     }
 

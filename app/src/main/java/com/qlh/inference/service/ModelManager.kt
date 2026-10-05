@@ -321,7 +321,11 @@ class ModelManager(private val context: Context) {
                 val raw = readDocument(manifest.uri) ?: continue
                 val descriptor = LayerArtifactManifestParser
                     .parse(raw, manifest.name).getOrNull() ?: continue
-                if (expected.isNotBlank() && descriptor.sourceModelSha256 != expected) continue
+                if (
+                    expected.isNotBlank() &&
+                    descriptor.sourceModelSha256 != expected &&
+                    descriptor.artifactSha256 != expected
+                ) continue
                 val document = modelDocuments.firstOrNull {
                     it.name.equals(descriptor.artifactName, ignoreCase = true)
                 } ?: continue
@@ -1151,9 +1155,9 @@ class ModelManager(private val context: Context) {
          * ★ 2026-10-05（DIST-3 实测缺口）：工件段类型（`head`/`middle`/`tail`），
          * 来自 manifest 的 `mode`。随能力快照广告给主仓，避免「中间段被分到末段」
          * —— 中间段工件没有 `lm_head`/`final_norm`，接末段必然执行失败。
-         * `null` = 旧 manifest 未声明。
+         * Missing or invalid modes make the manifest unusable.
          */
-        val mode: String? = null,
+        val mode: String,
     )
 
     data class LayerArtifactHandle(
