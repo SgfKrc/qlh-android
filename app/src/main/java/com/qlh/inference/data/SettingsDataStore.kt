@@ -52,6 +52,9 @@ class SettingsDataStore(private val context: Context) {
         // ---- task-worker 启动配置（系统重建恢复用）★ 2026-10-07（DIST-NEXT-5） ----
         val KEY_TASK_WORKER_STARTUP = stringPreferencesKey("task_worker_startup")
 
+        /** ★ 2026-10-07（DIST-NEXT-5b）：电池优化豁免引导是否已问过（一次性，不反复打扰）。 */
+        val KEY_BATTERY_EXEMPTION_ASKED = booleanPreferencesKey("battery_exemption_asked")
+
         // ---- 默认值 ----
         const val DEFAULT_HOST = "100.90.76.108"
         const val DEFAULT_PORT = 8000
@@ -201,6 +204,20 @@ class SettingsDataStore(private val context: Context) {
 
     suspend fun clearTaskWorkerStartupConfig() {
         context.dataStore.edit { it.remove(KEY_TASK_WORKER_STARTUP) }
+    }
+
+    /**
+     * ★ 2026-10-07（DIST-NEXT-5b）：本次安装内是否已经问过「忽略电池优化」。
+     */
+    suspend fun hasAskedBatteryExemption(): Boolean =
+        context.dataStore.data.first()[KEY_BATTERY_EXEMPTION_ASKED] ?: false
+
+    /**
+     * ★ 2026-10-07（DIST-NEXT-5b）：标记已问过 —— 系统对话框只在首次出现一次，
+     * 用户拒绝后不再重复打扰（撤销豁免要用户自己去系统设置）。
+     */
+    suspend fun markBatteryExemptionAsked() {
+        context.dataStore.edit { it[KEY_BATTERY_EXEMPTION_ASKED] = true }
     }
 
     suspend fun saveBootstrapConfig(

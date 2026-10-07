@@ -30,6 +30,8 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.launch
 import com.qlh.inference.logging.QlhLogger
 import com.qlh.inference.service.InferenceService
 import com.qlh.inference.ui.ChatScreen
@@ -83,6 +85,24 @@ class MainActivity : ComponentActivity() {
                         }
                     }
                 )
+            }
+        }
+
+        // ★ 2026-10-07（DIST-NEXT-5b）：worker 依赖前台服务长期存活，厂商省电策略是已知杀手。
+        //   首次启动且尚未豁免时用系统对话框申请一次（用户可拒绝；标记落库后不再重复打扰）。
+        lifecycleScope.launch {
+            val request = runCatching { viewModel.buildBatteryExemptionRequest() }.getOrNull()
+            if (request != null) {
+                runCatching { startActivity(request) }
+                    // ★ 只有真的拉起系统对话框才算「问过」；失败时不落标记，下次仍会引导。
+                    .onSuccess { viewModel.markBatteryExemptionAsked() }
+                    .onFailure { error ->
+                        QlhLogger.w(
+                            "MainActivity",
+                            "battery exemption prompt unavailable: " +
+                                (error.message ?: error.javaClass.simpleName),
+                        )
+                    }
             }
         }
     }

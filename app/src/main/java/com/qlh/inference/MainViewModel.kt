@@ -3,9 +3,11 @@ package com.qlh.inference
 import com.google.gson.Gson
 import android.app.Application
 import android.content.Context
+import android.content.Intent
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.Uri
+import android.os.PowerManager
 import java.io.File
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -27,6 +29,7 @@ import com.qlh.inference.service.InferenceService
 import com.qlh.inference.service.AndroidPresenceService
 import com.qlh.inference.service.ModelManager
 import com.qlh.inference.status.AndroidRuntimeStatus
+import com.qlh.inference.system.WorkerBatteryPolicy
 import com.qlh.inference.system.AndroidDeviceInfoProvider
 import com.qlh.inference.security.AuthTokenStore
 import com.qlh.inference.security.StoredAuthSession
@@ -1160,6 +1163,36 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /** Start the authenticated TCP worker only for distributed execution. */
+    /**
+     * ★ 2026-10-07（DIST-NEXT-5b）：需要时返回「申请忽略电池优化」的系统 Intent，否则返回 null。
+     *
+     * 只问一次（标记持久化到设置），且**不**静默改设置：用户拒绝后 worker 照常跑，只是可能被
+     * 厂商省电策略回收。判定本身在 `WorkerBatteryPolicy.shouldRequestExemption()`（已单测）；
+     * 这里只负责读系统状态、组装 Intent —— 拉起对话框由 Activity 负责，**标记在拉起成功后**
+     * 由 `markBatteryExemptionAsked()` 落库（拉起失败不算"问过"，下次仍会引导）。
+     */
+    suspend fun buildBatteryExemptionRequest(): Intent? {
+        val context = getApplication<Application>()
+        val alreadyAsked = runCatching { settings.hasAskedBatteryExemption() }
+            .getOrDefault(false)
+        val ignoring = runCatching {
+            (context.getSystemService(Context.POWER_SERVICE) as? PowerManager)
+                ?.isIgnoringBatteryOptimizations(context.packageName) == true
+        }.getOrDefault(false)
+        if (!WorkerBatteryPolicy.shouldRequestExemption(ignoring, alreadyAsked)) {
+            return null
+        }
+        return Intent(
+            WorkerBatteryPolicy.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+            Uri.parse("package:${context.packageName}"),
+        )
+    }
+
+    /** ★ 2026-10-07（DIST-NEXT-5b）：引导对话框成功拉起后落库，避免重复打扰。 */
+    suspend fun markBatteryExemptionAsked() {
+        runCatching { settings.markBatteryExemptionAsked() }
+    }
+
     private suspend fun ensureAndroidTaskWorker() {
         if (BuildConfig.IS_LITE || _uiState.value.inferenceMode != SettingsDataStore.MODE_DISTRIBUTED) {
             getApplication<Application>().stopService(TaskWorkerService.stopIntent(getApplication()))
