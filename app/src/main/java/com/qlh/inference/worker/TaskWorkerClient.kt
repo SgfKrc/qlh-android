@@ -663,7 +663,7 @@ class TaskWorkerClient(
                 heartbeatJob?.cancel()
                 heartbeatJob = scope.launch {
                     while (isActive && machine.snapshot().connection == TaskWorkerConnectionState.READY) {
-                        delay(15_000L)
+                        delay(HEARTBEAT_INTERVAL_MS)
                         opened.sendHeartbeat(nodeId, clockMs())
                     }
                 }
@@ -902,4 +902,15 @@ class TaskWorkerClient(
     }
 
     private fun newMessageId(kind: String): String = "msg_worker_${kind}_${UUID.randomUUID().toString().replace("-", "").take(24)}"
+
+    companion object {
+        /**
+         * ★ 2026-10-07（DIST-NEXT-4）：task-worker 控制面心跳间隔。
+         *
+         * 与主仓 `scheduler_types.ANDROID_TASK_WORKER_HEARTBEAT_INTERVAL_SECONDS`（15s）
+         * **必须同值** —— 主仓据它推导容忍上限（`WORKER_HEARTBEAT_MAX_AGE`）与控制面
+         * health 超时。此前这个数字只在这里硬编码，主仓侧没有任何记录。
+         */
+        const val HEARTBEAT_INTERVAL_MS: Long = 15_000L
+    }
 }

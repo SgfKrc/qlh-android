@@ -140,6 +140,14 @@ class TaskWorkerClientStateTest {
         assertEquals(TaskWorkerAttemptState.RUNNING, machine.snapshot().activeAttempt.state)
     }
 
+    @Test
+    fun `DIST-NEXT-4 heartbeat interval matches the master threshold source`() {
+        // 主仓 `scheduler_types.ANDROID_TASK_WORKER_HEARTBEAT_INTERVAL_SECONDS = 15.0`；
+        // 主仓据它推导容忍上限（WORKER_HEARTBEAT_MAX_AGE = 120s）与控制面 health 超时
+        // （30s）。两侧不同值会让设备心跳被判过期（历史实测：45s 心跳 vs 10s 上限）。
+        assertEquals(15_000L, TaskWorkerClient.HEARTBEAT_INTERVAL_MS)
+    }
+
     private fun readyMachine(): TaskWorkerStateMachine = TaskWorkerStateMachine().also {
         it.start()
         it.onConnected()
