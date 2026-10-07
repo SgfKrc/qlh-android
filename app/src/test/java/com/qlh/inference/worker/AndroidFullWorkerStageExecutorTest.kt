@@ -1,9 +1,15 @@
 package com.qlh.inference.worker
 
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 class AndroidFullWorkerStageExecutorTest {
     private val model = mapOf(
@@ -104,5 +110,57 @@ class AndroidFullWorkerStageExecutorTest {
             assertEquals("model_identity_mismatch", error.code)
         }
         assertTrue(!loadCalled)
+    }
+
+    @Test
+    fun `DIST-NEXT-1 executor reports in-flight state and forwards abort`() = runBlocking {
+        val aborts = AtomicInteger(0)
+        val started = CompletableDeferred<Unit>()
+        val release = AtomicBoolean(false)
+        val executor = AndroidFullWorkerStageExecutor(
+            expectedModelIdentity = { model },
+            ensureModelLoaded = { Result.success(Unit) },
+            generate = { _, _, _, _ ->
+                started.complete(Unit)
+                // 模拟不可被协程取消打断的原子执行（真实形态是 native 层段前向）。
+                val deadline = System.currentTimeMillis() + 5_000L
+                while (!release.get() && System.currentTimeMillis() < deadline) Thread.sleep(5)
+                Result.success("late result")
+            },
+            requestExecutionAbort = {
+                aborts.incrementAndGet()
+                release.set(true)
+            },
+        )
+        val identity = TaskWorkerAttemptIdentity(
+            workflowId = "wf_android_exec3",
+            stageId = "stage_1",
+            attemptId = "att_android_exec3",
+            leaseId = "lease_android_exec3",
+            leaseEpoch = 1,
+        )
+        val offer = TaskWorkerProtocol.buildStageOffer(
+            identity = identity,
+            requestId = "request_android_exec3",
+            stageType = "full_inference",
+            providerId = "remote_android_worker_01",
+            leaseExpiresAtMs = System.currentTimeMillis() + 30_000L,
+            rootInput = mapOf("message" to "hello", "max_new_tokens" to 8),
+            dependencies = emptyMap(),
+            modelIdentity = model,
+            messageId = "msg_android_exec03",
+            sentAtMs = System.currentTimeMillis(),
+        )
+
+        val job = launch(Dispatchers.Default) { executor.execute(offer) }
+        started.await()
+        assertTrue(executor.isExecutionInFlight(identity))
+        // 身份不符 ⇒ 不得转发中止（否则会打断别的 attempt）。
+        executor.requestCancel(identity.copy(attemptId = "att_android_other"))
+        assertEquals(0, aborts.get())
+        executor.requestCancel(identity)
+        assertEquals(1, aborts.get())
+        job.join()
+        assertFalse(executor.isExecutionInFlight(identity))
     }
 }

@@ -252,6 +252,14 @@ class TaskWorkerService : Service() {
                         }
                     } ?: Result.failure(IllegalStateException("inference_service_unavailable"))
                 },
+                // ★ 2026-10-07（DIST-NEXT-1）：取消合同 —— 把中止请求传到 native。
+                //   `nativeLayerForward*` 因此在下一个可分割的张量边界退出并返回 -4，
+                //   使「取消」不必等整个 stage 跑完；worker 客户端据此把
+                //   `execution_in_flight` 升级为 `execution_stopped`。
+                requestExecutionAbort = {
+                    QlhApplication.instance.inferenceService?.engine
+                        ?.requestLayerForwardAbort()
+                },
                 ensureModelLoadedForLayer = { range, contextSize, embeddingWidth, wantHidden, sha256 ->
                     awaitInferenceService()
                         ?.ensureLayerModelLoaded(

@@ -3,6 +3,7 @@
 #include <sys/sysinfo.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -55,6 +56,17 @@ static void free_vision(QlhLlamaContext * qctx) {
 }
 
 static std::once_flag g_backend_once;
+
+//: ★ 2026-10-07（DIST-NEXT-1）：层段前向的取消标志（DIST 取消合同）。
+//: 层段前向是一次 `llama_decode` 原子调用，Java 侧的协程取消打断不了它；
+//: 由 Java 显式置位，`llama_set_abort_callback` 注册的回调读它 ⇒ 计算在下一个
+//: 可分割的张量边界退出，JNI 返回 -4（`layer_forward_aborted`）。
+//: worker 单并发契约保证同一时刻最多一个层段前向 ⇒ 进程级标志足够。
+static std::atomic<bool> g_layer_forward_abort{false};
+
+static bool qlh_layer_forward_abort_callback(void * /* data */) {
+    return g_layer_forward_abort.load(std::memory_order_relaxed);
+}
 
 static void ensure_backend_initialized() {
     std::call_once(g_backend_once, []() {
@@ -1166,7 +1178,16 @@ static jint qlh_layer_forward_impl(
     }
 
     jint result = -1;
+    // ★ 2026-10-07（DIST-NEXT-1）：注册取消回调 —— 它读取 Java 侧置位的进程级标志。
+    //   回调在计算过程中被 llama.cpp 周期性调用 ⇒ 取消不必等整个 batch 算完。
+    llama_set_abort_callback(qctx->ctx, qlh_layer_forward_abort_callback, nullptr);
     const int rc = llama_decode(qctx->ctx, batch);
+    if (rc != 0 && g_layer_forward_abort.load(std::memory_order_relaxed)) {
+        // 被取消标志中止：与「形状/参数错」区分开，Java 侧据 -4 走取消终态
+        // （而不是把它报成执行失败）。
+        llama_batch_free(batch);
+        return -4;
+    }
     if (rc == 0) {
         const float * logits = llama_get_logits_ith(qctx->ctx, n_tokens - 1);
         if (logits != nullptr) {
@@ -1412,7 +1433,15 @@ static jint qlh_layer_forward_keep_head_impl(
     }
 
     jint result = -1;
+    // ★ 2026-10-07（DIST-NEXT-1）：同 `qlh_layer_forward_impl` —— keep-head 通道
+    //   也必须可被取消，否则末段/中间段在取消后仍会跑完整段。
+    llama_set_abort_callback(qctx->ctx, qlh_layer_forward_abort_callback, nullptr);
     const int rc = llama_decode(qctx->ctx, batch);
+    if (rc != 0 && g_layer_forward_abort.load(std::memory_order_relaxed)) {
+        llama_batch_free(batch);
+        qlh_layer_out_set(qctx->ctx, qctx->model, false);
+        return -4;
+    }
     if (rc == 0) {
         const float * logits = llama_get_logits_ith(qctx->ctx, n_tokens - 1);
         if (logits != nullptr) {
@@ -1495,6 +1524,19 @@ Java_com_qlh_inference_service_LocalInferenceEngine_nativeLayerForwardHiddenKeep
         n_seq_id.empty() ? nullptr : n_seq_id.data(),
         seq_ids.empty() ? nullptr : seq_ids.data(),
         positions.empty() ? nullptr : positions.data());
+}
+
+// ★ 2026-10-07（DIST-NEXT-1）：层段前向的取消开关。
+//
+// Java 侧（`LocalInferenceEngine.requestLayerForwardAbort()`）置位后，正在执行的
+// `llama_decode` 会在 `qlh_layer_forward_abort_callback` 返回 true 时中止，对应
+// JNI 入口返回 -4。**只有**这些层段入口受它影响：普通 `nativeGenerate*` 不注册该回调，
+// 因此取消标志不会误伤整模型推理。
+extern "C" JNIEXPORT void JNICALL
+Java_com_qlh_inference_service_LocalInferenceEngine_nativeSetLayerForwardAbort(
+    JNIEnv * /* env */, jobject /* thiz */, jboolean abort
+) {
+    g_layer_forward_abort.store(abort == JNI_TRUE, std::memory_order_relaxed);
 }
 
 // 层段能力探测：上报本节点能否承层段、hidden 宽度、以及「层段运行必需的批量下限」。

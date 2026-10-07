@@ -88,6 +88,32 @@ class LocalInferenceEngine(private val context: Context) {
     var multimodalLoaded: Boolean = false
         private set
 
+    /**
+     * ★ 2026-10-07（DIST-NEXT-1）：层段前向的取消标志。
+     *
+     * 层段前向是一次 `llama_decode` 原子调用，Kotlin 的协程取消打断不了它。
+     * 取消合同因此把它做成显式标志：native 侧 `llama_set_abort_callback` 读该
+     * 标志，在下一个可分割的张量边界退出，JNI 返回 -4（`layer_forward_aborted`）。
+     */
+    @Volatile
+    private var layerForwardAbortRequested = false
+
+    /** 请求中止正在执行的层段前向（幂等；未加载模型时只置标志）。 */
+    fun requestLayerForwardAbort() {
+        layerForwardAbortRequested = true
+        if (nativeLoaded) {
+            runCatching { nativeSetLayerForwardAbort(true) }
+        }
+    }
+
+    /** 清除层段前向的取消标志（每次进入 `layerForward` 前调用；幂等）。 */
+    fun clearLayerForwardAbort() {
+        layerForwardAbortRequested = false
+        if (nativeLoaded) {
+            runCatching { nativeSetLayerForwardAbort(false) }
+        }
+    }
+
     /** SAF fd 或缓存加载句柄。模型卸载前必须保持 fd 存活。 */
     private var modelOpenHandle: ModelManager.ModelOpenHandle? = null
 
@@ -519,6 +545,12 @@ class LocalInferenceEngine(private val context: Context) {
         if (!isLoaded) {
             return@withContext Result.failure(IllegalStateException("model_not_loaded"))
         }
+        // ★ 2026-10-07（DIST-NEXT-1）：取消已经到达 ⇒ 直接失败，不做任何计算。
+        //   （标志必须在这里清掉，否则会污染下一次前向。）
+        if (layerForwardAbortRequested) {
+            clearLayerForwardAbort()
+            return@withContext Result.failure(IllegalStateException("layer_forward_aborted"))
+        }
         if (nTokens <= 0) {
             return@withContext Result.failure(IllegalArgumentException("nTokens must be positive"))
         }
@@ -529,6 +561,9 @@ class LocalInferenceEngine(private val context: Context) {
                 IllegalArgumentException("seqIds and positions must each have nTokens entries when provided")
             )
         }
+        // ★ 2026-10-07（DIST-NEXT-1）：进入 native 前清标志 —— native 侧
+        //   `llama_set_abort_callback` 读的就是它。
+        clearLayerForwardAbort()
         try {
             if (wantHidden) {
                 val embeddingWidth = estimateEmbeddingWidth(hidden.size, nTokens)
@@ -560,6 +595,12 @@ class LocalInferenceEngine(private val context: Context) {
                     -3 -> return@withContext Result.failure(
                         IllegalStateException("keep_head_layer_out_unavailable")
                     )
+                    // -4 = 层段前向被取消标志中止（`llama_set_abort_callback` 触发）。
+                    // 这是**取消**而不是执行失败：调用方（worker 客户端）据该码走取消
+                    // 终态，绝不回 `stage_error`。
+                    -4 -> return@withContext Result.failure(
+                        IllegalStateException("layer_forward_aborted")
+                    )
                     else -> Result.success(LayerForwardOutput(token, if (token >= 0) out else null))
                 }
             } else {
@@ -567,6 +608,12 @@ class LocalInferenceEngine(private val context: Context) {
                     nativeLayerForwardTokenSeq(modelPtr, hidden, nTokens, posBase, seqIds, positions)
                 } else {
                     nativeLayerForwardToken(modelPtr, hidden, nTokens, posBase)
+                }
+                // -4 = 同上：被取消标志中止 ⇒ 按取消（而非执行失败）上报。
+                if (token == -4) {
+                    return@withContext Result.failure(
+                        IllegalStateException("layer_forward_aborted")
+                    )
                 }
                 Result.success(LayerForwardOutput(token, null))
             }
@@ -804,6 +851,15 @@ class LocalInferenceEngine(private val context: Context) {
         positions: IntArray?,
         outHidden: FloatArray
     ): Int
+
+    /**
+     * ★ 2026-10-07（DIST-NEXT-1）：设置/清除 native 侧的层段前向取消标志。
+     *
+     * native 侧把它存成 `std::atomic<bool>`，由 `llama_set_abort_callback` 注册的
+     * 回调读取；被中止的 `llama_decode` 使 `nativeLayerForward*` 返回 `-4`。
+     * 标志是**进程级**的（一次只有一个层段前向在跑，与 worker 单并发契约一致）。
+     */
+    private external fun nativeSetLayerForwardAbort(abort: Boolean)
 
     /**
      * 层段能力探测：`layer_forward_supported` / `n_embd` / `n_layer` /

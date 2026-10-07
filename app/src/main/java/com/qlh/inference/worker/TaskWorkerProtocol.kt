@@ -73,6 +73,18 @@ object TaskWorkerProtocol {
     const val STAGE_CANCEL = "stage_cancel"
     const val STAGE_CANCELLED = "stage_cancelled"
 
+    /**
+     * ★ 2026-10-07（DIST-NEXT-1）：取消 ACK 的执行状态（`stage_cancelled.execution_state`）。
+     *
+     * 与主仓 `_STAGE_CANCELLED_EXECUTION_STATES` 同集合：ACK 只证明「取消请求已送达」，
+     * 只有 [EXECUTION_STOPPED] 才证明「执行已停止」——native 层段前向是一次原子调用，
+     * 收到取消时可能仍在飞。
+     */
+    const val EXECUTION_STOPPED = "execution_stopped"
+    const val EXECUTION_IN_FLIGHT = "execution_in_flight"
+    private val executionStates = setOf(EXECUTION_STOPPED, EXECUTION_IN_FLIGHT)
+    private val cancelledOptionalFields = setOf("execution_state")
+
     private val gson = GsonBuilder()
         .disableHtmlEscaping()
         .serializeNulls()
@@ -256,11 +268,17 @@ object TaskWorkerProtocol {
         reasonCode: String,
         messageId: String,
         sentAtMs: Long,
+        /**
+         * ★ 2026-10-07（DIST-NEXT-1）：必填 —— 调用方必须表态「执行是否已停止」
+         * （[EXECUTION_STOPPED] / [EXECUTION_IN_FLIGHT]），不允许默认值掩盖事实。
+         */
+        executionState: String,
     ): TaskWorkerEnvelope = build(
         STAGE_CANCELLED,
         identity.asPayload() + mapOf(
             "provider_id" to providerId,
             "reason_code" to reasonCode,
+            "execution_state" to executionState,
         ),
         messageId,
         sentAtMs,
@@ -377,6 +395,16 @@ object TaskWorkerProtocol {
                 //   （`requireExact` 是双向精确匹配，写进必填集合会破坏旧对端）。
                 layerForwardOfferFields +
                     layerForwardOptionalFields.filter { envelope.payload.containsKey(it) }.toSet()
+            } else {
+                emptySet()
+            } +
+            // ★ 2026-10-07（DIST-NEXT-1）：取消 ACK 的执行状态同样只在真的出现时放宽
+            //   （旧对端不带该字段，写进必填集合会判 `field_mismatch`）。
+            if (
+                envelope.version >= 3 &&
+                envelope.messageType == STAGE_CANCELLED
+            ) {
+                cancelledOptionalFields.filter { envelope.payload.containsKey(it) }.toSet()
             } else {
                 emptySet()
             }
@@ -727,7 +755,22 @@ object TaskWorkerProtocol {
                 code(payload, "error_code")
                 boolean(payload, "retryable")
             }
-            STAGE_CANCEL, STAGE_CANCELLED -> code(payload, "reason_code")
+            STAGE_CANCEL -> code(payload, "reason_code")
+            STAGE_CANCELLED -> {
+                code(payload, "reason_code")
+                // ★ 2026-10-07（DIST-NEXT-1）：执行状态可选，但值域封闭（fail-closed）。
+                if (payload.containsKey("execution_state")) {
+                    val state = string(payload, "execution_state")
+                    if (state !in executionStates) {
+                        fail(
+                            "execution_state must be one of " +
+                                executionStates.joinToString(", "),
+                            "unsupported_execution_state",
+                            "payload.execution_state",
+                        )
+                    }
+                }
+            }
         }
     }
 

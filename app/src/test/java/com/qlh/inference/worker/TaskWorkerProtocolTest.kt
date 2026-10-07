@@ -505,4 +505,65 @@ class TaskWorkerProtocolTest {
             )
         }
     }
+
+    @Test
+    fun `DIST-NEXT-1 stage_cancelled carries a bounded execution state`() {
+        val inFlight = TaskWorkerProtocol.buildStageCancelled(
+            identity = identity,
+            providerId = "remote_android_worker_01",
+            reasonCode = "coordinator_cancelled",
+            messageId = "msg_cancelled_state01",
+            sentAtMs = 1_700_000_000_000L,
+            executionState = TaskWorkerProtocol.EXECUTION_IN_FLIGHT,
+        )
+        assertEquals(
+            TaskWorkerProtocol.EXECUTION_IN_FLIGHT,
+            inFlight.payload["execution_state"],
+        )
+        // 编解码往返必须保持该字段（对端据此区分「已取消」与「已停止」）。
+        //   ⚠️ 不比较整个 envelope：Gson 往返会把整数解析成 Double，Map 相等性会因此失败。
+        val roundTripped = TaskWorkerProtocol.decode(TaskWorkerProtocol.encode(inFlight))
+        assertEquals(TaskWorkerProtocol.EXECUTION_IN_FLIGHT, roundTripped.payload["execution_state"])
+        assertEquals("coordinator_cancelled", roundTripped.payload["reason_code"])
+
+        // 值域封闭：未知状态一律拒收，绝不照抄。
+        expectProtocolError("unsupported_execution_state") {
+            TaskWorkerProtocol.buildStageCancelled(
+                identity = identity,
+                providerId = "remote_android_worker_01",
+                reasonCode = "coordinator_cancelled",
+                messageId = "msg_cancelled_state02",
+                sentAtMs = 1_700_000_000_000L,
+                executionState = "stopped",
+            )
+        }
+
+        // 旧对端（不带该字段）仍然合法 —— 可选字段不得变成必填。
+        val legacy = TaskWorkerProtocol.build(
+            messageType = TaskWorkerProtocol.STAGE_CANCELLED,
+            payload = identity.asPayload() + mapOf(
+                "provider_id" to "remote_android_worker_01",
+                "reason_code" to "coordinator_cancelled",
+            ),
+            messageId = "msg_cancelled_state03",
+            sentAtMs = 1_700_000_000_000L,
+        )
+        assertNull(legacy.payload["execution_state"])
+        val legacyRoundTrip = TaskWorkerProtocol.decode(TaskWorkerProtocol.encode(legacy))
+        assertNull(legacyRoundTrip.payload["execution_state"])
+        assertEquals("remote_android_worker_01", legacyRoundTrip.payload["provider_id"])
+
+        // 该字段只属于回程 ACK；coordinator 的取消请求不得携带它。
+        expectProtocolError("invalid_fields") {
+            TaskWorkerProtocol.build(
+                messageType = TaskWorkerProtocol.STAGE_CANCEL,
+                payload = identity.asPayload() + mapOf(
+                    "reason_code" to "coordinator_cancelled",
+                    "execution_state" to TaskWorkerProtocol.EXECUTION_STOPPED,
+                ),
+                messageId = "msg_cancel_state01",
+                sentAtMs = 1_700_000_000_000L,
+            )
+        }
+    }
 }

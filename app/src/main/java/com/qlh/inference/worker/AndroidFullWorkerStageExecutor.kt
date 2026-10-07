@@ -94,7 +94,30 @@ class AndroidFullWorkerStageExecutor(
         List<Int>,
         Map<*, *>,
     ) -> Map<String, Any?>? = { _, _ -> null },
+    /**
+     * ★ 2026-10-07（DIST-NEXT-1）：请求中止正在进行的执行（层段前向）。
+     *
+     * 默认空实现 ⇒ 未接线时取消仍然只取消本地协程（旧行为），但 ACK 会如实
+     * 报告 `execution_in_flight`，不冒充「执行已停止」。
+     */
+    private val requestExecutionAbort: () -> Unit = {},
 ) : TaskWorkerStageHandler {
+    /**
+     * ★ 2026-10-07（DIST-NEXT-1）：当前**正在执行**的 attempt。
+     *
+     * 取消 ACK 的 `execution_state` 由它决定；`null` = 没有执行在飞。
+     */
+    @Volatile
+    private var runningIdentity: TaskWorkerAttemptIdentity? = null
+
+    override fun requestCancel(identity: TaskWorkerAttemptIdentity) {
+        if (runningIdentity != identity) return
+        runCatching { requestExecutionAbort() }
+    }
+
+    override fun isExecutionInFlight(identity: TaskWorkerAttemptIdentity): Boolean =
+        runningIdentity == identity
+
     override suspend fun execute(offer: TaskWorkerEnvelope): TaskWorkerStageExecution {
         if (offer.messageType != TaskWorkerProtocol.STAGE_OFFER) {
             throw AndroidFullWorkerStageException(
@@ -149,9 +172,24 @@ class AndroidFullWorkerStageExecutor(
         }
         // ★ 2026-09-20：按 stage 类型分派。两种 stage 的输入形态完全不同
         //   （整模型要 prompt；层段要 hidden + 层区间），不能共用一条路径。
-        return when (stageType) {
-            "layer_forward" -> executeLayerForward(payload, advertisedIdentity)
-            else -> executeFullInference(payload, advertisedIdentity)
+        // ★ 2026-10-07（DIST-NEXT-1）：进入执行前登记 identity —— 取消 ACK 的
+        //   `execution_in_flight` / `execution_stopped` 以它为准；执行结束（含异常）
+        //   必须清空，否则会把「已完成」报成「仍在执行」。
+        val attemptIdentity = TaskWorkerAttemptIdentity(
+            workflowId = (payload["workflow_id"] as? String).orEmpty(),
+            stageId = (payload["stage_id"] as? String).orEmpty(),
+            attemptId = (payload["attempt_id"] as? String).orEmpty(),
+            leaseId = (payload["lease_id"] as? String).orEmpty(),
+            leaseEpoch = (payload["lease_epoch"] as? Number)?.toInt() ?: 0,
+        )
+        runningIdentity = attemptIdentity
+        try {
+            return when (stageType) {
+                "layer_forward" -> executeLayerForward(payload, advertisedIdentity)
+                else -> executeFullInference(payload, advertisedIdentity)
+            }
+        } finally {
+            if (runningIdentity == attemptIdentity) runningIdentity = null
         }
     }
 

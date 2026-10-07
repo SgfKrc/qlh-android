@@ -489,6 +489,23 @@ class SocketTaskWorkerTransportFactory(
 
 fun interface TaskWorkerStageHandler {
     suspend fun execute(offer: TaskWorkerEnvelope): TaskWorkerStageExecution
+
+    /**
+     * ★ 2026-10-07（DIST-NEXT-1）：请求中止该 attempt 的执行。
+     *
+     * 默认空实现 ⇒ 未接线的执行器保持旧行为。已接线的实现（Android 层段执行器）
+     * 会把请求传到 native：`llama_set_abort_callback` 在每个可分割的张量边界退出，
+     * 使「取消」不再只能等到整个 stage 跑完。
+     */
+    fun requestCancel(identity: TaskWorkerAttemptIdentity) = Unit
+
+    /**
+     * ★ 2026-10-07（DIST-NEXT-1）：该 attempt 的执行**是否仍在进行**。
+     *
+     * 取消 ACK 用它如实区分 `execution_in_flight` 与 `execution_stopped`；
+     * 默认 false ⇒ 未接线的执行器不会冒充「仍在执行」。
+     */
+    fun isExecutionInFlight(identity: TaskWorkerAttemptIdentity): Boolean = false
 }
 
 data class TaskWorkerStageExecution(
@@ -517,6 +534,19 @@ class TaskWorkerClient(
     private var executionJob: Job? = null
     private var heartbeatJob: Job? = null
 
+    // ★ 2026-10-07（DIST-NEXT-1）：取消 ACK 的单一事实源。
+    //   `stage_cancelled` 可能发两次：先是 ACK（可能 `execution_in_flight`），
+    //   执行真正停止后再补一条终态。这里记录「已发出的状态」，保证每条状态
+    //   只发一次，且不会把 ACK 冒充成终态。
+    private val cancelLock = Any()
+    private var cancelAckAttemptId: String? = null
+    private var cancelAckState: String? = null
+    private var cancelAckReasonCode: String = ""
+
+    /** offer 里的 `provider_id`（主节点口径）；本地取消的回程必须回显它。 */
+    @Volatile
+    private var activeProviderId: String? = null
+
     val snapshot: StateFlow<TaskWorkerSnapshot> = mutableSnapshot.asStateFlow()
 
     @Synchronized
@@ -529,25 +559,35 @@ class TaskWorkerClient(
 
     fun cancelActive(reasonCode: String = "user_cancelled"): Boolean {
         val identity = machine.requestCancel(clockMs()) ?: return false
-        val errorCode = reasonCode.takeIf { it.matches(Regex("^[a-z][a-z0-9_]{0,63}$")) }
+        val code = reasonCode.takeIf { it.matches(Regex("^[a-z][a-z0-9_]{0,63}$")) }
             ?: "worker_cancelled"
-        machine.fail(identity, errorCode, retryable = true)
-        publish()
+        // ★ 2026-10-07（DIST-NEXT-1）：本地取消同样走**唯一取消状态机** ——
+        //   回程是 `stage_cancelled`（而非 `stage_error`），并如实报告执行状态；
+        //   主节点据此区分「用户取消」「执行失败」「对端已停止」。
+        //   ⚠️ 不再取消心跳：心跳只取决于连接状态，与单个 attempt 无关；此前
+        //      在这里停掉心跳会让 worker 在取消后 120s 内被判失联。
+        stageHandler?.requestCancel(identity)
         executionJob?.cancel()
-        heartbeatJob?.cancel()
+        publish()
+        val inFlight = stageHandler?.isExecutionInFlight(identity) == true
         scope.launch {
             val current = transport ?: return@launch
+            val providerId = activeProviderId ?: nodeId
             runCatching {
-                current.send(TaskWorkerProtocol.buildStageError(
-                    identity = identity,
-                    providerId = nodeId,
-                    errorCode = errorCode,
-                    retryable = true,
-                    messageId = newMessageId("cancel"),
-                    sentAtMs = clockMs(),
-                ))
+                sendCancelledAck(
+                    current,
+                    identity,
+                    providerId,
+                    code,
+                    if (inFlight) TaskWorkerProtocol.EXECUTION_IN_FLIGHT
+                    else TaskWorkerProtocol.EXECUTION_STOPPED,
+                )
             }.onFailure { error ->
                 machine.onDisconnected(clockMs(), "cancel_send_failed", error.message ?: "cancel send failed")
+                publish()
+            }
+            if (!inFlight) {
+                machine.cancelled(identity)
                 publish()
             }
         }
@@ -668,6 +708,7 @@ class TaskWorkerClient(
         //   （`remote_<node_id>`），不是本节点的裸 nodeId。此前一律回裸 nodeId，被主节点
         //   以 `attempt_identity_mismatch` 拒掉，真机表现为 Stage 响应一直等到超时。
         val providerId = (payload["provider_id"] as? String)?.takeIf { it.isNotBlank() } ?: nodeId
+        activeProviderId = providerId
         val expires = (payload["lease_expires_at_ms"] as Number).toLong()
         if (!machine.offer(identity, expires, clockMs())) {
             connection.send(TaskWorkerProtocol.buildStageAccept(
@@ -694,32 +735,40 @@ class TaskWorkerClient(
         executionJob = scope.launch {
             try {
                 val execution = handler.execute(envelope)
-                val output = TaskWorkerProtocol.buildStageResult(
-                    identity, providerId, execution.output, execution.metadata,
-                    newMessageId("result"), clockMs(),
-                )
-                val digest = output.payload["output_sha256"] as String
-                if (machine.complete(identity, digest, clockMs())) {
-                    connection.send(output)
-                    publish()
+                if (isAttemptCancelling(identity)) {
+                    // ★ 2026-10-07（DIST-NEXT-1）：取消与结果竞态 —— 已进入取消的
+                    //   attempt 不得再发 `stage_result`（否则主节点会把「已取消」
+                    //   记成「已完成」）。迟到的结果由主节点吸收并单独计数。
+                    finishCancelledExecution(connection, identity, providerId)
+                } else {
+                    val output = TaskWorkerProtocol.buildStageResult(
+                        identity, providerId, execution.output, execution.metadata,
+                        newMessageId("result"), clockMs(),
+                    )
+                    val digest = output.payload["output_sha256"] as String
+                    if (machine.complete(identity, digest, clockMs())) {
+                        connection.send(output)
+                        publish()
+                    }
                 }
             } catch (error: CancellationException) {
-                if (machine.snapshot().activeAttempt.identity == identity && machine.snapshot().activeAttempt.state == TaskWorkerAttemptState.CANCELLING) {
-                    machine.cancelled(identity)
-                    connection.send(TaskWorkerProtocol.buildStageCancelled(
-                        identity, providerId, "cancelled", newMessageId("cancelled"), clockMs(),
-                    ))
-                    publish()
-                }
+                finishCancelledExecution(connection, identity, providerId)
             } catch (error: Exception) {
-                val errorCode = (error as? AndroidFullWorkerStageException)?.code
-                    ?: "worker_execution_failed"
-                if (machine.fail(identity, errorCode, retryable = true)) {
-                    connection.send(TaskWorkerProtocol.buildStageError(
-                        identity, providerId, errorCode, true,
-                        newMessageId("error"), clockMs(),
-                    ))
-                    publish()
+                if (isAttemptCancelling(identity)) {
+                    // ★ 2026-10-07（DIST-NEXT-1）：native 层段前向被取消标志中断后
+                    //   返回的是普通失败。那属于取消，不能报成 `stage_error`
+                    //   （会把「用户取消」写成「执行失败」）。
+                    finishCancelledExecution(connection, identity, providerId)
+                } else {
+                    val errorCode = (error as? AndroidFullWorkerStageException)?.code
+                        ?: "worker_execution_failed"
+                    if (machine.fail(identity, errorCode, retryable = true)) {
+                        connection.send(TaskWorkerProtocol.buildStageError(
+                            identity, providerId, errorCode, true,
+                            newMessageId("error"), clockMs(),
+                        ))
+                        publish()
+                    }
                 }
             }
         }
@@ -727,19 +776,103 @@ class TaskWorkerClient(
 
     private suspend fun handleCancel(connection: TaskWorkerTransport, envelope: TaskWorkerEnvelope) {
         val identity = identityFrom(envelope.payload)
-        // 与 handleOffer 同理：回程原样回显主节点的 `provider_id`。
+        // ★ 2026-10-07（DIST-NEXT-1）：回程的 `provider_id` 必须是**主节点口径**
+        //   （`remote_<node_id>`）。`stage_cancel` 的 payload 里**没有** `provider_id`
+        //   （协议精确字段集如此），因此优先回显 offer 时记下的那个 ——
+        //   回裸 `nodeId` 会被主节点以 `attempt_identity_mismatch` 拒绝，
+        //   真机表现正是「`stage_cancel_acknowledged` 恒缺席」。
         val providerId = (envelope.payload["provider_id"] as? String)
-            ?.takeIf { it.isNotBlank() } ?: nodeId
-        if (machine.requestCancel(clockMs(), expectedIdentity = identity) == identity) {
-            executionJob?.cancel()
-            if (stageHandler == null) {
-                machine.cancelled(identity)
-                connection.send(TaskWorkerProtocol.buildStageCancelled(
-                    identity, providerId, "cancelled", newMessageId("cancelled"), clockMs(),
-                ))
-                publish()
-            }
+            ?.takeIf { it.isNotBlank() }
+            ?: activeProviderId
+            ?: nodeId
+        val reasonCode = (envelope.payload["reason_code"] as? String)
+            ?.takeIf { it.isNotBlank() } ?: "coordinator_cancelled"
+        if (machine.requestCancel(clockMs(), expectedIdentity = identity) != identity) return
+        // ★ 2026-10-07（DIST-NEXT-1）：取消合同。
+        //   ① 先让执行器知道要停（native 层段前向在下一个可分割边界退出）；
+        //   ② 再取消协程；
+        //   ③ ACK **立即**发出，与「执行是否已停止」解耦 —— 层段模式下
+        //      `stageHandler != null` 也必须回 ACK，且状态如实（`execution_in_flight`
+        //      / `execution_stopped`）。执行真正停止后由 finishCancelledExecution
+        //      补发终态，主节点不再需要等到租约/步骤超时。
+        val handler = stageHandler
+        // ⚠️ 必须在 `executionJob.cancel()` **之前**求值：`Job.isActive` 在取消后立即
+        //   变 false，用它判断会把「仍在跑的原子前向」误报成「已停止」。
+        val inFlight = handler?.isExecutionInFlight(identity) == true
+        handler?.requestCancel(identity)
+        executionJob?.cancel()
+        publish()
+        sendCancelledAck(
+            connection,
+            identity,
+            providerId,
+            reasonCode,
+            if (inFlight) TaskWorkerProtocol.EXECUTION_IN_FLIGHT
+            else TaskWorkerProtocol.EXECUTION_STOPPED,
+        )
+        if (!inFlight && machine.cancelled(identity)) publish()
+    }
+
+    /** 该 attempt 是否已进入取消（`CANCELLING`）—— 决定是否还能发结果/错误。 */
+    private fun isAttemptCancelling(identity: TaskWorkerAttemptIdentity): Boolean {
+        val active = machine.snapshot().activeAttempt
+        return active.identity == identity &&
+            active.state == TaskWorkerAttemptState.CANCELLING
+    }
+
+    /**
+     * ★ 2026-10-07（DIST-NEXT-1）：执行真正停止后把取消收敛成终态。
+     *
+     * 只有 `CANCELLING` 中的 attempt 才发 ACK；`stage_cancelled` 的
+     * `execution_state` 由 [sendCancelledAck] 去重，因此这里补发的终态
+     * 恰好把此前的 `execution_in_flight` 升级为 `execution_stopped`。
+     */
+    private suspend fun finishCancelledExecution(
+        connection: TaskWorkerTransport,
+        identity: TaskWorkerAttemptIdentity,
+        providerId: String,
+    ) {
+        if (!isAttemptCancelling(identity)) return
+        val reasonCode = synchronized(cancelLock) {
+            if (cancelAckAttemptId == identity.attemptId) cancelAckReasonCode
+            else "cancelled"
         }
+        sendCancelledAck(
+            connection, identity, providerId, reasonCode,
+            TaskWorkerProtocol.EXECUTION_STOPPED,
+        )
+        if (machine.cancelled(identity)) publish()
+    }
+
+    /**
+     * 发送 `stage_cancelled` 的唯一入口（同一 attempt 的同一状态只发一次）。
+     */
+    private suspend fun sendCancelledAck(
+        connection: TaskWorkerTransport,
+        identity: TaskWorkerAttemptIdentity,
+        providerId: String,
+        reasonCode: String,
+        executionState: String,
+    ) {
+        synchronized(cancelLock) {
+            if (cancelAckAttemptId == identity.attemptId &&
+                cancelAckState == executionState
+            ) {
+                return
+            }
+            cancelAckAttemptId = identity.attemptId
+            cancelAckState = executionState
+            cancelAckReasonCode = reasonCode
+        }
+        connection.send(TaskWorkerProtocol.buildStageCancelled(
+            identity = identity,
+            providerId = providerId,
+            reasonCode = reasonCode,
+            messageId = newMessageId("cancelled"),
+            sentAtMs = clockMs(),
+            executionState = executionState,
+        ))
+        publish()
     }
 
     private fun handleLeaseRenew(envelope: TaskWorkerEnvelope) {
