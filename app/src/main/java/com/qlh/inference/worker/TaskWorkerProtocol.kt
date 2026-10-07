@@ -94,8 +94,6 @@ object TaskWorkerProtocol {
      */
     const val HIDDEN_DTYPE_BYTES_F32 = 4
     const val STAGE_FRAME_RESERVE_BYTES = 256 * 1024
-    private const val BASE64_EXPANSION_NUMERATOR = 4L
-    private const val BASE64_EXPANSION_DENOMINATOR = 3L
 
     /** 层段 hidden 在 JSON 帧里占用的字节数（raw + base64 膨胀，向上取整）。 */
     fun hiddenWireBytes(
@@ -103,8 +101,9 @@ object TaskWorkerProtocol {
         dtypeBytes: Int = HIDDEN_DTYPE_BYTES_F32,
     ): Long {
         val raw = elementCount * dtypeBytes.toLong()
-        return (raw * BASE64_EXPANSION_NUMERATOR + BASE64_EXPANSION_DENOMINATOR - 1) /
-            BASE64_EXPANSION_DENOMINATOR
+        // 标准 base64 长度 = 4 × ceil(n / 3)。⚠️ 不要用 `ceil(n × 4/3)` 近似：对
+        // 1 MiB 这类 n 会少算 2 个字符，把「刚好一片」误判成超限（主仓侧实测踩到）。
+        return 4L * ((raw + 2L) / 3L)
     }
 
     /** 单条 stage 消息里可承载的 hidden 预算（已扣帧内其它字段的余量）。 */
@@ -485,6 +484,13 @@ object TaskWorkerProtocol {
                     setOf("layer_artifact_diagnostics")
                 } else {
                     emptySet()
+                }) +
+                // ★ 2026-10-07（DIST-NEXT-2b）：大 payload 分片接收能力（可选，默认关）。
+                //   与主仓 `_validate_capabilities` 同键集；两侧必须同时放行。
+                (if (capabilities.containsKey("stage_chunked_input")) {
+                    setOf("stage_chunked_input")
+                } else {
+                    emptySet()
                 }),
                 "payload.capabilities",
         )
@@ -550,6 +556,10 @@ object TaskWorkerProtocol {
         //   与主仓 `_validate_layer_artifact_diagnostics` 同键集、同值域。
         if (capabilities.containsKey("layer_artifact_diagnostics")) {
             validateLayerArtifactDiagnostics(capabilities["layer_artifact_diagnostics"])
+        }
+        // ★ 2026-10-07（DIST-NEXT-2b）：分片接收能力（可选，布尔）。
+        if (capabilities.containsKey("stage_chunked_input")) {
+            boolean(capabilities, "stage_chunked_input")
         }
         val stageTypes = stringList(capabilities, "stage_types")
         if (!AndroidWorkerCapabilities.areAllStageTypesSupported(stageTypes)) {
