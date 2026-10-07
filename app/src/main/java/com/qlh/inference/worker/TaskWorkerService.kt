@@ -255,6 +255,9 @@ class TaskWorkerService : Service() {
                 layerArtifactDiagnostics = inventory?.failures
                     ?.map { it.toAdvertisement() }
                     .orEmpty(),
+                // ★ 2026-10-07（DIST-NEXT-2b）：本构建已接线分片输入（`stage_chunk`
+                //   接收 + `hidden_ref` 装配）⇒ 声明给主节点。
+                stageChunkedInput = true,
             )
             QlhLogger.i(
                 "TaskWorkerService",

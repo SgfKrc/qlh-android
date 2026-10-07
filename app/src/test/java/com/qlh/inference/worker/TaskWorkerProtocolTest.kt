@@ -657,6 +657,45 @@ class TaskWorkerProtocolTest {
     ) + extra
 
     @Test
+    fun `DIST-NEXT-2b stage_chunk is validated and admitted`() {
+        val payload = ByteArray(64) { 5 }
+        val body = java.util.Base64.getEncoder().encodeToString(payload)
+
+        fun build(index: Int, count: Int, total: Long, chunkBody: Any?): TaskWorkerEnvelope =
+            TaskWorkerProtocol.build(
+                messageType = TaskWorkerProtocol.STAGE_CHUNK,
+                payload = identity.asPayload() + mapOf(
+                    "provider_id" to "remote_android_worker_01",
+                    "chunk_index" to index,
+                    "chunk_count" to count,
+                    "payload_b64" to chunkBody,
+                    "payload_sha256" to StageChunkAssembler.sha256Hex(payload),
+                    "total_bytes" to total,
+                ),
+                messageId = "msg_chunk000001",
+                sentAtMs = 1_700_000_000_000L,
+            )
+
+        val decoded = TaskWorkerProtocol.decode(
+            TaskWorkerProtocol.encode(build(0, 2, 64, body)),
+        )
+        assertEquals(TaskWorkerProtocol.STAGE_CHUNK, decoded.messageType)
+        assertEquals(2L, (decoded.payload["chunk_count"] as Number).toLong())
+
+        expectProtocolError("chunk_index_out_of_range") { build(2, 2, 64, body) }
+        expectProtocolError("chunk_count_out_of_range") { build(0, 65, 64, body) }
+        expectProtocolError("stage_payload_too_large") {
+            build(0, 2, (64L * 1024 * 1024) + 1, body)
+        }
+        expectProtocolError("chunk_too_large") {
+            build(
+                0, 2, 64,
+                java.util.Base64.getEncoder().encodeToString(ByteArray(2 * (1 shl 20))),
+            )
+        }
+    }
+
+    @Test
     fun `DIST-NEXT-2 hidden wire budget matches the master frame limit`() {
         // 与主仓 `task_worker_protocol.hidden_wire_bytes` 同公式、同常量
         assertEquals(5_464L, TaskWorkerProtocol.hiddenWireBytes(1_024L))

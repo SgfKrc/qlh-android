@@ -74,6 +74,15 @@ object TaskWorkerProtocol {
     const val STAGE_CANCELLED = "stage_cancelled"
 
     /**
+     * ★ 2026-10-07（DIST-NEXT-2b）：大 payload 的**有序分片**（v3 契约）——
+     * 与主仓 `task_worker_protocol` 的同名消息与上限同值。
+     */
+    const val STAGE_CHUNK = "stage_chunk"
+    const val MAX_STAGE_CHUNKS = 64
+    const val STAGE_CHUNK_BYTES = 1 shl 20
+    const val MAX_STAGE_PAYLOAD_BYTES = MAX_STAGE_CHUNKS * STAGE_CHUNK_BYTES
+
+    /**
      * ★ 2026-10-07（DIST-NEXT-1）：取消 ACK 的执行状态（`stage_cancelled.execution_state`）。
      *
      * 与主仓 `_STAGE_CANCELLED_EXECUTION_STATES` 同集合：ACK 只证明「取消请求已送达」，
@@ -129,7 +138,7 @@ object TaskWorkerProtocol {
     private val safeCode = Regex("^[a-z][a-z0-9_]{0,63}$")
     private val messageTypes = setOf(
         HELLO, HELLO_ACK, STAGE_OFFER, STAGE_ACCEPT, LEASE_RENEW,
-        STAGE_RESULT, STAGE_ERROR, STAGE_CANCEL, STAGE_CANCELLED,
+        STAGE_RESULT, STAGE_ERROR, STAGE_CANCEL, STAGE_CANCELLED, STAGE_CHUNK,
     )
 
     fun buildHello(
@@ -753,7 +762,7 @@ object TaskWorkerProtocol {
         val payload = envelope.payload
         validateIdentity(payload)
         val type = envelope.messageType
-        if (type in setOf(STAGE_OFFER, STAGE_ACCEPT, STAGE_RESULT, STAGE_ERROR, STAGE_CANCELLED)) {
+        if (type in setOf(STAGE_OFFER, STAGE_ACCEPT, STAGE_RESULT, STAGE_ERROR, STAGE_CANCELLED, STAGE_CHUNK)) {
             requirePattern(string(payload, "provider_id"), safeId, "payload.provider_id")
         }
         when (type) {
@@ -804,6 +813,44 @@ object TaskWorkerProtocol {
                 boolean(payload, "retryable")
             }
             STAGE_CANCEL -> code(payload, "reason_code")
+            // ★ 2026-10-07（DIST-NEXT-2b）：分片的形状与硬上限（顺序语义由
+            // `StageChunkAssembler` 保证）。android 侧只接收，不发送。
+            STAGE_CHUNK -> {
+                val chunkCount = integer(payload, "chunk_count")
+                if (chunkCount > MAX_STAGE_CHUNKS) {
+                    fail(
+                        "chunk_count must be <= $MAX_STAGE_CHUNKS",
+                        "chunk_count_out_of_range",
+                        "payload.chunk_count",
+                    )
+                }
+                val chunkIndex = integer(payload, "chunk_index", allowZero = true)
+                if (chunkIndex >= chunkCount) {
+                    fail(
+                        "chunk_index must be less than chunk_count",
+                        "chunk_index_out_of_range",
+                        "payload.chunk_index",
+                    )
+                }
+                val totalBytes = long(payload, "total_bytes")
+                if (totalBytes > MAX_STAGE_PAYLOAD_BYTES) {
+                    fail(
+                        "total_bytes must be <= $MAX_STAGE_PAYLOAD_BYTES",
+                        "stage_payload_too_large",
+                        "payload.total_bytes",
+                    )
+                }
+                val chunk = string(payload, "payload_b64")
+                // base64 字符数换算回 raw（±2 是 padding 量化误差；精确判定在装配器）。
+                if (((chunk.length + 3) / 4) * 3 > STAGE_CHUNK_BYTES + 2) {
+                    fail(
+                        "a single chunk must not exceed $STAGE_CHUNK_BYTES raw bytes",
+                        "chunk_too_large",
+                        "payload.payload_b64",
+                    )
+                }
+                requireSha(string(payload, "payload_sha256"), "payload.payload_sha256")
+            }
             STAGE_CANCELLED -> {
                 code(payload, "reason_code")
                 // ★ 2026-10-07（DIST-NEXT-1）：执行状态可选，但值域封闭（fail-closed）。
@@ -1099,6 +1146,11 @@ object TaskWorkerProtocol {
         STAGE_ERROR -> identityFields + setOf("provider_id", "error_code", "retryable")
         STAGE_CANCEL -> identityFields + setOf("reason_code")
         STAGE_CANCELLED -> identityFields + setOf("provider_id", "reason_code")
+        // ★ 2026-10-07（DIST-NEXT-2b）：大 payload 分片（与主仓 `_PAYLOAD_FIELDS` 同键集）。
+        STAGE_CHUNK -> identityFields + setOf(
+            "provider_id", "chunk_index", "chunk_count", "payload_b64",
+            "payload_sha256", "total_bytes",
+        )
         else -> emptySet()
     }
 

@@ -264,6 +264,11 @@ object AndroidWorkerCapabilities {
          * 「架构/模式非法」与「没有该区间」。
          */
         layerArtifactDiagnostics: List<Map<String, Any?>> = emptyList(),
+        /**
+         * ★ 2026-10-07（DIST-NEXT-2b）：是否声明能接收**分片输入**（`stage_chunk` +
+         * `stage_offer.root_input.hidden_ref`）。默认 `false`；只有接线完成的构建才声明。
+         */
+        stageChunkedInput: Boolean = false,
     ): Map<String, Any?> {
         require(
             layerArtifacts.map { it.startLayer to it.endLayerExclusive }.distinct().size ==
@@ -333,6 +338,9 @@ object AndroidWorkerCapabilities {
             capabilities["layer_artifact_diagnostics"] =
                 layerArtifactDiagnostics.take(MAX_ARTIFACT_DIAGNOSTICS)
         }
+        // ★ 2026-10-07（DIST-NEXT-2b）：声明能接收分片输入（`stage_chunk` + `hidden_ref`）。
+        //   只在此接线完成的构建里开启 —— 未声明的对端不会被主节点发分片。
+        if (stageChunkedInput) capabilities["stage_chunked_input"] = true
         return capabilities
     }
 }

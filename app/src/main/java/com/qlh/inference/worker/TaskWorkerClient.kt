@@ -28,6 +28,7 @@ import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 import com.google.gson.GsonBuilder
 import com.google.gson.JsonParser
+import com.qlh.inference.logging.QlhLogger
 
 enum class TaskWorkerConnectionState {
     STOPPED,
@@ -547,6 +548,9 @@ class TaskWorkerClient(
     @Volatile
     private var activeProviderId: String? = null
 
+    /** ★ 2026-10-07（DIST-NEXT-2b）：大 payload 分片的装配器（按 attempt 分区）。 */
+    private val stageChunks = StageChunkAssembler()
+
     val snapshot: StateFlow<TaskWorkerSnapshot> = mutableSnapshot.asStateFlow()
 
     @Synchronized
@@ -691,6 +695,9 @@ class TaskWorkerClient(
                     TaskWorkerProtocol.STAGE_OFFER -> handleOffer(connection, event.value)
                     TaskWorkerProtocol.STAGE_CANCEL -> handleCancel(connection, event.value)
                     TaskWorkerProtocol.LEASE_RENEW -> handleLeaseRenew(event.value)
+                    // ★ 2026-10-07（DIST-NEXT-2b）：大 payload 分片 —— 只累积；装配在
+                    //   随后的 `stage_offer` 路径完成（收到 offer 时分片应当已齐备）。
+                    TaskWorkerProtocol.STAGE_CHUNK -> handleStageChunk(event.value)
                     else -> throw TaskWorkerProtocolException(
                         "unexpected coordinator message for Android worker",
                         "unexpected_message_type",
@@ -727,6 +734,19 @@ class TaskWorkerClient(
             ))
             return
         }
+        // ★ 2026-10-07（DIST-NEXT-2b）：分片输入在 accept **之前**装配 —— 装配不成功就
+        //   别接这个 stage（用 accept 的具名拒绝码收敛，而不是执行阶段的笼统失败）。
+        val effectiveOffer = try {
+            assembleChunkedRootInput(envelope)
+        } catch (error: AndroidFullWorkerStageException) {
+            machine.fail(identity, error.code, retryable = true)
+            publish()
+            connection.send(TaskWorkerProtocol.buildStageAccept(
+                identity, providerId, false, error.code, true,
+                newMessageId("accept"), clockMs(),
+            ))
+            return
+        } ?: envelope
         connection.send(TaskWorkerProtocol.buildStageAccept(
             identity, providerId, true, "", false, newMessageId("accept"), clockMs(),
         ))
@@ -734,7 +754,7 @@ class TaskWorkerClient(
         publish()
         executionJob = scope.launch {
             try {
-                val execution = handler.execute(envelope)
+                val execution = handler.execute(effectiveOffer)
                 if (isAttemptCancelling(identity)) {
                     // ★ 2026-10-07（DIST-NEXT-1）：取消与结果竞态 —— 已进入取消的
                     //   attempt 不得再发 `stage_result`（否则主节点会把「已取消」
@@ -772,6 +792,73 @@ class TaskWorkerClient(
                 }
             }
         }
+    }
+
+    /**
+     * ★ 2026-10-07（DIST-NEXT-2b）：接收一条 `stage_chunk`。
+     *
+     * 分片错误**只影响该 attempt**（不因此断开连接）：这里记录具名日志，随后的
+     * `stage_offer` 会因为分片未齐备被拒（`incomplete_chunks`）。
+     */
+    private fun handleStageChunk(envelope: TaskWorkerEnvelope) {
+        val payload = envelope.payload
+        val chunk = try {
+            java.util.Base64.getDecoder().decode(payload["payload_b64"] as String)
+        } catch (error: Exception) {
+            QlhLogger.w("TaskWorkerClient", "stage_chunk rejected: invalid_chunk_payload")
+            return
+        }
+        try {
+            stageChunks.add(
+                attemptId = payload["attempt_id"] as String,
+                chunkIndex = (payload["chunk_index"] as Number).toInt(),
+                chunkCount = (payload["chunk_count"] as Number).toInt(),
+                payload = chunk,
+                payloadSha256 = payload["payload_sha256"] as String,
+            )
+        } catch (error: AndroidFullWorkerStageException) {
+            QlhLogger.w(
+                "TaskWorkerClient",
+                "stage_chunk rejected: ${error.code} ${error.message ?: ""}",
+            )
+        }
+    }
+
+    /**
+     * ★ 2026-10-07（DIST-NEXT-2b）：把 `hidden_ref` 的分片装配回 `hidden_f32`。
+     *
+     * 返回 `null` 表示**无需改写**（内联路径或非层段）—— 调用方原样使用收到的 envelope，
+     * 与接线前逐字节一致。装配后以 offer 的 `hidden_sha256` 兜底校验；成功后丢弃分片状态。
+     */
+    private fun assembleChunkedRootInput(
+        envelope: TaskWorkerEnvelope,
+    ): TaskWorkerEnvelope? {
+        val payload = envelope.payload
+        if (payload["stage_type"] != TaskWorkerProtocol.LAYER_FORWARD_STAGE) return null
+        val rootInput = payload["root_input"] as? Map<*, *> ?: return null
+        if (rootInput["hidden_f32"] is String) return null
+        if (rootInput["hidden_ref"] !is Map<*, *>) return null
+        val identity = identityFrom(payload)
+        val raw = stageChunks.assemble(identity.attemptId)
+        val declared = (payload["hidden_sha256"] as? String).orEmpty()
+        val actual = StageChunkAssembler.sha256Hex(raw)
+        if (declared.isNotEmpty() && !actual.equals(declared, ignoreCase = true)) {
+            throw AndroidFullWorkerStageException(
+                "chunk_digest_mismatch",
+                "assembled hidden digest does not match the offer",
+            )
+        }
+        stageChunks.discard(identity.attemptId)
+        // 改写后**移除** `hidden_ref`：执行器只应看到内联 `hidden_f32`（避免两个来源并存）。
+        val merged = LinkedHashMap<String, Any?>(
+            rootInput.entries
+                .filterNot { it.key.toString() == "hidden_ref" }
+                .associate { it.key.toString() to it.value },
+        )
+        merged["hidden_f32"] = java.util.Base64.getEncoder().encodeToString(raw)
+        val rewritten = LinkedHashMap<String, Any?>(payload)
+        rewritten["root_input"] = merged
+        return envelope.copy(payload = rewritten)
     }
 
     private suspend fun handleCancel(connection: TaskWorkerTransport, envelope: TaskWorkerEnvelope) {
