@@ -47,15 +47,20 @@
         <service
             android:name=".service.InferenceService"
             android:exported="false"
+            android:stopWithTask="false"
             android:foregroundServiceType="specialUse">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="local_model_inference" />
         </service>
 
+        <!-- ★ 2026-10-07（DIST-NEXT-5）：三个前台服务都 `stopWithTask="false"`——
+             用户从最近任务划掉 App 不应终止 worker/presence/引擎（审计 P1-3：
+             「划掉任务即停」是真实缺口），与配置持久化 + 无参重建配套。 -->
         <service
             android:name=".worker.TaskWorkerService"
             android:exported="false"
+            android:stopWithTask="false"
             android:foregroundServiceType="specialUse">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
@@ -65,6 +70,7 @@
         <service
             android:name=".service.AndroidPresenceService"
             android:exported="false"
+            android:stopWithTask="false"
             android:foregroundServiceType="specialUse">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"

@@ -49,6 +49,9 @@ class SettingsDataStore(private val context: Context) {
         val KEY_MODEL_STORAGE_MODE = stringPreferencesKey("model_storage_mode")
         val KEY_THEME_MODE = stringPreferencesKey("theme_mode") // "system" | "light" | "dark"
 
+        // ---- task-worker 启动配置（系统重建恢复用）★ 2026-10-07（DIST-NEXT-5） ----
+        val KEY_TASK_WORKER_STARTUP = stringPreferencesKey("task_worker_startup")
+
         // ---- 默认值 ----
         const val DEFAULT_HOST = "100.90.76.108"
         const val DEFAULT_PORT = 8000
@@ -181,6 +184,23 @@ class SettingsDataStore(private val context: Context) {
 
     suspend fun setServerPort(port: Int) {
         context.dataStore.edit { it[KEY_SERVER_PORT] = port }
+    }
+
+    /**
+     * ★ 2026-10-07（DIST-NEXT-5）：task-worker 的启动配置（`TaskWorkerStartupConfig.toJson()`）。
+     *
+     * 系统回收后 `START_STICKY` 重建时 `TaskWorkerService` 读回它恢复 worker；
+     * 用户主动停止（`ACTION_STOP`）或配置不足时清除，避免把坏配置反复拉起。
+     */
+    suspend fun getTaskWorkerStartupConfig(): String =
+        context.dataStore.data.first()[KEY_TASK_WORKER_STARTUP] ?: ""
+
+    suspend fun setTaskWorkerStartupConfig(json: String) {
+        context.dataStore.edit { it[KEY_TASK_WORKER_STARTUP] = json }
+    }
+
+    suspend fun clearTaskWorkerStartupConfig() {
+        context.dataStore.edit { it.remove(KEY_TASK_WORKER_STARTUP) }
     }
 
     suspend fun saveBootstrapConfig(
