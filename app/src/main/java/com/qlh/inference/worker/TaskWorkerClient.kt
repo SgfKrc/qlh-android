@@ -433,12 +433,39 @@ class SocketTaskWorkerTransport(
     override suspend fun receiveEvent(): TaskWorkerInboundEvent {
         while (true) {
             val objectValue = receiveOuter() ?: return TaskWorkerInboundEvent.Closed
+            // ★ 2026-10-08（诊断，定位后降级）：分片帧「到没到 Android」是本轮的唯一未知量 ——
+            //   master 侧 `task_worker_stage_chunks_sent` 成功，而设备侧连一条分片/未知帧日志
+            //   都没有。这里把**每一个外层帧类型**打出来，直接回答该问题。
+            QlhLogger.d(
+                "TaskWorkerClient",
+                "outer frame: type=${objectValue.get("type")?.asString ?: "(null)"} " +
+                    "keys=${objectValue.keySet().joinToString(",")}",
+            )
             when (objectValue.get("type")?.asString) {
                 "task_worker" -> {
                     val data = objectValue.get("data")
                     if (data == null || !data.isJsonObject) {
                         throw TaskWorkerProtocolException("task worker frame has no data object", "invalid_frame", "data")
                     }
+                    // ★ 2026-10-08（诊断，定位后降级）：帧的内层契约是
+                    //   `{"protocol","version","message_type","message_id","sent_at_ms","payload"}`
+                    //   （主仓 `task_worker_protocol.build_message`），**不是** `type`/`data`
+                    //   —— 我第一次查 `data.type` 得到 `(null)` 就是问错了字段。这里打出
+                    //   `message_type`，直接判定「到了几片、offer 到没到」。
+                    val innerType = data.asJsonObject.get("message_type")?.asString
+                    val innerPayload = data.asJsonObject.get("payload")
+                    QlhLogger.d(
+                        "TaskWorkerClient",
+                        "task_worker frame: message_type=${innerType ?: "(null)"}" +
+                            (if (innerType == TaskWorkerProtocol.STAGE_CHUNK &&
+                                innerPayload != null && innerPayload.isJsonObject
+                            ) {
+                                " index=${innerPayload.asJsonObject.get("chunk_index")}" +
+                                    " count=${innerPayload.asJsonObject.get("chunk_count")}"
+                            } else {
+                                ""
+                            }),
+                    )
                     return TaskWorkerInboundEvent.Envelope(
                         TaskWorkerProtocol.decode(gson.toJson(data).toByteArray(StandardCharsets.UTF_8))
                     )
@@ -461,6 +488,15 @@ class SocketTaskWorkerTransport(
                     } else {
                         val payload = data.asJsonObject.deepCopy()
                         payload.addProperty("type", TaskWorkerProtocol.STAGE_CHUNK)
+                        // ★ 2026-10-08（诊断，定位后降级）：逐片记录到达情况。真机上
+                        //   `task_worker_stage_chunks_sent chunks=18` 之后 offer 始终未到，
+                        //   必须先看清「到底收到几片、有无越界/重复」。
+                        QlhLogger.d(
+                            "TaskWorkerClient",
+                            "stage_chunk in: index=${payload.get("chunk_index")} " +
+                                "count=${payload.get("chunk_count")} " +
+                                "bytes=${payload.get("total_bytes")}",
+                        )
                         return TaskWorkerInboundEvent.Envelope(
                             TaskWorkerProtocol.decode(
                                 gson.toJson(payload).toByteArray(StandardCharsets.UTF_8)
