@@ -431,20 +431,37 @@ class SocketTaskWorkerTransport(
     }
 
     override suspend fun receiveEvent(): TaskWorkerInboundEvent {
-        val objectValue = receiveOuter() ?: return TaskWorkerInboundEvent.Closed
-        return when (objectValue.get("type")?.asString) {
-            "task_worker" -> {
-                val data = objectValue.get("data")
-                if (data == null || !data.isJsonObject) {
-                    throw TaskWorkerProtocolException("task worker frame has no data object", "invalid_frame", "data")
+        while (true) {
+            val objectValue = receiveOuter() ?: return TaskWorkerInboundEvent.Closed
+            when (objectValue.get("type")?.asString) {
+                "task_worker" -> {
+                    val data = objectValue.get("data")
+                    if (data == null || !data.isJsonObject) {
+                        throw TaskWorkerProtocolException("task worker frame has no data object", "invalid_frame", "data")
+                    }
+                    return TaskWorkerInboundEvent.Envelope(
+                        TaskWorkerProtocol.decode(gson.toJson(data).toByteArray(StandardCharsets.UTF_8))
+                    )
                 }
-                TaskWorkerInboundEvent.Envelope(
-                    TaskWorkerProtocol.decode(gson.toJson(data).toByteArray(StandardCharsets.UTF_8))
-                )
+                "heartbeat_ack" -> return TaskWorkerInboundEvent.HeartbeatAck
+                // 已知但本端不消费的帧：吞掉，继续读下一帧。
+                "node_list_sync", "node_update", "layer_config" -> Unit
+                else -> {
+                    // ★ 2026-10-08（真机闸门根因）：**未知帧不得断连**。
+                    //
+                    //   主仓的节点级查询帧（例如日志聚合按 PC 的 `LOG_REQUEST` 协议下发）此前
+                    //   会落到 `else -> throw` ⇒ 这里的接收循环抛异常 ⇒ **连接被拆**。实测
+                    //   `GET /api/cluster/nodes/log-aggregate` 每调一次 Y700 就断一次（约 1 秒后
+                    //   重连），而 TUI 启动正好会调它 ⇒ 紧随其后的 `POST /api/chat/stream`
+                    //   落进断开窗口被判 `pipeline workers not ready`。
+                    //   协议前向兼容：记一条 WARN 后跳过该帧，连接保持不变。
+                    QlhLogger.w(
+                        "TaskWorkerClient",
+                        "ignoring unknown coordinator frame: " +
+                            (objectValue.get("type")?.asString ?: "(null)"),
+                    )
+                }
             }
-            "heartbeat_ack" -> TaskWorkerInboundEvent.HeartbeatAck
-            "node_list_sync", "node_update", "layer_config" -> receiveEvent()
-            else -> throw TaskWorkerProtocolException("unexpected task worker frame", "invalid_frame", "message")
         }
     }
 

@@ -129,11 +129,19 @@ class TaskWorkerTransportContractTest {
                 readTimeoutMs = 2_000,
             ).connect("127.0.0.1", server.localPort)
             try {
-                transport.receive()
-                assertTrue("invalid outer frame must fail", false)
+                // ★ 2026-10-08（真机闸门根因）：未知外层帧**改为忽略**（协议前向兼容），
+                //   不再断连 —— 主仓的节点级查询帧（如日志聚合的 LOG_REQUEST）曾让它
+                //   把连接拆掉，实测每调一次 `GET /api/cluster/nodes/log-aggregate`
+                //   Y700 就断一次。因此这里既不抛异常，也因为对端随后关闭而返回 null。
+                assertNull(
+                    "unknown outer frame must be ignored, not rejected",
+                    transport.receive(),
+                )
             } catch (error: TaskWorkerProtocolException) {
-                assertEquals("invalid_frame", error.code)
-                assertEquals("message", error.field)
+                assertTrue(
+                    "unknown outer frame must not be rejected (got ${error.code})",
+                    false,
+                )
             } finally {
                 transport.close()
             }
