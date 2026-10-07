@@ -444,6 +444,30 @@ class SocketTaskWorkerTransport(
                     )
                 }
                 "heartbeat_ack" -> return TaskWorkerInboundEvent.HeartbeatAck
+                "stage_chunk" -> {
+                    // ★ 2026-10-08（DIST-NEXT-2b 真机回归暴露）：`stage_chunk` 是**外层帧类型**
+                    //   （主仓 `build_stage_chunk` 用 `build_message("stage_chunk", …)`）。此前这里
+                    //   没有该分支 ⇒ 分片落到下面的 `else` 被当作未知帧**丢弃** ⇒ offer 到达时装配
+                    //   不齐 ⇒ 主节点只看到 `remote Stage response timed out`（真机现象：master 侧
+                    //   `task_worker_stage_chunks_sent chunks=18`，而设备侧 CPU 空闲、一条分片日志
+                    //   都没有）。这里把它解码成 envelope（补上外层类型），交给上层已有的
+                    //   `TaskWorkerProtocol.STAGE_CHUNK -> handleStageChunk(...)` 分支。
+                    val data = objectValue.get("data")
+                    if (data == null || !data.isJsonObject) {
+                        QlhLogger.w(
+                            "TaskWorkerClient",
+                            "stage_chunk rejected: invalid_frame (no data object)",
+                        )
+                    } else {
+                        val payload = data.asJsonObject.deepCopy()
+                        payload.addProperty("type", TaskWorkerProtocol.STAGE_CHUNK)
+                        return TaskWorkerInboundEvent.Envelope(
+                            TaskWorkerProtocol.decode(
+                                gson.toJson(payload).toByteArray(StandardCharsets.UTF_8)
+                            )
+                        )
+                    }
+                }
                 // 已知但本端不消费的帧：吞掉，继续读下一帧。
                 "node_list_sync", "node_update", "layer_config" -> Unit
                 else -> {
