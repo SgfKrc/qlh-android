@@ -351,6 +351,12 @@ class TaskWorkerService : Service() {
                     QlhApplication.instance.inferenceService?.engine
                         ?.requestLayerForwardAbort()
                 },
+                // ★ 2026-10-07（真机 P0）：与上面成对 —— 新 stage 开始前复位中止标志，
+                //   否则「取消后的第一次执行」会被上一次取消的标志直接判失败。
+                clearExecutionAbort = {
+                    QlhApplication.instance.inferenceService?.engine
+                        ?.clearLayerForwardAbort()
+                },
                 ensureModelLoadedForLayer = { range, contextSize, embeddingWidth, wantHidden, sha256 ->
                     awaitInferenceService()
                         ?.ensureLayerModelLoaded(

@@ -2,6 +2,8 @@ package com.qlh.inference.worker
 
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
@@ -153,6 +155,71 @@ class TaskWorkerCancelContractTest {
         }
     }
 
+    @Test
+    fun `cancel releases the attempt slot so the next offer is accepted`() = runBlocking {
+        val transport = RecordingTransport()
+        val handler = AtomicLayerHandler()
+        val client = TaskWorkerClient(
+            host = "127.0.0.1",
+            port = 18824,
+            nodeId = "android_worker_01",
+            capabilities = { workerCapabilities() },
+            transportFactory = { _, _ -> transport },
+            stageHandler = handler,
+        )
+        try {
+            client.start()
+            awaitTrue { transport.messageTypes().contains(TaskWorkerProtocol.HELLO) }
+            transport.push(TaskWorkerProtocol.buildHelloAck(
+                coordinatorNodeId = "master_12345678",
+                accepted = true,
+                selectedVersion = TaskWorkerProtocol.VERSION,
+                reasonCode = "",
+                messageId = "msg_ack_cancelcontract3",
+                sentAtMs = 1_700_000_000_000L,
+            ))
+            awaitTrue {
+                client.snapshot.value.connection == TaskWorkerConnectionState.READY
+            }
+            transport.push(offerEnvelope())
+            awaitTrue { handler.started.isCompleted }
+
+            transport.push(cancelEnvelope())
+            awaitTrue { transport.messageTypes().contains(TaskWorkerProtocol.STAGE_CANCELLED) }
+
+            // ★ 2026-10-07（真机 P0）回归：执行协程被 `executionJob.cancel()` 取消后，
+            //   终态 ACK 与 `machine.cancelled()` 恰恰在那条（已取消的）协程上 ⇒ 收敛必须
+            //   仍然发生，否则 attempt 永远停在 `CANCELLING`。
+            handler.release.set(true)
+            awaitTrue {
+                client.snapshot.value.activeAttempt.state == TaskWorkerAttemptState.CANCELLED
+            }
+            awaitTrue {
+                transport.envelopes(TaskWorkerProtocol.STAGE_CANCELLED).last()
+                    .payload["execution_state"] == TaskWorkerProtocol.EXECUTION_STOPPED
+            }
+
+            // 槽位立即可复用：下一个 attempt（不同 attempt_id / lease）必须被接受，
+            // 而不是 `worker_busy_or_lease_invalid`（现场症状正是后者持续到 lease 过期）。
+            transport.push(secondOfferEnvelope())
+            awaitTrue {
+                transport.envelopes(TaskWorkerProtocol.STAGE_ACCEPT).any {
+                    it.payload["attempt_id"] == secondIdentity.attemptId
+                }
+            }
+            val accept = transport.envelopes(TaskWorkerProtocol.STAGE_ACCEPT)
+                .first { it.payload["attempt_id"] == secondIdentity.attemptId }
+            assertEquals(true, accept.payload["accepted"])
+            assertFalse(
+                "取消之后的 offer 不得再被判 busy",
+                accept.payload["reason_code"] == "worker_busy_or_lease_invalid",
+            )
+        } finally {
+            handler.release.set(true)
+            client.stopAndJoin()
+        }
+    }
+
     private fun workerCapabilities(): Map<String, Any?> = mapOf(
         "stage_types" to listOf("full_inference"),
         "engines" to listOf("llama_cpp"),
@@ -184,6 +251,32 @@ class TaskWorkerCancelContractTest {
         sentAtMs = System.currentTimeMillis(),
     )
 
+    /** 取消之后的下一个 attempt（不同 attempt_id / lease）：用于验证槽位已释放。 */
+    private val secondIdentity = TaskWorkerAttemptIdentity(
+        workflowId = "wf_cancelcontract2",
+        stageId = "candidate_b",
+        attemptId = "att_cancelcontract2",
+        leaseId = "lease_cancelcontract2",
+        leaseEpoch = 1,
+    )
+
+    private fun secondOfferEnvelope(): TaskWorkerEnvelope = TaskWorkerProtocol.buildStageOffer(
+        identity = secondIdentity,
+        requestId = "request_cancelcontract2",
+        stageType = "full_inference",
+        providerId = offeredProviderId,
+        leaseExpiresAtMs = System.currentTimeMillis() + 30_000L,
+        rootInput = mapOf(
+            "message" to "hello again",
+            "max_new_tokens" to 8,
+            "context_size" to 2048,
+        ),
+        dependencies = emptyMap(),
+        modelIdentity = model,
+        messageId = "msg_offer_cancelcontract2",
+        sentAtMs = System.currentTimeMillis(),
+    )
+
     private fun awaitTrue(timeoutMs: Long = 5_000L, predicate: () -> Boolean) {
         val deadline = System.currentTimeMillis() + timeoutMs
         while (System.currentTimeMillis() < deadline) {
@@ -197,7 +290,13 @@ class TaskWorkerCancelContractTest {
         val sent = CopyOnWriteArrayList<TaskWorkerEnvelope>()
         private val inbound = LinkedBlockingQueue<TaskWorkerEnvelope>()
 
+        /**
+         * 真机的 `SocketTaskWorkerTransport.send` 走 `withContext(Dispatchers.IO)` ——
+         * **在已被取消的协程里调用会立刻抛 `CancellationException`**。测试必须先具备这个语义，
+         * 否则「取消后终态 ACK 与槽位释放正在一条被取消的协程上」这个真机缺陷在测试里不可见。
+         */
         override suspend fun send(envelope: TaskWorkerEnvelope) {
+            currentCoroutineContext().ensureActive()
             sent.add(envelope)
         }
 
@@ -243,11 +342,19 @@ class TaskWorkerCancelContractTest {
         override suspend fun execute(offer: TaskWorkerEnvelope): TaskWorkerStageExecution {
             inFlight = true
             started.complete(Unit)
-            val deadline = System.currentTimeMillis() + 5_000L
-            while (!release.get() && System.currentTimeMillis() < deadline) {
-                Thread.sleep(5)
+            try {
+                val deadline = System.currentTimeMillis() + 5_000L
+                while (!release.get() && System.currentTimeMillis() < deadline) {
+                    Thread.sleep(5)
+                }
+            } finally {
+                // ★ 2026-10-07（真机 P0 同源）：`inFlight` 必须在**所有**出口归位 ——
+                //   `Thread.sleep` 被中断时若跳过赋值，就等价于「执行永远不会被观察到已停止」，
+                //   取消收敛会一直等到 30 秒上限。真机的
+                //   `AndroidFullWorkerStageExecutor` 是在 `finally` 里清 `runningIdentity`，
+                //   测试 fake 必须同语义。
+                inFlight = false
             }
-            inFlight = false
             return TaskWorkerStageExecution(output = mapOf("content" to "late result"))
         }
 

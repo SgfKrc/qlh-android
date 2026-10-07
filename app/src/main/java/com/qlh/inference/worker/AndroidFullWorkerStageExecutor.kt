@@ -101,6 +101,16 @@ class AndroidFullWorkerStageExecutor(
      * 报告 `execution_in_flight`，不冒充「执行已停止」。
      */
     private val requestExecutionAbort: () -> Unit = {},
+    /**
+     * ★ 2026-10-07（真机 P0）：**清除**上一次取消留下的引擎中止标志。
+     *
+     * `requestExecutionAbort()` 会把引擎的 abort 置位（native 在下一个可分割边界退出并返回
+     * -4），但取消并不会自动复位它 ⇒ 取消之后的**第一次** `layerForward` 会在引擎入口被判
+     * `layer_forward_aborted` 而直接失败。现场证据：取消收敛成功后的下一个 stage 报
+     * `code=worker_execution_failed detail=layer_forward_aborted`。新 stage 开始前清除，
+     * 才是这个标志的正确生命周期。
+     */
+    private val clearExecutionAbort: () -> Unit = {},
 ) : TaskWorkerStageHandler {
     /**
      * ★ 2026-10-07（DIST-NEXT-1）：当前**正在执行**的 attempt。
@@ -244,6 +254,9 @@ class AndroidFullWorkerStageExecutor(
         payload: Map<String, Any?>,
         advertised: Map<String, Any?>,
     ): TaskWorkerStageExecution {
+        // ★ 2026-10-07（真机 P0）：新 stage 开始前先复位引擎的中止标志 —— 否则上一次取消
+        //   会把「取消后的第一次执行」直接判成 `layer_forward_aborted`。
+        runCatching { clearExecutionAbort() }
         val layerRange = (payload["layer_range"] as? List<*>)
             ?.mapNotNull { (it as? Number)?.toInt() }
             ?: throw AndroidFullWorkerStageException("invalid_layer_range", "layer_range is required")

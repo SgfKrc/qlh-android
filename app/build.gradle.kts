@@ -62,6 +62,14 @@ android {
         }
     }
 
+    testOptions {
+        // ★ 2026-10-07（真机 P0 修复的测试前提）：JVM 单测里 `android.util.Log.*` 默认抛
+        //   `RuntimeException: Method ... not mocked`。`QlhLogger` 每个方法都会调 `Log.*`，
+        //   于是"取消收敛"这条**带日志的关键路径**在测试里会中断 —— 真机缺陷因此被掩盖。
+        //   打开官方的 return-default 语义后，日志调用返回默认值，不参与失败判定。
+        unitTests.isReturnDefaultValues = true
+    }
+
     buildTypes {
         release {
             // ★ 2026-09-30：full/lite 合并后只有一套签名（`keystore.properties`）。

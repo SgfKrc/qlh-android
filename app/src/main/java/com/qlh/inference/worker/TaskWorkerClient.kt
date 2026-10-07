@@ -4,6 +4,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
@@ -593,6 +594,10 @@ class TaskWorkerClient(
             if (!inFlight) {
                 machine.cancelled(identity)
                 publish()
+            } else {
+                // ★ 2026-10-07（真机 P0）：本地取消同样要收敛（此前只依赖执行协程的取消分支，
+                //   而那条路径上的 `send` 会因协程已取消而抛 ⇒ 终态 ACK 与槽位释放一起丢失）。
+                convergeCancellation(current, identity, providerId)
             }
         }
         return true
@@ -718,6 +723,17 @@ class TaskWorkerClient(
         activeProviderId = providerId
         val expires = (payload["lease_expires_at_ms"] as Number).toLong()
         if (!machine.offer(identity, expires, clockMs())) {
+            // ★ 2026-10-07（真机 P0）：拒绝必须留痕。此前设备侧完全没有日志，现场只能从
+            //   主节点看到 `worker_busy_or_lease_invalid`，无法区分「上一个 attempt 未释放
+            //   槽位」还是「lease 过期」。
+            val state = machine.snapshot()
+            QlhLogger.w(
+                "TaskWorkerClient",
+                "stage offer rejected: worker_busy_or_lease_invalid " +
+                    "stage=${identity.stageId} attempt=${identity.attemptId} " +
+                    "activeAttempt=${state.activeAttempt.state} " +
+                    "connection=${state.connection}",
+            )
             connection.send(TaskWorkerProtocol.buildStageAccept(
                 identity, providerId, false, "worker_busy_or_lease_invalid", true,
                 newMessageId("accept"), clockMs(),
@@ -783,6 +799,13 @@ class TaskWorkerClient(
                     val errorCode = (error as? AndroidFullWorkerStageException)?.code
                         ?: "worker_execution_failed"
                     if (machine.fail(identity, errorCode, retryable = true)) {
+                        // ★ 2026-10-07（真机 P0）：执行失败必须留设备侧证据（此前完全静默）。
+                        QlhLogger.e(
+                            "TaskWorkerClient",
+                            "stage execution failed: stage=${identity.stageId} " +
+                                "attempt=${identity.attemptId} code=$errorCode " +
+                                "detail=${error.message ?: error.javaClass.simpleName}",
+                        )
                         connection.send(TaskWorkerProtocol.buildStageError(
                             identity, providerId, errorCode, true,
                             newMessageId("error"), clockMs(),
@@ -898,6 +921,55 @@ class TaskWorkerClient(
             else TaskWorkerProtocol.EXECUTION_STOPPED,
         )
         if (!inFlight && machine.cancelled(identity)) publish()
+        if (inFlight) convergeCancellation(connection, identity, providerId)
+    }
+
+    /**
+     * ★ 2026-10-07（真机 P0）：等执行真正停止后补发终态、释放槽位。
+     *
+     * 必须跑在**独立且不可取消**的协程里：`executionJob.cancel()` 之后，执行协程上的任何挂起
+     * （包括 `send`）都会立刻抛 `CancellationException`，把「终态 ACK + 槽位释放」一起带走 ⇒
+     * attempt 卡在 `CANCELLING`（`ACTIVE_ATTEMPT_STATES`）⇒ 之后每个 `stage_offer` 都被拒
+     * `worker_busy_or_lease_invalid`，直到 lease 过期。协调方取消（`handleCancel`）与
+     * worker 侧主动取消（`cancelActive`）共用这一条收敛路径。
+     */
+    private fun convergeCancellation(
+        connection: TaskWorkerTransport,
+        identity: TaskWorkerAttemptIdentity,
+        providerId: String,
+    ) {
+        scope.launch {
+            withContext(NonCancellable) {
+                val deadline = clockMs() + CANCEL_STOP_WAIT_MS
+                while (stageHandler?.isExecutionInFlight(identity) == true &&
+                    clockMs() < deadline
+                ) {
+                    delay(CANCEL_STOP_POLL_MS)
+                }
+                val stopped = stageHandler?.isExecutionInFlight(identity) != true
+                // ⚠️ 先收敛、后记日志：槽位释放是这条路径上**唯一**不可省的副作用。
+                //   （日志走 `android.util.Log`，在某些环境会抛异常；顺序反了会让「取消后
+                //   worker 假死」在那些环境里复现。）
+                finishCancelledExecution(connection, identity, providerId)
+                runCatching {
+                    if (stopped) {
+                        QlhLogger.i(
+                            "TaskWorkerClient",
+                            "cancel converged: attempt=${identity.attemptId} " +
+                                "execution stopped, slot released",
+                        )
+                    } else {
+                        // 超时也要释放槽位：卡在 `CANCELLING` 会让 worker 对后续所有 stage
+                        // 假死，比「旧前向可能仍在飞」更严重（主节点侧仍有 lease/attempt 护栏）。
+                        QlhLogger.w(
+                            "TaskWorkerClient",
+                            "cancel convergence timed out after ${CANCEL_STOP_WAIT_MS}ms " +
+                                "attempt=${identity.attemptId}: releasing the attempt slot",
+                        )
+                    }
+                }
+            }
+        }
     }
 
     /** 该 attempt 是否已进入取消（`CANCELLING`）—— 决定是否还能发结果/错误。 */
@@ -905,6 +977,20 @@ class TaskWorkerClient(
         val active = machine.snapshot().activeAttempt
         return active.identity == identity &&
             active.state == TaskWorkerAttemptState.CANCELLING
+    }
+
+    /**
+     * ★ 2026-10-07（真机 P0）：该 attempt 是否处于**取消家族**状态。
+     *
+     * 取消收敛有两条可能路径（执行协程的取消分支、独立收敛协程），谁先到都可能把状态推进到
+     * `CANCELLED`。若终态 ACK 仍以 `CANCELLING` 为门槛，后到的那条就会**跳过发送** ——
+     * 主节点因此只看到 `execution_in_flight`（现场正是如此）。重复发送由
+     * [sendCancelledAck] 的同状态去重负责，所以这里放宽到 `CANCELLED` 也允许。
+     */
+    private fun isAttemptCancellingOrDone(identity: TaskWorkerAttemptIdentity): Boolean {
+        val active = machine.snapshot().activeAttempt
+        return active.identity == identity &&
+            active.state in CANCELLING_STATES
     }
 
     /**
@@ -919,16 +1005,21 @@ class TaskWorkerClient(
         identity: TaskWorkerAttemptIdentity,
         providerId: String,
     ) {
-        if (!isAttemptCancelling(identity)) return
+        if (!isAttemptCancellingOrDone(identity)) return
         val reasonCode = synchronized(cancelLock) {
             if (cancelAckAttemptId == identity.attemptId) cancelAckReasonCode
             else "cancelled"
         }
-        sendCancelledAck(
-            connection, identity, providerId, reasonCode,
-            TaskWorkerProtocol.EXECUTION_STOPPED,
-        )
-        if (machine.cancelled(identity)) publish()
+        try {
+            sendCancelledAck(
+                connection, identity, providerId, reasonCode,
+                TaskWorkerProtocol.EXECUTION_STOPPED,
+            )
+        } finally {
+            // ★ 2026-10-07（真机 P0）：槽位释放**不得**依赖 ACK 是否送达 —— 连接可能已断、
+            //   协程可能已被取消。否则 attempt 卡在 `CANCELLING` ⇒ 后续 offer 全被拒。
+            if (machine.cancelled(identity)) publish()
+        }
     }
 
     /**
@@ -941,16 +1032,14 @@ class TaskWorkerClient(
         reasonCode: String,
         executionState: String,
     ) {
-        synchronized(cancelLock) {
-            if (cancelAckAttemptId == identity.attemptId &&
-                cancelAckState == executionState
-            ) {
-                return
-            }
-            cancelAckAttemptId = identity.attemptId
-            cancelAckState = executionState
-            cancelAckReasonCode = reasonCode
+        // ★ 2026-10-07（真机 P0）：去重标记必须代表「**已成功发送**」这个事实。
+        //   此前是在发送**之前**写标记：执行协程里的那次发送会抛 `CancellationException`
+        //   （协程已被 `executionJob.cancel()` 取消），标记却已置位 ⇒ 独立收敛协程被去重挡掉
+        //   ⇒ 终态 `execution_stopped` ACK 永远发不出去（现场只看到 `execution_in_flight`）。
+        val shouldSend = synchronized(cancelLock) {
+            !(cancelAckAttemptId == identity.attemptId && cancelAckState == executionState)
         }
+        if (!shouldSend) return
         connection.send(TaskWorkerProtocol.buildStageCancelled(
             identity = identity,
             providerId = providerId,
@@ -959,6 +1048,11 @@ class TaskWorkerClient(
             sentAtMs = clockMs(),
             executionState = executionState,
         ))
+        synchronized(cancelLock) {
+            cancelAckAttemptId = identity.attemptId
+            cancelAckState = executionState
+            cancelAckReasonCode = reasonCode
+        }
         publish()
     }
 
@@ -999,5 +1093,24 @@ class TaskWorkerClient(
          * health 超时。此前这个数字只在这里硬编码，主仓侧没有任何记录。
          */
         const val HEARTBEAT_INTERVAL_MS: Long = 15_000L
+
+        /**
+         * ★ 2026-10-07（真机 P0）：取消收敛的等待上限。
+         *
+         * native 层段前向是原子调用，`executionJob.cancel()` 打断不了它；取消到达后我们
+         * **必须**在没有执行在飞时释放 attempt 槽位，否则后续每个 `stage_offer` 都被拒
+         * `worker_busy_or_lease_invalid`（真机实测：直到 lease 过期才恢复）。等待到上限仍
+         * 未停止时也会释放槽位，并留 `QlhLogger.w` 证据。
+         */
+        const val CANCEL_STOP_WAIT_MS: Long = 30_000L
+
+        /** 取消收敛的轮询间隔。 */
+        const val CANCEL_STOP_POLL_MS: Long = 50L
+
+        /** ★ 2026-10-07（真机 P0）：取消家族状态 —— 终态 ACK 的允许集合。 */
+        private val CANCELLING_STATES = setOf(
+            TaskWorkerAttemptState.CANCELLING,
+            TaskWorkerAttemptState.CANCELLED,
+        )
     }
 }
