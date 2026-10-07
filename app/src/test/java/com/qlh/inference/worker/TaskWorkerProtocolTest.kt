@@ -568,6 +568,95 @@ class TaskWorkerProtocolTest {
     }
 
     @Test
+    fun `DIST-NEXT-6 hello advertises unusable artifact reasons without paths`() {
+        val hello = TaskWorkerProtocol.buildHello(
+            nodeId = "android_worker_01",
+            capabilities = mapOf(
+                "stage_types" to listOf("layer_forward"),
+                "engines" to listOf("llama_cpp"),
+                "models" to listOf(model),
+                "max_concurrency" to 1,
+                "layer_artifact_diagnostics" to listOf(
+                    artifactDiagnostic(
+                        errorCode = "artifact_missing",
+                        manifest = "mid.manifest.json",
+                        mode = "middle",
+                        layerRange = listOf(4, 16),
+                    ),
+                    artifactDiagnostic(
+                        errorCode = "manifest_unreadable",
+                        manifest = "gone.manifest.json",
+                        mode = "",
+                        layerRange = null,
+                    ),
+                ),
+            ),
+            messageId = "msg_hello_artifactdiag1",
+            sentAtMs = 1_700_000_000_000L,
+        )
+
+        val decoded = TaskWorkerProtocol.decode(TaskWorkerProtocol.encode(hello))
+        val capabilities = decoded.payload["capabilities"] as Map<*, *>
+        val diagnostics = capabilities["layer_artifact_diagnostics"] as List<*>
+        assertEquals(2, diagnostics.size)
+        assertEquals(
+            "artifact_missing",
+            (diagnostics[0] as Map<*, *>)["error_code"],
+        )
+    }
+
+    @Test
+    fun `DIST-NEXT-6 artifact diagnostics are validated fail closed`() {
+        fun helloWith(value: Any?): TaskWorkerEnvelope = TaskWorkerProtocol.buildHello(
+            nodeId = "android_worker_01",
+            capabilities = mapOf(
+                "stage_types" to listOf("layer_forward"),
+                "engines" to listOf("llama_cpp"),
+                "models" to listOf(model),
+                "max_concurrency" to 1,
+                "layer_artifact_diagnostics" to value,
+            ),
+            messageId = "msg_hello_artifactdiag2",
+            sentAtMs = 1_700_000_000_000L,
+        )
+
+        // 空列表没有信息量：要么不给该键，要么给非空列表
+        expectProtocolError("invalid_capabilities") { helloWith(emptyList<Any?>()) }
+
+        // error code 值域封闭
+        expectProtocolError("invalid_capabilities") {
+            helloWith(listOf(artifactDiagnostic(errorCode = "whatever")))
+        }
+
+        // 键集固定：携带本地路径的额外键会被拒
+        expectRejected {
+            helloWith(listOf(artifactDiagnostic(extra = mapOf("path" to "/sdcard/models/x.gguf"))))
+        }
+
+        // 合法项通过（含 layer_range = null 的「读不到 manifest」）
+        TaskWorkerProtocol.validate(helloWith(listOf(
+            artifactDiagnostic(errorCode = "artifact_digest_mismatch", manifest = "x.manifest.json"),
+        )))
+    }
+
+    private fun artifactDiagnostic(
+        errorCode: String = "artifact_missing",
+        manifest: String = "mid.manifest.json",
+        architecture: String = "qwen35",
+        mode: String = "middle",
+        layerRange: List<Int>? = listOf(4, 16),
+        artifactPresent: Boolean = false,
+        extra: Map<String, Any?> = emptyMap(),
+    ): Map<String, Any?> = mapOf(
+        "error_code" to errorCode,
+        "manifest" to manifest,
+        "architecture" to architecture,
+        "mode" to mode,
+        "layer_range" to layerRange,
+        "artifact_present" to artifactPresent,
+    ) + extra
+
+    @Test
     fun `DIST-NEXT-2 hidden wire budget matches the master frame limit`() {
         // 与主仓 `task_worker_protocol.hidden_wire_bytes` 同公式、同常量
         assertEquals(5_462L, TaskWorkerProtocol.hiddenWireBytes(1_024L))

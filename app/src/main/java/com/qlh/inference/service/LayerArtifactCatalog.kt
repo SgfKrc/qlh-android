@@ -3,6 +3,7 @@ package com.qlh.inference.service
 import com.google.gson.JsonArray
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
+import com.qlh.inference.service.ModelManager.LayerArtifact
 import java.io.File
 
 /** Metadata required to bind one GGUF artifact to a source-model layer range. */
@@ -30,8 +31,7 @@ data class LayerArtifactDescriptor(
 )
 
 /** Parser for the main repository's layer artifact manifests. */
-object LayerArtifactManifestParser {
-    private val sha256Pattern = Regex("[0-9a-fA-F]{64}")
+object LayerArtifactManifestParser {    private val sha256Pattern = Regex("[0-9a-fA-F]{64}")
     private val segmentModes = setOf("head", "middle", "tail")
 
     fun parse(raw: String, manifestName: String): Result<LayerArtifactDescriptor> = runCatching {
@@ -91,4 +91,177 @@ object LayerArtifactManifestParser {
 
     private fun string(root: JsonObject, name: String): String =
         root.get(name)?.takeUnless { it.isJsonNull }?.asString?.trim().orEmpty()
+}
+
+/**
+ * ★ 2026-10-07（DIST-NEXT-6）：单条层段 manifest 的**结构化判定**。
+ *
+ * `listLayerArtifacts` 保留 fail-closed（不可用工件绝不返回），但不再把它静默丢掉：
+ * 每条 manifest 都留下稳定 `errorCode` 与已解析出的身份字段，使「读不到 manifest」
+ * 「manifest 非法」「工件文件不存在」「摘要不符」「不属于本次请求的源模型」可区分 ——
+ * 此前这些都被压成同一个「没有该区间」。
+ *
+ * **路径纪律**：本地路径/URI 只留在日志与本地诊断 API；[toAdvertisement] 是能力
+ * 广告用的那一行，键集固定且不含路径（主仓 `_validate_capabilities` 精确校验它）。
+ */
+data class LayerArtifactDiagnostic(
+    val manifestName: String,
+    val errorCode: String,
+    val detail: String = "",
+    val artifactName: String = "",
+    val startLayer: Int? = null,
+    val endLayerExclusive: Int? = null,
+    val architecture: String = "",
+    val mode: String = "",
+    val sourceModelSha256: String = "",
+    val artifactSha256: String = "",
+    val artifactPresent: Boolean = false,
+    val artifactSizeBytes: Long = 0L,
+) {
+    val usable: Boolean get() = errorCode == ERROR_OK
+
+    /** 能力广告用的一行（无本地路径）。 */
+    fun toAdvertisement(): Map<String, Any?> = mapOf(
+        "error_code" to errorCode,
+        "manifest" to manifestName,
+        "architecture" to architecture,
+        "mode" to mode,
+        "layer_range" to if (startLayer != null && endLayerExclusive != null) {
+            listOf(startLayer, endLayerExclusive)
+        } else {
+            null
+        },
+        "artifact_present" to artifactPresent,
+    )
+
+    companion object {
+        const val ERROR_OK = ""
+        const val MANIFEST_UNREADABLE = "manifest_unreadable"
+        const val MANIFEST_INVALID = "manifest_invalid"
+        const val SOURCE_DIGEST_MISMATCH = "source_digest_mismatch"
+        const val ARTIFACT_MISSING = "artifact_missing"
+        const val ARTIFACT_DIGEST_MISMATCH = "artifact_digest_mismatch"
+    }
+}
+
+/** ★ 2026-10-07（DIST-NEXT-6）：一次层段扫描的结果 —— 可用工件 + 全部判定。 */
+data class LayerArtifactInventory(
+    val artifacts: List<LayerArtifact>,
+    val diagnostics: List<LayerArtifactDiagnostic>,
+    /** 扫描根：`saf`（SAF tree）或 `internal`（`filesDir/models`）。 */
+    val root: String,
+    val manifestCount: Int,
+    val artifactFileCount: Int,
+) {
+    val failures: List<LayerArtifactDiagnostic> get() = diagnostics.filterNot { it.usable }
+
+    fun failureCounts(): Map<String, Int> =
+        failures.groupingBy { it.errorCode }.eachCount()
+}
+
+/** ★ 2026-10-07（DIST-NEXT-6）：IO 层对工件文件的探测结果（判定逻辑的输入）。 */
+data class LayerArtifactProbe(
+    val sizeBytes: Long,
+    val digestMatches: Boolean,
+)
+
+/** ★ 2026-10-07（DIST-NEXT-6）：一条 manifest 的判定（诊断 + 可用时的描述符）。 */
+data class LayerArtifactClassification(
+    val diagnostic: LayerArtifactDiagnostic,
+    val descriptor: LayerArtifactDescriptor? = null,
+) {
+    val usable: Boolean get() = diagnostic.usable
+}
+
+/**
+ * ★ 2026-10-07（DIST-NEXT-6）：**纯函数**判定一条 manifest 是否可用（fail-closed）。
+ *
+ * 判定顺序即原因优先级，六种结果互斥且各有稳定 error code：
+ * 读不到 → `manifest_unreadable`；解析/字段非法 → `manifest_invalid`；
+ * 不属于本次请求的源模型 → `source_digest_mismatch`；
+ * 工件文件不在根目录 → `artifact_missing`；摘要不符 → `artifact_digest_mismatch`；
+ * 全部通过 → 可用（[LayerArtifactDiagnostic.ERROR_OK]）。
+ *
+ * 判定逻辑集中在这里（而不是散落在扫描循环）才能被单测锁住；IO 与摘要计算由
+ * 调用方通过 [probeArtifact] 注入。
+ */
+fun classifyLayerArtifact(
+    manifestName: String,
+    raw: String?,
+    expectedModelSha256: String = "",
+    probeArtifact: (LayerArtifactDescriptor) -> LayerArtifactProbe?,
+): LayerArtifactClassification {
+    if (raw == null) {
+        return LayerArtifactClassification(
+            LayerArtifactDiagnostic(
+                manifestName = manifestName,
+                errorCode = LayerArtifactDiagnostic.MANIFEST_UNREADABLE,
+                detail = "manifest could not be read",
+            ),
+        )
+    }
+    val parsed = LayerArtifactManifestParser.parse(raw, manifestName)
+    val descriptor = parsed.getOrNull()
+    if (descriptor == null) {
+        return LayerArtifactClassification(
+            LayerArtifactDiagnostic(
+                manifestName = manifestName,
+                errorCode = LayerArtifactDiagnostic.MANIFEST_INVALID,
+                detail = parsed.exceptionOrNull()?.message ?: "manifest did not parse",
+            ),
+        )
+    }
+    val identity = LayerArtifactDiagnostic(
+        manifestName = manifestName,
+        errorCode = LayerArtifactDiagnostic.ERROR_OK,
+        artifactName = descriptor.artifactName,
+        startLayer = descriptor.startLayer,
+        endLayerExclusive = descriptor.endLayerExclusive,
+        architecture = descriptor.architecture,
+        mode = descriptor.mode,
+        sourceModelSha256 = descriptor.sourceModelSha256,
+        artifactSha256 = descriptor.artifactSha256,
+    )
+    val expected = expectedModelSha256.trim().lowercase()
+    if (
+        expected.isNotEmpty() &&
+        descriptor.sourceModelSha256 != expected &&
+        descriptor.artifactSha256 != expected
+    ) {
+        return LayerArtifactClassification(
+            identity.copy(
+                errorCode = LayerArtifactDiagnostic.SOURCE_DIGEST_MISMATCH,
+                detail = "manifest belongs to another source model",
+            ),
+            descriptor,
+        )
+    }
+    val probe = probeArtifact(descriptor)
+    if (probe == null) {
+        return LayerArtifactClassification(
+            identity.copy(
+                errorCode = LayerArtifactDiagnostic.ARTIFACT_MISSING,
+                detail = "artifact file is not present in the model root",
+            ),
+            descriptor,
+        )
+    }
+    if (!probe.digestMatches) {
+        return LayerArtifactClassification(
+            identity.copy(
+                errorCode = LayerArtifactDiagnostic.ARTIFACT_DIGEST_MISMATCH,
+                detail = "artifact digest does not match the manifest",
+                artifactPresent = true,
+                artifactSizeBytes = probe.sizeBytes,
+            ),
+            descriptor,
+        )
+    }
+    return LayerArtifactClassification(
+        identity.copy(
+            artifactPresent = true,
+            artifactSizeBytes = probe.sizeBytes,
+        ),
+        descriptor,
+    )
 }

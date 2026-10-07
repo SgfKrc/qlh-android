@@ -125,10 +125,11 @@ class TaskWorkerService : Service() {
             )
         }
         val buildCapabilities: suspend () -> Map<String, Any?> = suspend {
-            val layerArtifacts = modelManager.listLayerArtifacts(
+            val inventory = modelManager.scanLayerArtifacts(
                 expectedModelSha256 = modelSha256,
                 verifyArtifactDigest = true,
-            ).getOrNull().orEmpty()
+            ).getOrNull()
+            val layerArtifacts = inventory?.artifacts.orEmpty()
             verifiedLayerArtifacts.set(layerArtifacts.toList())
             val layerRanges = layerArtifacts
                 .map { listOf(it.startLayer, it.endLayerExclusive) }
@@ -188,6 +189,10 @@ class TaskWorkerService : Service() {
                 nPosPerEmbd = layerForwardInfo["n_pos_per_embd"]?.toIntOrNull(),
                 layerBudget = layerBudget,
                 layerArtifacts = advertisedLayerArtifacts,
+                // ★ 2026-10-07（DIST-NEXT-6）：不可用工件的结构化原因（无本地路径）。
+                layerArtifactDiagnostics = inventory?.failures
+                    ?.map { it.toAdvertisement() }
+                    .orEmpty(),
             )
             QlhLogger.i(
                 "TaskWorkerService",

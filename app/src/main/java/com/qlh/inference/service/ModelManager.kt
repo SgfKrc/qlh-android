@@ -55,6 +55,16 @@ class ModelManager(private val context: Context) {
 
     private val settings = SettingsDataStore(context)
 
+    /**
+     * ★ 2026-10-07（DIST-NEXT-6）：最近一次层段工件扫描的结构化结果（含失败原因）。
+     *
+     * 供本地诊断 / UI 查询；跨端只上报 [LayerArtifactDiagnostic.toAdvertisement]
+     * 那一行（无本地路径）。
+     */
+    @Volatile
+    var lastLayerArtifactInventory: LayerArtifactInventory? = null
+        private set
+
     private val httpClient = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(300, TimeUnit.SECONDS)
@@ -290,15 +300,37 @@ class ModelManager(private val context: Context) {
         }
     }
 
-    /** Return manifests whose artifact files are present in the selected model root. */
+    /**
+     * Return manifests whose artifact files are present in the selected model root.
+     *
+     * ★ 2026-10-07（DIST-NEXT-6）：fail-closed 语义不变（不可用工件绝不返回），
+     * 但**不再静默** —— 需要原因的调用方用 [scanLayerArtifacts] 拿结构化诊断。
+     */
     suspend fun listLayerArtifacts(
         expectedModelSha256: String = "",
         verifyArtifactDigest: Boolean = false,
-    ): Result<List<LayerArtifact>> = withContext(Dispatchers.IO) {
+    ): Result<List<LayerArtifact>> =
+        scanLayerArtifacts(expectedModelSha256, verifyArtifactDigest)
+            .map { it.artifacts }
+
+    /**
+     * ★ 2026-10-07（DIST-NEXT-6）：扫描层段工件并**保留每条 manifest 的判定**。
+     *
+     * 旧实现把「读不到 manifest」「manifest 非法」「工件文件不存在」「摘要不符」
+     * 一律 `continue`，返回空/部分列表 ⇒ 主节点只看到 `layer_range_not_advertised`
+     * 或没有可用 worker，看不出是哪一条、为什么。这里为每条 manifest 产出
+     * [LayerArtifactDiagnostic]（稳定 error code + 已解析出的身份字段），
+     * 并逐条写日志；本地路径只留在日志与 [lastLayerArtifactInventory]。
+     */
+    suspend fun scanLayerArtifacts(
+        expectedModelSha256: String = "",
+        verifyArtifactDigest: Boolean = false,
+    ): Result<LayerArtifactInventory> = withContext(Dispatchers.IO) {
         try {
             val treeUri = getSavedTreeUri()
-            val modelDocuments = if (treeUri != null && hasPersistedPermission(treeUri)) {
-                listSafModels(treeUri)
+            val usingTree = treeUri != null && hasPersistedPermission(treeUri)
+            val modelDocuments = if (usingTree) {
+                listSafModels(treeUri!!)
             } else {
                 modelsDir.listFiles { file ->
                     file.isFile && file.name.endsWith(GGUF_EXTENSION, true)
@@ -306,8 +338,8 @@ class ModelManager(private val context: Context) {
                     ModelDocument(it.name, Uri.fromFile(it), it.length(), ModelSource.INTERNAL)
                 }.orEmpty()
             }
-            val manifests = if (treeUri != null && hasPersistedPermission(treeUri)) {
-                listSafFiles(treeUri, setOf(JSON_EXTENSION))
+            val manifests = if (usingTree) {
+                listSafFiles(treeUri!!, setOf(JSON_EXTENSION))
             } else {
                 modelsDir.listFiles { file ->
                     file.isFile && file.name.endsWith(JSON_EXTENSION, true)
@@ -317,25 +349,40 @@ class ModelManager(private val context: Context) {
             }
             val expected = expectedModelSha256.trim().lowercase()
             val output = mutableListOf<LayerArtifact>()
+            val diagnostics = mutableListOf<LayerArtifactDiagnostic>()
             for (manifest in manifests) {
-                val raw = readDocument(manifest.uri) ?: continue
-                val descriptor = LayerArtifactManifestParser
-                    .parse(raw, manifest.name).getOrNull() ?: continue
-                if (
-                    expected.isNotBlank() &&
-                    descriptor.sourceModelSha256 != expected &&
-                    descriptor.artifactSha256 != expected
-                ) continue
+                val classification = classifyLayerArtifact(
+                    manifestName = manifest.name,
+                    raw = readDocument(manifest.uri),
+                    expectedModelSha256 = expected,
+                    probeArtifact = { descriptor ->
+                        val probed = modelDocuments.firstOrNull {
+                            it.name.equals(descriptor.artifactName, ignoreCase = true)
+                        } ?: return@classifyLayerArtifact null
+                        LayerArtifactProbe(
+                            sizeBytes = probed.sizeBytes,
+                            digestMatches = !verifyArtifactDigest ||
+                                computeSha256(probed.uri).equals(
+                                    descriptor.artifactSha256, ignoreCase = true,
+                                ),
+                        )
+                    },
+                )
+                diagnostics += classification.diagnostic
+                val descriptor = classification.descriptor
+                if (!classification.usable || descriptor == null) {
+                    Log.w(
+                        TAG,
+                        "layer artifact unusable: manifest=${manifest.name} " +
+                            "code=${classification.diagnostic.errorCode} " +
+                            "detail=${classification.diagnostic.detail}",
+                    )
+                    continue
+                }
                 val document = modelDocuments.firstOrNull {
                     it.name.equals(descriptor.artifactName, ignoreCase = true)
                 } ?: continue
-                if (verifyArtifactDigest &&
-                    computeSha256(document.uri).equals(descriptor.artifactSha256, ignoreCase = true).not()
-                ) {
-                    Log.w(TAG, "layer artifact digest mismatch: ${document.name}")
-                    continue
-                }
-                output += LayerArtifact(
+                val artifact = LayerArtifact(
                     document = document,
                     manifest = manifest,
                     startLayer = descriptor.startLayer,
@@ -346,8 +393,38 @@ class ModelManager(private val context: Context) {
                     // ★ 2026-10-05（DIST-3）：段类型透传（`head`/`middle`/`tail`）。
                     mode = descriptor.mode,
                 )
+                output += artifact
             }
-            Result.success(output.distinctBy { "${it.startLayer}:${it.endLayerExclusive}:${it.document.uri}" })
+            val inventory = LayerArtifactInventory(
+                artifacts = output.distinctBy {
+                    "${it.startLayer}:${it.endLayerExclusive}:${it.document.uri}"
+                },
+                diagnostics = diagnostics,
+                root = if (usingTree) "saf" else "internal",
+                manifestCount = manifests.size,
+                artifactFileCount = modelDocuments.size,
+            )
+            lastLayerArtifactInventory = inventory
+            for (diagnostic in diagnostics) {
+                Log.i(
+                    TAG,
+                    "layer artifact: manifest=${diagnostic.manifestName} " +
+                        "code=${diagnostic.errorCode.ifBlank { "ok" }} " +
+                        "range=[${diagnostic.startLayer},${diagnostic.endLayerExclusive}) " +
+                        "artifact=${diagnostic.artifactName} " +
+                        "mode=${diagnostic.mode} arch=${diagnostic.architecture} " +
+                        "source_sha=${diagnostic.sourceModelSha256.take(12)} " +
+                        "artifact_sha=${diagnostic.artifactSha256.take(12)} " +
+                        "detail=${diagnostic.detail}",
+                )
+            }
+            Log.i(
+                TAG,
+                "layer artifact scan: root=${inventory.root} " +
+                    "manifests=${inventory.manifestCount} files=${inventory.artifactFileCount} " +
+                    "usable=${inventory.artifacts.size} failures=${inventory.failureCounts()}",
+            )
+            Result.success(inventory)
         } catch (error: Exception) {
             Log.e(TAG, "layer artifact scan failed", error)
             Result.failure(error)

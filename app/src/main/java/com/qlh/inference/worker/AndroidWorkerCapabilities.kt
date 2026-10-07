@@ -84,6 +84,12 @@ object AndroidWorkerCapabilities {
      */
     val SUPPORTED_ENGINES: List<String> = listOf("llama_cpp")
 
+    /**
+     * ★ 2026-10-07（DIST-NEXT-6）：能力广告里携带的工件诊断条数上限。
+     * 广告是控制面消息，不承载病态目录的完整清单。
+     */
+    const val MAX_ARTIFACT_DIAGNOSTICS: Int = 32
+
     /** 默认引擎（用于未显式指定引擎的模型身份）。 */
     val DEFAULT_ENGINE: String = SUPPORTED_ENGINES.first()
 
@@ -250,6 +256,14 @@ object AndroidWorkerCapabilities {
         layerBudget: LayerBudget? = null,
         /** Per-artifact records; unlike the legacy global mode these cannot conflate ranges. */
         layerArtifacts: List<LayerArtifactCapability> = emptyList(),
+        /**
+         * ★ 2026-10-07（DIST-NEXT-6）：**不可用**层段工件的结构化原因（无本地路径）。
+         *
+         * 广告可用工件时同时说明「哪些 manifest 被判不可用、因为什么」—— 否则主节点
+         * 只能看到 `layer_range_not_advertised`，无法区分「文件不存在」「摘要不符」
+         * 「架构/模式非法」与「没有该区间」。
+         */
+        layerArtifactDiagnostics: List<Map<String, Any?>> = emptyList(),
     ): Map<String, Any?> {
         require(
             layerArtifacts.map { it.startLayer to it.endLayerExclusive }.distinct().size ==
@@ -312,6 +326,12 @@ object AndroidWorkerCapabilities {
             layerArtifacts.map { it.segmentMode }.distinct().singleOrNull()?.let {
                 capabilities["segment_mode"] = it
             }
+        }
+        // ★ 2026-10-07（DIST-NEXT-6）：把**不可用**工件的原因一并广告出去（不含本地路径）。
+        //   上限 32 条：广告是控制面消息，不承载病态目录的完整清单。
+        if (layerArtifactDiagnostics.isNotEmpty()) {
+            capabilities["layer_artifact_diagnostics"] =
+                layerArtifactDiagnostics.take(MAX_ARTIFACT_DIAGNOSTICS)
         }
         return capabilities
     }

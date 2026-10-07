@@ -478,7 +478,14 @@ object TaskWorkerProtocol {
                 //   只改一边会让对端 hello 自校验失败 —— hello 根本发不出去，
                 //   连接注册成功后 0.7s 静默断开，双方都不留日志（实测踩到）。
                 (if (capabilities.containsKey("segment_mode")) setOf("segment_mode") else emptySet()) +
-                (if (capabilities.containsKey("layer_artifacts")) setOf("layer_artifacts") else emptySet()),
+                (if (capabilities.containsKey("layer_artifacts")) setOf("layer_artifacts") else emptySet()) +
+                // ★ 2026-10-07（DIST-NEXT-6）：不可用工件的结构化原因（可选，向后兼容）。
+                //   与其余可选键同样按「出现才允许」处理；两侧必须同时放行。
+                (if (capabilities.containsKey("layer_artifact_diagnostics")) {
+                    setOf("layer_artifact_diagnostics")
+                } else {
+                    emptySet()
+                }),
                 "payload.capabilities",
         )
         if (capabilities.containsKey("runtime_profile")) {
@@ -538,6 +545,11 @@ object TaskWorkerProtocol {
                     "payload.capabilities.layer_budget",
                 )
             }
+        }
+        // ★ 2026-10-07（DIST-NEXT-6）：不可用层段工件的结构化原因（可选键）。
+        //   与主仓 `_validate_layer_artifact_diagnostics` 同键集、同值域。
+        if (capabilities.containsKey("layer_artifact_diagnostics")) {
+            validateLayerArtifactDiagnostics(capabilities["layer_artifact_diagnostics"])
         }
         val stageTypes = stringList(capabilities, "stage_types")
         if (!AndroidWorkerCapabilities.areAllStageTypesSupported(stageTypes)) {
@@ -882,6 +894,99 @@ object TaskWorkerProtocol {
      * * `keep_head_layer_out` —— `layer_inp` 的 `lid == n_layer` 槽位，返回**末层输出**。
      */
     private val layerForwardMiddleChannels = setOf("extract_hidden", "keep_head_layer_out")
+
+    /**
+     * ★ 2026-10-07（DIST-NEXT-6）：层段工件诊断的稳定 error code 与上限 ——
+     * 与主仓 `_LAYER_ARTIFACT_DIAGNOSTIC_CODES` / `_LAYER_ARTIFACT_DIAGNOSTIC_MAX` 同集合。
+     */
+    private val layerArtifactDiagnosticCodes = setOf(
+        "manifest_unreadable", "manifest_invalid", "source_digest_mismatch",
+        "artifact_missing", "artifact_digest_mismatch",
+    )
+    private val layerArtifactSegmentModes = setOf("head", "middle", "tail")
+    private const val MAX_LAYER_ARTIFACT_DIAGNOSTICS = 32
+
+    /**
+     * 校验不可用层段工件的诊断广告：键集固定、**不含本地路径**。
+     *
+     * 与主仓 `task_worker_protocol._validate_layer_artifact_diagnostics` 逐条对称 ——
+     * 只改一侧会让对端 hello 自校验失败（连接建立后静默断开）。
+     */
+    private fun validateLayerArtifactDiagnostics(value: Any?) {
+        val field = "payload.capabilities.layer_artifact_diagnostics"
+        val entries = value as? List<*>
+        if (
+            entries == null ||
+            entries.isEmpty() ||
+            entries.size > MAX_LAYER_ARTIFACT_DIAGNOSTICS
+        ) {
+            fail(
+                "layer_artifact_diagnostics must be a non-empty list with at most " +
+                    "$MAX_LAYER_ARTIFACT_DIAGNOSTICS entries",
+                "invalid_capabilities",
+                field,
+            )
+        }
+        entries.forEachIndexed { index, raw ->
+            val itemField = "$field[$index]"
+            val entry = (raw as? Map<*, *>)?.entries
+                ?.associate { it.key.toString() to it.value }
+                ?: fail(
+                    "layer artifact diagnostic must be an object",
+                    "invalid_capabilities",
+                    itemField,
+                )
+            requireExact(
+                entry.keys,
+                setOf(
+                    "error_code", "manifest", "architecture", "mode",
+                    "layer_range", "artifact_present",
+                ),
+                itemField,
+            )
+            val errorCode = string(entry, "error_code")
+            if (errorCode !in layerArtifactDiagnosticCodes) {
+                fail(
+                    "error_code must be one of " +
+                        layerArtifactDiagnosticCodes.joinToString(", "),
+                    "invalid_capabilities",
+                    "$itemField.error_code",
+                )
+            }
+            requirePattern(string(entry, "manifest"), safeId, "$itemField.manifest")
+            requirePattern(
+                string(entry, "architecture", allowEmpty = true),
+                safeId,
+                "$itemField.architecture",
+            )
+            val mode = string(entry, "mode", allowEmpty = true)
+            if (mode.isNotEmpty() && mode !in layerArtifactSegmentModes) {
+                fail(
+                    "mode must be empty or one of " +
+                        layerArtifactSegmentModes.joinToString(", "),
+                    "invalid_capabilities",
+                    "$itemField.mode",
+                )
+            }
+            boolean(entry, "artifact_present")
+            val range = entry["layer_range"] ?: return@forEachIndexed
+            val bounds = range as? List<*>
+                ?: fail(
+                    "layer_range must be null or an integer pair",
+                    "invalid_capabilities",
+                    "$itemField.layer_range",
+                )
+            val start = exactNonNegativeInt(bounds.getOrNull(0))
+            val end = exactNonNegativeInt(bounds.getOrNull(1))
+            if (bounds.size != 2 || start == null || end == null || end <= start) {
+                fail(
+                    "layer_range must be null or a non-empty [start, end) integer range",
+                    "invalid_capabilities",
+                    "$itemField.layer_range",
+                )
+            }
+        }
+    }
 
     /**
      * ★ 2026-09-20（v3 层段）：`layer_forward` stage_offer 的专项字段校验。
