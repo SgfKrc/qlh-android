@@ -673,7 +673,25 @@ class TaskWorkerClient(
                 heartbeatJob = scope.launch {
                     while (isActive && machine.snapshot().connection == TaskWorkerConnectionState.READY) {
                         delay(HEARTBEAT_INTERVAL_MS)
-                        opened.sendHeartbeat(nodeId, clockMs())
+                        // ★ 2026-10-08（真机根因）：单次发送失败**不得**让心跳循环静默退出。
+                        //   此前 `sendHeartbeat` 抛异常会直接结束这个 coroutine（`while` 之外没有
+                        //   catch）⇒ 该连接此后**一次心跳都不再发**；master 侧实测
+                        //   `event=tcp_heartbeat_received` 收到 0 条，而 worker 的
+                        //   `soTimeout = 45_000` 又要求 45 秒内必须有入站消息 ⇒ 连接只能被
+                        //   断开重连（真机表现：Y700 每 ~37 秒断开一次）。这里改为：失败记日志并
+                        //   继续下一轮；真需要重连时由 `receiveLoop` 的读失败驱动。
+                        try {
+                            opened.sendHeartbeat(nodeId, clockMs())
+                            QlhLogger.d("TaskWorkerClient", "heartbeat sent")
+                        } catch (error: CancellationException) {
+                            throw error
+                        } catch (error: Exception) {
+                            QlhLogger.w(
+                                "TaskWorkerClient",
+                                "heartbeat send failed: " +
+                                    (error.message ?: error.javaClass.simpleName),
+                            )
+                        }
                     }
                 }
                 receiveLoop(opened)
