@@ -291,9 +291,19 @@ class TaskWorkerService : Service() {
                         ?: Result.failure(IllegalStateException("inference_service_unavailable"))
                 },
                 generate = { prompt, maxTokens, temperature, topP ->
-                    awaitInferenceService()?.generate(
-                        prompt, maxTokens, temperature, topP,
-                    ) ?: Result.failure(IllegalStateException("inference_service_unavailable"))
+                    val service = awaitInferenceService()
+                    if (service == null) {
+                        Result.failure(IllegalStateException("inference_service_unavailable"))
+                    } else {
+                        // ★ 2026-10-07（DIST-NEXT-5b）：stage 执行期间按任务持有 WakeLock
+                        //   （空闲即释放，不再固定 30 分钟硬撑）。
+                        service.beginForegroundWork()
+                        try {
+                            service.generate(prompt, maxTokens, temperature, topP)
+                        } finally {
+                            service.endForegroundWork()
+                        }
+                    }
                 },
                 // ★ 2026-09-20（层段）：接上 layer_forward。
                 //   中间段需要隐藏态导出 ⇒ 用 ensureModelLoadedForLayer 单独加载。
@@ -301,26 +311,37 @@ class TaskWorkerService : Service() {
                 //      （引擎会按需卸载重载）。这是刻意的 fail-closed：
                 //      宁可重载一次，也不静默降级成取不到 hidden。
                 layerForward = { req ->
-                    awaitInferenceService()?.engine?.let { engine ->
-                        engine.layerForward(
-                            hidden = req.hidden,
-                            nTokens = req.nTokens,
-                            posBase = req.posBase,
-                            wantHidden = req.wantHidden,
-                            // ★ 2026-09-23：中间段通道由 stage_offer 的 `middle_channel` 决定 ——
-                            //   `keep_head_layer_out` ⇒ keep-head（**末层输出**，`output_norm` 之前），
-                            //   其余 ⇒ 旧的 `extract_hidden`（`output_norm(H)`，多一次归一化）。
-                            keepHead = req.middleChannel == "keep_head_layer_out",
-                            // ★ 2026-09-23（A12）：多序列显式位置（协议层已校验；null = 单序列）。
-                            seqIds = req.seqIds,
-                            positions = req.positions,
-                        ).map { out ->
-                            LayerForwardResult(
-                                tokenArgmax = out.tokenArgmax,
-                                hiddenOut = out.hiddenOut,
-                            )
+                    val service = awaitInferenceService()
+                    val engine = service?.engine
+                    if (engine == null) {
+                        Result.failure(IllegalStateException("inference_service_unavailable"))
+                    } else {
+                        // ★ 2026-10-07（DIST-NEXT-5b）：层段前向同样按任务持有 WakeLock
+                        //   （这是最容易被厂商省电策略打断的长任务）。
+                        service.beginForegroundWork()
+                        try {
+                            engine.layerForward(
+                                hidden = req.hidden,
+                                nTokens = req.nTokens,
+                                posBase = req.posBase,
+                                wantHidden = req.wantHidden,
+                                // ★ 2026-09-23：中间段通道由 stage_offer 的 `middle_channel` 决定 ——
+                                //   `keep_head_layer_out` ⇒ keep-head（**末层输出**，`output_norm` 之前），
+                                //   其余 ⇒ 旧的 `extract_hidden`（`output_norm(H)`，多一次归一化）。
+                                keepHead = req.middleChannel == "keep_head_layer_out",
+                                // ★ 2026-09-23（A12）：多序列显式位置（协议层已校验；null = 单序列）。
+                                seqIds = req.seqIds,
+                                positions = req.positions,
+                            ).map { out ->
+                                LayerForwardResult(
+                                    tokenArgmax = out.tokenArgmax,
+                                    hiddenOut = out.hiddenOut,
+                                )
+                            }
+                        } finally {
+                            service.endForegroundWork()
                         }
-                    } ?: Result.failure(IllegalStateException("inference_service_unavailable"))
+                    }
                 },
                 // ★ 2026-10-07（DIST-NEXT-1）：取消合同 —— 把中止请求传到 native。
                 //   `nativeLayerForward*` 因此在下一个可分割的张量边界退出并返回 -4，

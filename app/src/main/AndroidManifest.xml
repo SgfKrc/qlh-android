@@ -12,6 +12,10 @@
     <!-- Wake Lock 权限（防止推理中断） -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
+    <!-- ★ 2026-10-07（DIST-NEXT-5b）：worker 依赖前台服务长期存活，厂商省电策略是已知杀手。
+         该权限只用于**申请**忽略电池优化（系统对话框，用户可拒绝），不静默改设置。 -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
     <!-- 通知权限（Android 13+） -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 

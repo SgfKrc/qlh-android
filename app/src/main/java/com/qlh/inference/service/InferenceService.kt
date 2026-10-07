@@ -19,6 +19,7 @@ import com.qlh.inference.status.AndroidRuntimeStatus
 import com.qlh.inference.status.BackendStatus
 import com.qlh.inference.status.ContextRuntimeStatus
 import com.qlh.inference.status.GpuStatus
+import com.qlh.inference.system.WorkerWakeLockPolicy
 import com.qlh.inference.status.MultimodalStatus
 import com.qlh.inference.status.ModelRuntimeStatus
 import com.qlh.inference.system.AndroidDeviceInfoProvider
@@ -74,6 +75,14 @@ class InferenceService : Service() {
     // ---- 内部状态 ----
 
     private var wakeLock: PowerManager.WakeLock? = null
+
+    /**
+     * ★ 2026-10-07（DIST-NEXT-5b）：**活动任务数**（本地推理 / 层段前向）。
+     *
+     * `WorkerWakeLockPolicy.shouldHold()` 以它决定是否持有 WakeLock —— 空闲即释放，
+     * 不再用固定 30 分钟硬撑（审计 P1-3 点名的那条）。
+     */
+    private val activeTasks = java.util.concurrent.atomic.AtomicInteger(0)
     private val binder = LocalBinder()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     @Volatile
@@ -98,7 +107,9 @@ class InferenceService : Service() {
         QlhApplication.instance.inferenceService = this
 
         startForegroundNotification()
-        acquireWakeLock()
+        // ★ 2026-10-07（DIST-NEXT-5b）：启动时**不**持有 WakeLock（空闲不唤醒）。有任务时由
+        //   `beginForegroundWork()` 获取，并按 `RENEWAL_TIMEOUT_MS` 在任务期间续租。
+        renewWakeLock()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -374,9 +385,15 @@ class InferenceService : Service() {
         }
         val ready = ensureMultimodalReady()
         if (ready.isFailure) return Result.failure(ready.exceptionOrNull()!!)
-        return engine?.generateMultimodal(
-            prompt, imageBytes, maxTokens, temperature, topP,
-        ) ?: Result.failure(IllegalStateException("Service 未初始化"))
+        // ★ DIST-NEXT-5b：多模态推理同样按任务持有 WakeLock。
+        beginForegroundWork()
+        try {
+            return engine?.generateMultimodal(
+                prompt, imageBytes, maxTokens, temperature, topP,
+            ) ?: Result.failure(IllegalStateException("Service 未初始化"))
+        } finally {
+            endForegroundWork()
+        }
     }
 
     /** Return the intersection of registered Gemma4 assets and compiled JNI MTMD capability. */
@@ -521,7 +538,13 @@ class InferenceService : Service() {
         if (!eng.isLoaded) {
             return Result.failure(IllegalStateException("模型未加载"))
         }
-        return eng.generate(prompt, maxTokens, temperature, topP)
+        // ★ DIST-NEXT-5b：推理期间持有 WakeLock（按任务续租），结束即释放。
+        beginForegroundWork()
+        try {
+            return eng.generate(prompt, maxTokens, temperature, topP)
+        } finally {
+            endForegroundWork()
+        }
     }
 
     // ================================================================
@@ -558,16 +581,40 @@ class InferenceService : Service() {
         }
     }
 
-    @Suppress("DEPRECATION")
-    private fun acquireWakeLock() {
-        if (wakeLock == null) {
-            val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
-            wakeLock = powerManager.newWakeLock(
-                PowerManager.PARTIAL_WAKE_LOCK,
-                "QLH:InferenceEngine"
-            )
-            wakeLock?.acquire(30 * 60 * 1000L) // 30 分钟超时
+    /**
+     * ★ 2026-10-07（DIST-NEXT-5b）：标记一个前台任务开始（本地推理入口 / 层段执行器调用）。
+     */
+    fun beginForegroundWork() {
+        if (activeTasks.incrementAndGet() == 1) renewWakeLock()
+    }
+
+    /** ★ 2026-10-07（DIST-NEXT-5b）：标记一个前台任务结束；计数归零即释放 WakeLock。 */
+    fun endForegroundWork() {
+        if (activeTasks.decrementAndGet() <= 0) {
+            activeTasks.set(0)
+            releaseWakeLock()
         }
+    }
+
+    /**
+     * 按当前任务数获取 / 续租 / 释放 WakeLock（幂等）。
+     *
+     * 空闲 ⇒ 释放；有任务 ⇒ 以 `RENEWAL_TIMEOUT_MS` 持有。重复 `acquire` 会累加引用计数，
+     * 因此续租前先释放已持有的那一份，保持"单次持有"。
+     */
+    @Suppress("DEPRECATION")
+    private fun renewWakeLock() {
+        if (!WorkerWakeLockPolicy.shouldHold(activeTasks.get())) {
+            releaseWakeLock()
+            return
+        }
+        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+        val lock = wakeLock ?: powerManager.newWakeLock(
+            PowerManager.PARTIAL_WAKE_LOCK,
+            "QLH:InferenceEngine",
+        ).also { wakeLock = it }
+        if (lock.isHeld) lock.release()
+        lock.acquire(WorkerWakeLockPolicy.RENEWAL_TIMEOUT_MS)
     }
 
     private fun releaseWakeLock() {
