@@ -566,4 +566,20 @@ class TaskWorkerProtocolTest {
             )
         }
     }
+
+    @Test
+    fun `DIST-NEXT-2 hidden wire budget matches the master frame limit`() {
+        // 与主仓 `task_worker_protocol.hidden_wire_bytes` 同公式、同常量
+        assertEquals(5_462L, TaskWorkerProtocol.hiddenWireBytes(1_024L))
+        assertEquals(2_731L, TaskWorkerProtocol.hiddenWireBytes(1_024L, 2))
+        assertEquals(
+            TaskWorkerProtocol.MAX_MESSAGE_BYTES.toLong() -
+                TaskWorkerProtocol.STAGE_FRAME_RESERVE_BYTES,
+            TaskWorkerProtocol.stagePayloadBudgetBytes(),
+        )
+        val budget = TaskWorkerProtocol.stagePayloadBudgetBytes()
+        // 2048 宽的 1 token ≈ 10.9 KB：预算内；2_000_000 元素 ≈ 10.7 MB：超预算
+        assertTrue(TaskWorkerProtocol.hiddenWireBytes(2_048L) < budget)
+        assertTrue(TaskWorkerProtocol.hiddenWireBytes(2_000_000L) > budget)
+    }
 }

@@ -85,6 +85,32 @@ object TaskWorkerProtocol {
     private val executionStates = setOf(EXECUTION_STOPPED, EXECUTION_IN_FLIGHT)
     private val cancelledOptionalFields = setOf("execution_state")
 
+    /**
+     * ★ 2026-10-07（DIST-NEXT-2）：层段 hidden 的 **wire 预算** —— 与主仓
+     * `src/task_worker_protocol.py` 的 `_BASE64_EXPANSION` / `STAGE_FRAME_RESERVE_BYTES`
+     * 同值。层段的 hidden 用 base64 承载 raw 数据，单帧上限是 [MAX_MESSAGE_BYTES]；
+     * 超预算必须在 dispatch（或产出）前以具名错误结束，不能等到 encode 抛
+     * `message_too_large` —— 那时原因已经丢了。
+     */
+    const val HIDDEN_DTYPE_BYTES_F32 = 4
+    const val STAGE_FRAME_RESERVE_BYTES = 256 * 1024
+    private const val BASE64_EXPANSION_NUMERATOR = 4L
+    private const val BASE64_EXPANSION_DENOMINATOR = 3L
+
+    /** 层段 hidden 在 JSON 帧里占用的字节数（raw + base64 膨胀，向上取整）。 */
+    fun hiddenWireBytes(
+        elementCount: Long,
+        dtypeBytes: Int = HIDDEN_DTYPE_BYTES_F32,
+    ): Long {
+        val raw = elementCount * dtypeBytes.toLong()
+        return (raw * BASE64_EXPANSION_NUMERATOR + BASE64_EXPANSION_DENOMINATOR - 1) /
+            BASE64_EXPANSION_DENOMINATOR
+    }
+
+    /** 单条 stage 消息里可承载的 hidden 预算（已扣帧内其它字段的余量）。 */
+    fun stagePayloadBudgetBytes(): Long =
+        MAX_MESSAGE_BYTES.toLong() - STAGE_FRAME_RESERVE_BYTES.toLong()
+
     private val gson = GsonBuilder()
         .disableHtmlEscaping()
         .serializeNulls()

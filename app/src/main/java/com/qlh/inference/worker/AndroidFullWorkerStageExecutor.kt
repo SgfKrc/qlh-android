@@ -362,6 +362,19 @@ class AndroidFullWorkerStageExecutor(
         output["layer_range"] = layerRange
         output["n_tokens"] = nTokens
         result.hiddenOut?.let { out ->
+            // ★ 2026-10-07（DIST-NEXT-2）：产出侧对称预检 —— 中间段的
+            //   `hidden_out_f32`（base64 raw f32）与输入同尺寸。超预算时在这里以
+            //   具名错误结束，不再让协议层在 `encode` 时抛 `message_too_large`
+            //   （那条路径只会把它笼统记成 `worker_execution_failed`，丢掉原因）。
+            val wireBytes = TaskWorkerProtocol.hiddenWireBytes(out.size.toLong())
+            val budgetBytes = TaskWorkerProtocol.stagePayloadBudgetBytes()
+            if (wireBytes > budgetBytes) {
+                throw AndroidFullWorkerStageException(
+                    "stage_result_too_large",
+                    "layer stage hidden output does not fit one frame " +
+                        "(wire=${wireBytes}B budget=${budgetBytes}B elements=${out.size})",
+                )
+            }
             output["hidden_out_sha256"] = sha256Hex(out)
             // The digest is useful for auditing, but the next stage also
             // needs the actual tensor. Keep the wire representation explicit
