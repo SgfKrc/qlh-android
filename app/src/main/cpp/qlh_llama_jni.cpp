@@ -103,11 +103,15 @@ static jobject new_string_map(JNIEnv * env, jmethodID * put_method_out) {
 }
 
 static int available_threads() {
-    // ★ 2026-10-08（真机性能）：此前硬上限 4，8 核设备（Y700 / 骁龙 8 Gen 3）只用一半核。
-    //   层段前向（层段 embd prefill）在本设备上已实测 ~30ms/step，线程数直接决定墙钟时间。
-    //   上限提到 6：给系统/前台服务留 2 核余量（设备同时跑 UI + 心跳 + socket）。
+    // ★ 2026-10-08（真机性能；按用户要求去掉硬编码上限）：线程数**由本机运行时核数自适应**。
+    //   此前是 `min(4, cores-1)`（8 核设备只用 4 核，实测拖慢 prefill），后来临时写死 6；
+    //   现在改为「给系统/前台服务留 2 核余量后取满」并按 [2, 8] 收敛 —— 同型号设备也可能
+    //   因降频/核隔离/大小核调度而不同，写死反而失真。
+    //   ⚠️ 为什么不用设备画像：画像是 **master 侧对节点的评级**（tier/score，用于选模型/选档），
+    //   而线程数必须反映**本机真实可用核**。若将来要让用户或画像覆盖，正确做法是在 Java 侧
+    //   把 `n_threads` 透传进来（engine 参数），而不是在 native 层读画像。
     const int cores = std::max(1, get_nprocs());
-    return std::max(2, std::min(6, cores - 1));
+    return std::max(2, std::min(8, cores - 2));
 }
 
 static bool valid_utf8(const std::string & s) {
