@@ -1,5 +1,7 @@
 package com.qlh.inference.worker
 
+import com.qlh.inference.logging.QlhLogger
+
 import kotlin.math.pow
 import kotlin.math.roundToInt
 
@@ -325,7 +327,17 @@ class AndroidFullWorkerStageExecutor(
         //   fail-closed —— 存在但非法时抛错，绝不静默退化成单序列（那会让多序列链路悄悄算错）。
         val seqIds = optionalIntList(payload, "seq_ids", nTokens)
         val positions = optionalIntList(payload, "positions", nTokens)
-        val loaderResult = if (wantHidden || layerRange.isNotEmpty()) {
+        val wantsLayerForward = wantHidden || layerRange.isNotEmpty()
+        // ★ 2026-10-08（诊断，定位后降级）：本执行器此前**一行日志都没有**，导致真机上
+        //   「offer 接受后在跑、但 50 秒 stage 超时」完全不可见。这里给「模型加载」与
+        //   「层段前向」分别计时 —— 首次 `q35-2b` 尾段 GGUF 的加载时间正是当前嫌疑。
+        QlhLogger.d(
+            "AndroidFullWorkerStageExecutor",
+            "stage execute start: layerRange=$layerRange nTokens=$nTokens nEmbd=$nEmbd " +
+                "wantHidden=$wantHidden layerForward=$wantsLayerForward",
+        )
+        val loaderStartedMs = System.currentTimeMillis()
+        val loaderResult = if (wantsLayerForward) {
             ensureModelLoadedForLayer(
                 layerRange,
                 contextSize,
@@ -336,6 +348,11 @@ class AndroidFullWorkerStageExecutor(
         } else {
             ensureModelLoaded(contextSize)
         }
+        QlhLogger.d(
+            "AndroidFullWorkerStageExecutor",
+            "model ready in ${System.currentTimeMillis() - loaderStartedMs}ms " +
+                "(ok=${loaderResult.isSuccess})",
+        )
         loaderResult.getOrElse { error ->
             throw AndroidFullWorkerStageException(
                 "model_not_ready",
@@ -344,6 +361,7 @@ class AndroidFullWorkerStageExecutor(
         }
 
         val posBase = boundedInt(rootInput["pos_base"], 0, 0, Int.MAX_VALUE - 1)
+        val forwardStartedMs = System.currentTimeMillis()
         val result = layerForward(
             LayerForwardRequest(
                 layerRange = layerRange,
@@ -363,6 +381,11 @@ class AndroidFullWorkerStageExecutor(
                 error.message ?: "Android layer forward failed",
             )
         }
+        QlhLogger.d(
+            "AndroidFullWorkerStageExecutor",
+            "layerForward done in ${System.currentTimeMillis() - forwardStartedMs}ms " +
+                "tokenArgmax=${result.tokenArgmax}",
+        )
         if (result.tokenArgmax < 0) {
             throw AndroidFullWorkerStageException(
                 "layer_forward_failed",
