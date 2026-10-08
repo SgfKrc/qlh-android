@@ -103,8 +103,11 @@ static jobject new_string_map(JNIEnv * env, jmethodID * put_method_out) {
 }
 
 static int available_threads() {
+    // ★ 2026-10-08（真机性能）：此前硬上限 4，8 核设备（Y700 / 骁龙 8 Gen 3）只用一半核。
+    //   层段前向（层段 embd prefill）在本设备上已实测 ~30ms/step，线程数直接决定墙钟时间。
+    //   上限提到 6：给系统/前台服务留 2 核余量（设备同时跑 UI + 心跳 + socket）。
     const int cores = std::max(1, get_nprocs());
-    return std::max(2, std::min(4, cores - 1));
+    return std::max(2, std::min(6, cores - 1));
 }
 
 static bool valid_utf8(const std::string & s) {
