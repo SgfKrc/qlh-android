@@ -86,6 +86,8 @@ import com.qlh.inference.AuditReviewTicket
 import com.qlh.inference.AuditUiState
 import com.qlh.inference.AuditWorkflow
 import com.qlh.inference.ClusterOverviewUiState
+import com.qlh.inference.clusterCapacitySummaryText
+import com.qlh.inference.clusterNodeParticipationText
 import com.qlh.inference.DiagnosticsUiState
 import com.qlh.inference.ModelFleetEntry
 import com.qlh.inference.ModelFleetStatus
@@ -527,6 +529,27 @@ private fun ClusterOverviewGroup(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
+            value.capacity?.let { capacity ->
+                Text(
+                    text = clusterCapacitySummaryText(capacity),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (capacity.admitted == false) {
+                        MaterialTheme.colorScheme.error
+                    } else {
+                        MaterialTheme.colorScheme.onSurfaceVariant
+                    },
+                    modifier = Modifier.testTag("cluster_overview_capacity"),
+                )
+                if (capacity.controlOnlyNodes.isNotEmpty()) {
+                    Text(
+                        text = "仅控制面：${capacity.controlOnlyNodes.joinToString("、")}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
             value.currentTaskId?.let { taskId ->
                 val taskState = value.currentTaskState?.ifBlank { "unknown" } ?: "unknown"
                 val elapsed = value.currentTaskElapsedSeconds?.let { " · ${it}s" }.orEmpty()
@@ -549,7 +572,7 @@ private fun ClusterOverviewGroup(
                 value.nodes.take(8).forEach { node ->
                     SettingRow(
                         title = node.hostname.ifBlank { node.nodeId },
-                        subtitle = "${node.role} · ${node.nodeType} · ${node.networkType} · 任务 ${node.taskCount} · 错误 ${node.errorCount}",
+                        subtitle = "${node.role} · ${node.nodeType} · ${node.networkType} · 任务 ${node.taskCount} · 错误 ${node.errorCount} · ${clusterNodeParticipationText(node)}",
                         modifier = Modifier.testTag("cluster_overview_node_${node.nodeId}"),
                         trailing = {
                             QlhSemanticStatusChip(

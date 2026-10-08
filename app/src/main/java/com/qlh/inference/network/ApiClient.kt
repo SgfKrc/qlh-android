@@ -97,7 +97,37 @@ data class ClusterStatus(
     @SerializedName("total_count")
     val totalCount: Int = 0,
     @SerializedName("distributed_enabled")
-    val distributedEnabled: Boolean = false
+    val distributedEnabled: Boolean = false,
+    @SerializedName("pipeline_capacity")
+    val pipelineCapacity: PipelineCapacitySummary? = null
+)
+
+/**
+ * 只读容量决策投影（`/api/cluster/status` 的 `pipeline_capacity`）。
+ *
+ * 存在的理由：「节点 online」只说心跳在发，不代表它在流水线里干活 ——
+ * 这里把「是否准入 + 没准入的原因 + 谁在参与」一并带给移动端，
+ * 免得必须交叉 `/cluster/nodes` 与 `/cluster/pipeline-capacity` 才能看出真相。
+ */
+data class PipelineCapacitySummary(
+    val status: String = "",
+    /** 三态：true=已准入、false=已拒绝、null=后端没有权威决策。 */
+    val admitted: Boolean? = null,
+    @SerializedName("reason_code")
+    val reasonCode: String = "",
+    val reason: String = "",
+    @SerializedName("participating_node_count")
+    val participatingNodeCount: Int = 0,
+    @SerializedName("control_only_nodes")
+    val controlOnlyNodes: List<String> = emptyList(),
+    @SerializedName("worker_count")
+    val workerCount: Int = 0,
+    @SerializedName("prepared_node_count")
+    val preparedNodeCount: Int = 0,
+    @SerializedName("ready_node_count")
+    val readyNodeCount: Int = 0,
+    @SerializedName("require_distributed")
+    val requireDistributed: Boolean = false,
 )
 
 data class ClusterTask(
@@ -126,6 +156,10 @@ data class ClusterNode(
     val errorCount: Int = 0,
     @SerializedName("is_available")
     val isAvailable: Boolean = false,
+    @SerializedName("pipeline_participating")
+    val pipelineParticipating: Boolean = false,
+    @SerializedName("pipeline_exclusion_reason")
+    val pipelineExclusionReason: String = "",
 )
 
 data class RegisterNodeRequest(

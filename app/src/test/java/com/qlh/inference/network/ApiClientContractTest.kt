@@ -649,6 +649,50 @@ class ApiClientContractTest {
     }
 
     @Test
+    fun `getClusterStatus parses pipeline capacity projection and node participation`() {
+        route("/api/cluster/status") { _, reply ->
+            reply(200, """
+                {
+                  "running": true,
+                  "run_mode": "distributed",
+                  "nodes_ready": true,
+                  "nodes": {
+                    "master": {"node_id":"master","role":"master","state":"online","is_available":true,"pipeline_participating":true,"pipeline_exclusion_reason":""},
+                    "android-1": {"node_id":"android-1","role":"client","node_type":"android","state":"online","is_available":true,"pipeline_participating":false,"pipeline_exclusion_reason":"capacity_plan_control_only"}
+                  },
+                  "pipeline_capacity": {
+                    "status":"rejected",
+                    "admitted":false,
+                    "reason_code":"pipeline_distributed_workers_unavailable",
+                    "participating_node_count":0,
+                    "control_only_nodes":["android-1"],
+                    "worker_count":0,
+                    "prepared_node_count":0,
+                    "ready_node_count":0,
+                    "require_distributed":true
+                  }
+                }
+            """.trimIndent())
+        }
+
+        val status = runBlocking { client.getClusterStatus() }.getOrNull()!!
+
+        assertEquals(false, status.pipelineCapacity?.admitted)
+        assertEquals(
+            "pipeline_distributed_workers_unavailable",
+            status.pipelineCapacity?.reasonCode,
+        )
+        assertEquals(listOf("android-1"), status.pipelineCapacity?.controlOnlyNodes)
+        assertEquals(true, status.pipelineCapacity?.requireDistributed)
+        assertEquals(true, status.nodes["master"]?.pipelineParticipating)
+        assertEquals(false, status.nodes["android-1"]?.pipelineParticipating)
+        assertEquals(
+            "capacity_plan_control_only",
+            status.nodes["android-1"]?.pipelineExclusionReason,
+        )
+    }
+
+    @Test
     fun `testConnection returns success boolean on any http response`() {
         route("/api/cluster/status") { _, reply -> reply(200, "{}") }
         assertEquals(true, runBlocking { client.testConnection() }.getOrNull())
