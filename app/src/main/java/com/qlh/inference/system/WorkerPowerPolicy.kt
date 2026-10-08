@@ -41,3 +41,39 @@ object WorkerWakeLockPolicy {
      */
     fun shouldHold(activeTasks: Int): Boolean = activeTasks > 0
 }
+
+/**
+ * ★ 2026-10-08：worker 的 **WiFi lock 策略**（纯逻辑，可 JVM 单测）。
+ *
+ * 由来（实测）：Y700 的局域网 ICMP 延迟是 `9 / 23 / 39 / 71 / 79 ms`（抖动 3–8×），
+ * 而 decode **每步要一个网络往返** ⇒ 息屏/空闲时 WiFi 进入省电后的唤醒延迟，会直接变成
+ * 每一步的固定税（对照：同网段 Surface 的 TCP RTT 稳定 6.3ms）。带宽不是问题
+ * （11ax / RSSI −28 / Link 154Mbps）⇒ 这里要保的是**延迟**，不是吞吐。
+ *
+ * 与 [WorkerWakeLockPolicy] **同生命周期**：有任务才持有、空闲即释放 ——
+ * 常驻持有 WiFi lock 会反向耗电，且与"空闲让系统休眠"的既有取向冲突。
+ */
+object WorkerWifiLockPolicy {
+    /** 锁标签（`WifiManager.createWifiLock(mode, tag)`）。 */
+    const val LOCK_TAG: String = "QLH:LayerWorkerWifi"
+
+    /**
+     * 空闲释放窗口（60 秒）：最后一次层段执行之后再无任务，才释放 WiFi lock。
+     *
+     * ★ 为什么**不能**与 WakeLock 一样"任务计数归零即释放"（实测踩到）：
+     * 单次层段执行只持续几十毫秒，而 WiFi 的省电模式切换（PS ⇄ CAM）本身要花时间；
+     * 更关键的是**下一个 offer 的到达时刻才决定"网络活跃期"** —— 步与步之间的等待
+     * 同样依赖 WiFi 低延迟。若按"每次执行成对开关"，锁在 99% 的时间里都是松的
+     * （现场验证：请求进行中 `dumpsys power` 的 `Wake Locks: size=0`，抓不到锁）。
+     * 因此 WiFi 采用"**续租 + 空闲超时**"：连续工作时一直持有，真空闲才放手。
+     */
+    const val IDLE_RELEASE_MS: Long = 60_000L
+
+    /**
+     * 本时刻是否应当持有 WiFi lock（获取门槛）：与 WakeLock 同一判据（有活动任务）。
+     *
+     * 与 WakeLock **分叉点**：这里只决定"是否获取"，**释放**由 [IDLE_RELEASE_MS] 超时驱动，
+     * 而不是任务计数归零 —— 见上面的实测理由。
+     */
+    fun shouldHold(activeTasks: Int): Boolean = activeTasks > 0
+}

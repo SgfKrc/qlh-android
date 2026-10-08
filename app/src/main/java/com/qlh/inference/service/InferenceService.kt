@@ -8,6 +8,9 @@ import android.content.Intent
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
+import android.net.wifi.WifiManager
+import android.os.Handler
+import android.os.Looper
 import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
@@ -20,6 +23,7 @@ import com.qlh.inference.status.BackendStatus
 import com.qlh.inference.status.ContextRuntimeStatus
 import com.qlh.inference.status.GpuStatus
 import com.qlh.inference.system.WorkerWakeLockPolicy
+import com.qlh.inference.system.WorkerWifiLockPolicy
 import com.qlh.inference.status.MultimodalStatus
 import com.qlh.inference.status.ModelRuntimeStatus
 import com.qlh.inference.system.AndroidDeviceInfoProvider
@@ -75,6 +79,18 @@ class InferenceService : Service() {
     // ---- 内部状态 ----
 
     private var wakeLock: PowerManager.WakeLock? = null
+
+    /**
+     * ★ 2026-10-08：层段/推理期间同时持有的 **WiFi lock**（延迟保障，不保吞吐）。
+     *
+     * 实测动机：Y700 局域网 ICMP 延迟 9–79ms（抖动 3–8×），decode 每步一个网络往返 ⇒
+     * 息屏/空闲的 WiFi 省电会直接变成每一步的固定税。与 [wakeLock] 同生命周期。
+     */
+    private var wifiLock: WifiManager.WifiLock? = null
+
+    /** ★ 2026-10-08：WiFi lock 的**空闲释放**调度器（见 [WorkerWifiLockPolicy.IDLE_RELEASE_MS]）。 */
+    private val wifiIdleHandler: Handler by lazy { Handler(Looper.getMainLooper()) }
+    private val releaseWifiLockRunnable: Runnable by lazy { Runnable { releaseWifiLock() } }
 
     /**
      * ★ 2026-10-07（DIST-NEXT-5b）：**活动任务数**（本地推理 / 层段前向）。
@@ -160,6 +176,7 @@ class InferenceService : Service() {
             QlhApplication.instance.inferenceService = null
         }
         releaseWakeLock()
+        releaseWifiLock()
         scope.cancel()
         super.onDestroy()
     }
@@ -585,10 +602,16 @@ class InferenceService : Service() {
      * ★ 2026-10-07（DIST-NEXT-5b）：标记一个前台任务开始（本地推理入口 / 层段执行器调用）。
      */
     fun beginForegroundWork() {
-        if (activeTasks.incrementAndGet() == 1) renewWakeLock()
+        if (activeTasks.incrementAndGet() == 1) {
+            renewWakeLock()
+            renewWifiLock()
+        }
     }
 
-    /** ★ 2026-10-07（DIST-NEXT-5b）：标记一个前台任务结束；计数归零即释放 WakeLock。 */
+    /** ★ 2026-10-07（DIST-NEXT-5b）：标记一个前台任务结束；计数归零即释放 WakeLock。
+     *
+     *  ★ 2026-10-08：WiFi lock **不在这里释放** —— 它改由 [WorkerWifiLockPolicy.IDLE_RELEASE_MS]
+     *  空闲超时释放（单次层段只有几十毫秒，成对开关会让锁在步与步之间全松掉）。 */
     fun endForegroundWork() {
         if (activeTasks.decrementAndGet() <= 0) {
             activeTasks.set(0)
@@ -622,6 +645,60 @@ class InferenceService : Service() {
             if (it.isHeld) it.release()
         }
         wakeLock = null
+    }
+
+    /**
+     * ★ 2026-10-08：WiFi lock 与 WakeLock **成对**获取/释放（同一 `activeTasks` 判据）。
+     *
+     * 取 `WIFI_MODE_FULL_LOW_LATENCY`（API 29+）而不是 `WIFI_MODE_FULL_HIGH_PERF`：
+     * decode 每步是一个"小包往返、延迟敏感、吞吐无所谓"的负载，前者正是为该场景新增的模式；
+     * 低版本回退到 `HIGH_PERF`。锁不做引用计数，`acquire/release` 以 `isHeld` 幂等。
+     */
+    @Suppress("DEPRECATION")
+    private fun renewWifiLock() {
+        if (!WorkerWifiLockPolicy.shouldHold(activeTasks.get())) {
+            releaseWifiLock()
+            return
+        }
+        val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+            ?: return
+        val lock = wifiLock ?: wifiManager.createWifiLock(
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+            } else {
+                WifiManager.WIFI_MODE_FULL_HIGH_PERF
+            },
+            WorkerWifiLockPolicy.LOCK_TAG,
+        ).also {
+            // 引用计数必须"未 acquire 前"设置；设 false 后 acquire/release 语义即幂等持有。
+            it.setReferenceCounted(false)
+            wifiLock = it
+        }
+        if (!lock.isHeld) {
+            lock.acquire()
+            Log.i(
+                TAG,
+                "wifi lock acquired tag=${WorkerWifiLockPolicy.LOCK_TAG} " +
+                    "mode=${if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) "full_low_latency" else "full_high_perf"} " +
+                    "idleReleaseMs=${WorkerWifiLockPolicy.IDLE_RELEASE_MS}",
+            )
+        }
+        // ★ 续租 + 空闲超时释放：连续工作的每一步都会重置窗口，真空闲才放手。
+        //   （只在获取/释放时打日志：每步续租不打，避免刷屏 —— 续租只重置定时器，不重复 acquire。）
+        wifiIdleHandler.removeCallbacks(releaseWifiLockRunnable)
+        wifiIdleHandler.postDelayed(
+            releaseWifiLockRunnable,
+            WorkerWifiLockPolicy.IDLE_RELEASE_MS,
+        )
+    }
+
+    private fun releaseWifiLock() {
+        if (wifiLock != null) Log.i(TAG, "wifi lock released (idle timeout or service stop)")
+        wifiIdleHandler.removeCallbacks(releaseWifiLockRunnable)
+        wifiLock?.let {
+            if (it.isHeld) it.release()
+        }
+        wifiLock = null
     }
 }
 
