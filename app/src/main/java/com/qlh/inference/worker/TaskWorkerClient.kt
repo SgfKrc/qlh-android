@@ -433,14 +433,6 @@ class SocketTaskWorkerTransport(
     override suspend fun receiveEvent(): TaskWorkerInboundEvent {
         while (true) {
             val objectValue = receiveOuter() ?: return TaskWorkerInboundEvent.Closed
-            // ★ 2026-10-08（诊断，定位后降级）：分片帧「到没到 Android」是本轮的唯一未知量 ——
-            //   master 侧 `task_worker_stage_chunks_sent` 成功，而设备侧连一条分片/未知帧日志
-            //   都没有。这里把**每一个外层帧类型**打出来，直接回答该问题。
-            QlhLogger.d(
-                "TaskWorkerClient",
-                "outer frame: type=${objectValue.get("type")?.asString ?: "(null)"} " +
-                    "keys=${objectValue.keySet().joinToString(",")}",
-            )
             when (objectValue.get("type")?.asString) {
                 "task_worker" -> {
                     val data = objectValue.get("data")
