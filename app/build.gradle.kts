@@ -46,6 +46,13 @@ android {
                     // Android 15+ 的 16 KB page 设备要求 ELF LOAD 段 16 KB 对齐；
                     // NDK r27 通过该开关带上 -Wl,-z,max-page-size=16384（无需改源码）。
                     "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON",
+                    // ★ 2026-10-08（真机性能根因）：此前**没有传任何 arch 参数** ⇒
+                    //   `GGML_CPU_ARM_ARCH` 为空 ⇒ ggml-cpu 退到 baseline NEON，设备上
+                    //   `ggml_cpu_has_dotprod()/ggml_cpu_has_matmul_int8()` 恒为 0（编译期宏）。
+                    //   真机实测：Y700（骁龙 8 Gen 3）上 1062 tokens × 4 层 >43 秒，远超硬件
+                    //   应有水平。带 dotprod/fp16/i8mm 的同类构建在 Termux 手工验证里已存在
+                    //   （`build-aarch64/CMakeCache.txt` ⇒ `armv8.6-a+dotprod+fp16+i8mm`）。
+                    "-DGGML_CPU_ARM_ARCH=armv8.6-a+dotprod+fp16+i8mm",
                 )
             }
         }
