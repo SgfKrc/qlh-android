@@ -179,7 +179,31 @@ class ApiClientHttpException(
     val statusCode: Int,
     val errorCode: String,
     val responseBody: String,
-) : IOException("HTTP $statusCode${if (errorCode.isBlank()) "" else " [$errorCode]"}: $responseBody")
+) : IOException("HTTP $statusCode${if (errorCode.isBlank()) "" else " [$errorCode]"}: ${errorDetailOf(responseBody)}")
+
+/**
+ * 从后端错误响应体里取出**人类可读原因**（供 UI 直接显示）。
+ *
+ * ★ 2026-10-08：此前异常 message 直接拼**原始 JSON 串**（`{"detail":"推理失败: ..."}`），
+ * 用户看到的是转义 JSON、得自己找重点。后端两类错误体的形状都在这儿收拢：
+ *   - `{"detail": "<文本>"}`                     —— 例如"禁止自动整模回退"那条；
+ *   - `{"detail": {"code": "...", "message": "..."}}` —— 例如信任边界的
+ *     `MODEL_API_SOURCE_UNTRUSTED`（`src/model_api_access.py`）。
+ *
+ * 取不到时**回退到原始 body**（绝不吞掉信息，宁可难看也不静默）。
+ */
+internal fun errorDetailOf(body: String): String {
+    val extracted = runCatching {
+        val obj = JsonParser.parseString(body).asJsonObject
+        val detail = obj.get("detail")
+        when {
+            detail == null || detail.isJsonNull -> obj.get("message")?.asString.orEmpty()
+            detail.isJsonObject -> detail.asJsonObject.get("message")?.asString.orEmpty()
+            else -> detail.asString
+        }
+    }.getOrDefault("")
+    return extracted.ifBlank { body }
+}
 
 data class BootstrapRequest(
     @SerializedName("node_id")
