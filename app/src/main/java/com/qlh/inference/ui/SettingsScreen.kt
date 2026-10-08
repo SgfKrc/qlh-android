@@ -730,13 +730,13 @@ private fun AuditOverviewGroup(
 ) {
     val snapshot = state.snapshot
     val summary = when {
-        state.loading -> "姝ｅ湪璇诲彇"
-        snapshot != null -> "娲诲姩 ${snapshot.workflows.size} · 澶嶆牳 ${snapshot.reviews.size}"
-        state.error != null -> "鏆傛椂鏃犳硶璇诲彇"
-        else -> "灏氭湭璇诲彇"
+        state.loading -> "正在读取"
+        snapshot != null -> "活动 ${snapshot.workflows.size} · 复核 ${snapshot.reviews.size}"
+        state.error != null -> "暂时无法读取"
+        else -> "尚未读取"
     }
     CollapsibleSettingsGroup(
-        title = "瀹¤涓庢椿鍔?",
+        title = "审计与活动",
         summary = summary,
         icon = Icons.Default.Description,
         testTag = "audit_overview_details",
@@ -745,12 +745,12 @@ private fun AuditOverviewGroup(
             Row(verticalAlignment = Alignment.CenterVertically) {
                 CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
                 Spacer(modifier = Modifier.width(8.dp))
-                Text("姝ｅ湪鍒锋柊", style = MaterialTheme.typography.bodySmall)
+                Text("正在刷新", style = MaterialTheme.typography.bodySmall)
             }
         }
         state.error?.let { error ->
             Text(
-                text = "瀹¤璧勬枡涓嶅彲鐢細$error",
+                text = "审计资料不可用：$error",
                 color = MaterialTheme.colorScheme.error,
                 style = MaterialTheme.typography.bodySmall,
                 maxLines = 2,
