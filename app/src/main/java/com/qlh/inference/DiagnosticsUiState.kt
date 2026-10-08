@@ -12,6 +12,14 @@ data class DiagnosticsUiState(
     val uploadInProgress: Boolean = false,
     val uploadMessage: String? = null,
     val uploadError: String? = null,
+    /**
+     * ★ 2026-10-08：当前是否已豁免电池优化（`PowerManager.isIgnoringBatteryOptimizations`）。
+     *
+     * 三态：`true` 已豁免 / `false` 未豁免（厂商省电可能回收层段 worker）/ `null` 尚未探测。
+     * 引导本身（弹一次系统对话框、落库「已问过」）在 `MainViewModel.buildBatteryExemptionRequest()`；
+     * 这里只让**状态可见**，便于用户手动复查与再次申请。
+     */
+    val batteryOptimizationExempt: Boolean? = null,
 )
 
 data class AppUpdateUiState(

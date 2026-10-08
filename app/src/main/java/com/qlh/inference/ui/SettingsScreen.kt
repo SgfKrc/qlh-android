@@ -4,6 +4,7 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
 import com.qlh.inference.BuildConfig
 import com.qlh.inference.data.SettingsDataStore
 import androidx.compose.foundation.clickable
@@ -101,6 +102,7 @@ import com.qlh.inference.network.ApiClient
 import com.qlh.inference.network.GgufModelInfo
 import com.qlh.inference.network.httpBaseUrl
 import com.qlh.inference.service.ModelManager
+import com.qlh.inference.system.WorkerBatteryPolicy
 import com.qlh.inference.status.AndroidRuntimeStatus
 import com.qlh.inference.network.AndroidPresenceSnapshot
 import com.qlh.inference.network.AndroidPresenceState
@@ -1257,6 +1259,54 @@ private fun DiagnosticsGroup(
     onUpload: () -> Unit,
 ) {
     SettingsGroup(title = "连接诊断", icon = Icons.Default.Info) {
+        // ★ 2026-10-08（goal ①-B）：电池优化豁免的**状态可见**。
+        //   判定与一次性引导在 `MainViewModel.buildBatteryExemptionRequest()`（WorkerBatteryPolicy
+        //   + DataStore 落库），这里只做显示与"再申请"入口 —— 厂商省电回收后台是层段 worker
+        //   掉线的已知原因（Y700 实测过 App 被判后台限制而终止）。
+        val batteryExempt = state.batteryOptimizationExempt
+        val context = LocalContext.current
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text("电池优化", color = MaterialTheme.colorScheme.onSurface)
+            QlhSemanticStatusChip(
+                text = when (batteryExempt) {
+                    true -> "已豁免"
+                    false -> "未豁免"
+                    null -> "未知"
+                },
+                status = when (batteryExempt) {
+                    true -> "pass"
+                    false -> "fail"
+                    null -> "skipped"
+                },
+                showDot = false,
+            )
+        }
+        if (batteryExempt != true) {
+            Text(
+                text = "未豁免时厂商省电策略可能在后台回收推理服务（层段 worker 掉线）。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            OutlinedButton(
+                onClick = {
+                    runCatching {
+                        context.startActivity(
+                            Intent(
+                                WorkerBatteryPolicy.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                                Uri.parse("package:${context.packageName}"),
+                            )
+                        )
+                    }
+                },
+                modifier = Modifier.testTag("request_battery_exemption"),
+            ) {
+                Text("申请电池优化豁免")
+            }
+        }
         state.health?.let { report ->
             Text(
                 text = "网络：${report.localNetworkType}",

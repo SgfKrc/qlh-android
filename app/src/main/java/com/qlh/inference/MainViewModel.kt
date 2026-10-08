@@ -1012,6 +1012,26 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         )
     }
 
+    /**
+     * ★ 2026-10-08（goal ①-B）：刷新「电池优化是否已豁免」，供设置页显示。
+     *
+     * 与 [buildBatteryExemptionRequest] 分工：那个是**一次性引导**（弹系统对话框、落库"已问过"）；
+     * 这里只读系统状态、不做引导，因此可以随 `onResume` 反复调用。取不到系统状态时保持 `null`
+     * （显示"未知"），**不谎报**为"未豁免"。
+     */
+    fun refreshBatteryExemption() {
+        val context = getApplication<Application>()
+        val exempt = runCatching {
+            (context.getSystemService(Context.POWER_SERVICE) as? PowerManager)
+                ?.isIgnoringBatteryOptimizations(context.packageName)
+        }.getOrNull()
+        _uiState.value = _uiState.value.copy(
+            diagnostics = _uiState.value.diagnostics.copy(
+                batteryOptimizationExempt = exempt,
+            ),
+        )
+    }
+
     fun installDownloadedUpdate() {
         val file = downloadedUpdateFile
         if (file == null || !file.exists()) {
