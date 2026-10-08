@@ -49,6 +49,14 @@ set(GGML_BACKEND_DL OFF CACHE BOOL "Use statically linked backend" FORCE)
 # Koakuma Android RPC worker：App 进程内直接运行 ggml RPC server（不 fork 子进程）
 set(GGML_RPC ON CACHE BOOL "Enable RPC backend for the Koakuma Android worker" FORCE)
 
+# ★ 2026-10-08（真机性能根因，子 agent 取证）：Gradle 的 Debug 变体会传
+#   `-DCMAKE_BUILD_TYPE=Debug`，而 NDK clang 在 Debug 下**不带任何 -O**（等效 -O0）
+#   ⇒ ggml/llama 的 CPU kernel 全为未优化代码。实测：Y700 上 1062 tokens × 4 层 >43 秒。
+#   这里给 Debug 配置**补上 -O2**（保留 -g debug 信息，只加优化级别），
+#   与 `GGML_CPU_ARM_ARCH=armv8.6-a+dotprod+fp16+i8mm` 一起构成移动端可用的性能基线。
+set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} -O2")
+set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -O2")
+
 add_subdirectory(llama.cpp build-llama)
 
 add_library(qlh_llama_jni SHARED qlh_llama_jni.cpp)

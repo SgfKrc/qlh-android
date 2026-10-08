@@ -262,8 +262,17 @@ Java_com_qlh_inference_service_LocalInferenceEngine_nativeLoadModel(
     //   层段（layer_forward）每步注入的是**整段序列**的 hidden，长 prefill 会超过 512
     //   ⇒ `llama_decode` 越界（实验侧实测 rc=0xC0000409）。批量必须能吃下最长序列，
     //   故与 n_ctx 联动（上游 llama.cpp 的默认 n_batch 也是 2048 量级）。
-    ctx_params.n_batch = ctx_params.n_ctx;
-    ctx_params.n_ubatch = ctx_params.n_ctx;
+    // ★ 2026-10-08（真机性能，子 agent 取证）：`n_batch` 必须**够装下整段序列**（层段把
+    //   整段 hidden 作为 embd 一次 decode），但 `n_ubatch` **不需要**跟着等于 n_ctx ——
+    //   llama.cpp 按 `min(n_ctx, n_ubatch)` 做 worst-case 图预留，而 QWEN35 的
+    //   `graph_max_nodes = n_tokens*40`，n_ubatch=32768 时每次 memory update 都要预留约
+    //   131 万节点。真机实测：`n_batch = n_ubatch = n_ctx = 32768` ⇒ 1062 tokens × 4 层
+    //   >43 秒（超 stage 超时）。现在 `n_batch` 取「够装序列」的**有限上界**，
+    //   `n_ubatch` 降到内部微批量级。
+    const int batch_limit = std::max(
+        2048, std::min(static_cast<int>(ctx_params.n_ctx), 8192));
+    ctx_params.n_batch = static_cast<uint32_t>(batch_limit);
+    ctx_params.n_ubatch = static_cast<uint32_t>(std::min(512, batch_limit));
     ctx_params.n_threads = n_threads;
     ctx_params.n_threads_batch = n_threads;
     ctx_params.no_perf = true;
