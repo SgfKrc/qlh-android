@@ -661,15 +661,41 @@ private fun formatTime(timestamp: Long): String {
     return sdf.format(Date(timestamp))
 }
 
-private fun formatMetrics(metricsJson: String): String {
+/**
+ * 把后端 metrics 渲染成状态行（与 TUI 的 `tui_shared.format_metrics` **同口径**）。
+ *
+ * ★ 2026-10-08：`distributed_used` **无论真假都要显式呈现**，并补两处此前缺失的信息：
+ *  - 真分布式时给出**承层证据**（远端实际承了哪段层）——否则"分布式: 是"与
+ *    "本地假装分布式"无法区分；
+ *  - 请求侧**要求过**分布式（`routing_preference` 为 preferred/required，或
+ *    `distributed_requested`）但实际未生效时必须提示 —— 此前只看全局开关，
+ *    用户用 `/route required` 而开关恰好关着时界面**完全静默**。
+ *
+ * 这两条正是"大批状态栏出现本地要求与分布式要求矛盾且无提示"的渲染侧对策。
+ */
+internal fun formatMetrics(metricsJson: String): String {
     return try {
         val obj = JSONObject(metricsJson)
         val parts = mutableListOf<String>()
         val engine = obj.optString("engine", obj.optString("execution_mode", ""))
         if (engine.isNotBlank()) parts += engine.replace("distributed_pipeline", "Pipeline")
-        if (obj.has("distributed_used")) {
-            parts += if (obj.optBoolean("distributed_used")) "分布式: 是" else "分布式: 否"
+        val segments = obj.optJSONArray("layer_segments")?.let { arr ->
+            (0 until arr.length()).mapNotNull { i ->
+                arr.optJSONArray(i)?.let { seg -> (0 until seg.length()).map { seg.optInt(it) } }
+            }
+        } ?: emptyList()
+        val claimed = obj.optJSONArray("claimed_layers")?.let { arr ->
+            (0 until arr.length()).map { arr.optInt(it) }
         }
+        val workers = obj.optJSONArray("workers_used")?.length() ?: 0
+        val status = distributedStatusLine(
+            hasDistributedField = obj.has("distributed_used"),
+            distributedUsed = obj.optBoolean("distributed_used", false),
+            requestedDistributed = obj.optBoolean("distributed_requested", false) ||
+                obj.optString("routing_preference", "").lowercase() in DISTRIBUTED_REQUEST_PREFS,
+            evidence = formatLayerEvidence(segments, claimed, workers),
+        )
+        if (status.isNotBlank()) parts += status
         val tokens = listOf("generated_tokens", "new_tokens", "completion_tokens", "tokens_generated")
             .firstNotNullOfOrNull { key -> obj.optInt(key, 0).takeIf { it > 0 } }
         if (tokens != null) parts += "$tokens tokens"
@@ -687,4 +713,46 @@ private fun formatMetrics(metricsJson: String): String {
     } catch (_: Exception) {
         metricsJson
     }
+}
+
+/** 请求侧要求分布式的 `routing_preference` 取值（与后端 `ChatRequest.routing_preference` 一致）。 */
+internal val DISTRIBUTED_REQUEST_PREFS = setOf("distributed_preferred", "distributed_required")
+
+/**
+ * 分布式状态片段（**不依赖 JSON 的纯函数**，便于 JVM 单测直接覆盖）。
+ *
+ * ⚠️ 为什么要抽出来：Android 的 JVM unit test 里 `org.json` 是**未实现的 stub**
+ * （调用即抛 `RuntimeException: not mocked`）⇒ 把判定留在 `formatMetrics` 里会让逻辑
+ * 不可测（只能落进 catch）。抽成纯函数后，四条分支都能被直接钉住。
+ */
+internal fun distributedStatusLine(
+    hasDistributedField: Boolean,
+    distributedUsed: Boolean,
+    requestedDistributed: Boolean,
+    evidence: String,
+): String = when {
+    distributedUsed -> "分布式 ✓" + evidence
+    requestedDistributed -> "⚠️ 已请求分布式，实际本地"
+    hasDistributedField -> "⚠️ 本地执行（未用分布式）"
+    else -> ""
+}
+
+/** 远端**实际承了哪段层**的短证据（与 TUI `tui_shared._distributed_evidence` 同口径）。 */
+internal fun formatLayerEvidence(
+    segments: List<List<Int>>,
+    claimed: List<Int>?,
+    workers: Int,
+): String {
+    if (segments.isNotEmpty()) {
+        val first = segments.first()
+        val last = segments.last()
+        return if (first.isNotEmpty() && last.size >= 2) {
+            "（${segments.size} 段·层 ${first[0]}-${last[1]}）"
+        } else {
+            "（${segments.size} 段）"
+        }
+    }
+    if (claimed != null && claimed.size == 2) return "（层 ${claimed[0]}-${claimed[1]}）"
+    if (workers > 0) return "（$workers 个 worker）"
+    return ""
 }
