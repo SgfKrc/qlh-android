@@ -788,22 +788,45 @@ class TaskWorkerClient(
 
     private suspend fun receiveLoop(connection: TaskWorkerTransport) {
         while (scope.isActive && machine.snapshot().connection == TaskWorkerConnectionState.READY) {
-            when (val event = connection.receiveEvent()) {
-                TaskWorkerInboundEvent.Closed -> throw EOFException("coordinator closed worker connection")
-                TaskWorkerInboundEvent.HeartbeatAck -> Unit
-                is TaskWorkerInboundEvent.Envelope -> when (event.value.messageType) {
-                    TaskWorkerProtocol.STAGE_OFFER -> handleOffer(connection, event.value)
-                    TaskWorkerProtocol.STAGE_CANCEL -> handleCancel(connection, event.value)
-                    TaskWorkerProtocol.LEASE_RENEW -> handleLeaseRenew(event.value)
-                    // ★ 2026-10-07（DIST-NEXT-2b）：大 payload 分片 —— 只累积；装配在
-                    //   随后的 `stage_offer` 路径完成（收到 offer 时分片应当已齐备）。
-                    TaskWorkerProtocol.STAGE_CHUNK -> handleStageChunk(event.value)
-                    else -> throw TaskWorkerProtocolException(
-                        "unexpected coordinator message for Android worker",
-                        "unexpected_message_type",
-                        "message_type",
-                    )
+            val event = connection.receiveEvent()
+            // ★ 2026-10-08（真机 P0 候选）：**分发层必须容错**。此前 `handleOffer` 里任何
+            //   未预期的异常（例如分片装配抛出的类型不在那一个 `catch` 里）都会直接逃出本
+            //   循环 ⇒ 读循环**静默死亡** ⇒ 之后 offer/分片全部无人处理，而心跳是另一个协程、
+            //   仍在照常发送。真机现象与此完全一致：18 片 + offer 都送达、设备侧 CPU 空闲、
+            //   连一条装配日志都没有，master 只看到 `remote Stage response timed out`。
+            try {
+                when (event) {
+                    TaskWorkerInboundEvent.Closed -> throw EOFException("coordinator closed worker connection")
+                    TaskWorkerInboundEvent.HeartbeatAck -> Unit
+                    is TaskWorkerInboundEvent.Envelope -> when (event.value.messageType) {
+                        TaskWorkerProtocol.STAGE_OFFER -> handleOffer(connection, event.value)
+                        TaskWorkerProtocol.STAGE_CANCEL -> handleCancel(connection, event.value)
+                        TaskWorkerProtocol.LEASE_RENEW -> handleLeaseRenew(event.value)
+                        // ★ 2026-10-07（DIST-NEXT-2b）：大 payload 分片 —— 只累积；装配在
+                        //   随后的 `stage_offer` 路径完成（收到 offer 时分片应当已齐备）。
+                        TaskWorkerProtocol.STAGE_CHUNK -> handleStageChunk(event.value)
+                        else -> throw TaskWorkerProtocolException(
+                            "unexpected coordinator message for Android worker",
+                            "unexpected_message_type",
+                            "message_type",
+                        )
+                    }
                 }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: EOFException) {
+                // 对端关闭 / 显式 EOF ⇒ 维持既有语义，交上层重连。
+                throw error
+            } catch (error: java.io.IOException) {
+                // 传输层已坏 ⇒ 同样交上层重连，不要在这里吞掉。
+                throw error
+            } catch (error: Exception) {
+                // 单条消息处理失败**不得**掐死整条连接：记名后继续读下一帧。
+                QlhLogger.w(
+                    "TaskWorkerClient",
+                    "message handling failed (connection kept): " +
+                        "${error::class.simpleName}: ${error.message ?: ""}",
+                )
             }
         }
     }
@@ -836,7 +859,21 @@ class TaskWorkerClient(
             return
         }
         val handler = stageHandler
+        // ★ 2026-10-08（诊断，定位后降级）：真机卡点 —— 18 片分片与 offer 都完好送达，
+        //   但之后**没有任何**装配/执行/拒绝痕迹、CPU 全程空闲。下面几个分支此前完全静默，
+        //   是最大嫌疑；先把它们全部变可见，避免继续靠推断。
+        val hasHiddenRef = (payload["root_input"] as? Map<*, *>)?.containsKey("hidden_ref") == true
+        QlhLogger.d(
+            "TaskWorkerClient",
+            "stage offer handling: stage=${identity.stageId} attempt=${identity.attemptId} " +
+                "handlerNull=${handler == null} hasHiddenRef=$hasHiddenRef",
+        )
         if (handler == null) {
+            QlhLogger.w(
+                "TaskWorkerClient",
+                "stage offer rejected: worker_execution_not_configured (stageHandler is null) " +
+                    "stage=${identity.stageId}",
+            )
             machine.fail(identity, "worker_execution_not_configured", retryable = true)
             publish()
             connection.send(TaskWorkerProtocol.buildStageAccept(
@@ -850,6 +887,11 @@ class TaskWorkerClient(
         val effectiveOffer = try {
             assembleChunkedRootInput(envelope)
         } catch (error: AndroidFullWorkerStageException) {
+            QlhLogger.w(
+                "TaskWorkerClient",
+                "stage offer rejected: chunked assembly failed ${error.code} " +
+                    "${error.message ?: ""}",
+            )
             machine.fail(identity, error.code, retryable = true)
             publish()
             connection.send(TaskWorkerProtocol.buildStageAccept(
