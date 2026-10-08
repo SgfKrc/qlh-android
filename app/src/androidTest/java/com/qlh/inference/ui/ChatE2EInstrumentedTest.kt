@@ -112,25 +112,48 @@ class ChatE2EInstrumentedTest {
         val (host, port) = configuredBackend()
         val base = "http://$host:$port"
 
-        // ---- 前置（只读探测）：后端可达 / 集群就绪 / capacity 可解；任一不满足即 skip ----
-        val health = httpGet("$base/api/health")
-        assumeTrue("后端不可达：$base/api/health -> HTTP ${health.first}", health.first == 200)
-
-        val capacityRaw = httpGet("$base/api/cluster/pipeline-capacity")
+        // ---- 前置（只读探测，**带等待**）：instrumentation 启动时会重启 target 包，
+        //   App 的 TaskWorker 需要重新注册、并经 master 重新求解容量后才出现在
+        //   `/cluster/pipeline-capacity` 的远端段里。一次性检查必然踩在窗口里，
+        //   把"可用的三机集群"误判成"集群未就绪"（2026-10-08 实测：连跑两次都 skip，
+        //   同一时刻手工 curl 却 admitted=True + 两个远端段）。这里轮询等待，
+        //   判据本身不放宽：仍要求 admitted 且有远端段。
+        var capacity: JSONObject? = null
+        var remoteRanges: List<Pair<Int, Int>> = emptyList()
+        var lastReason = "（尚未探测）"
+        val deadline = System.currentTimeMillis() + PRECONDITION_WAIT_MS
+        while (System.currentTimeMillis() < deadline) {
+            val health = httpGet("$base/api/health")
+            if (health.first != 200) {
+                lastReason = "后端不可达：$base/api/health -> HTTP ${health.first}"
+            } else {
+                val capacityRaw = httpGet("$base/api/cluster/pipeline-capacity")
+                if (capacityRaw.first != 200) {
+                    lastReason =
+                        "capacity 端点不可用：HTTP ${capacityRaw.first}"
+                } else {
+                    val parsed = JSONObject(capacityRaw.second)
+                    if (!parsed.optBoolean("admitted", false)) {
+                        lastReason =
+                            "capacity 未给出可用计划（reason=${parsed.optString("reason_code")}）"
+                    } else {
+                        val ranges = remoteRangesOf(parsed)
+                        if (ranges.isEmpty()) {
+                            lastReason = "capacity 没有任何远端（非 master）段"
+                        } else {
+                            capacity = parsed
+                            remoteRanges = ranges
+                            break
+                        }
+                    }
+                }
+            }
+            Thread.sleep(PRECONDITION_POLL_MS)
+        }
         assumeTrue(
-            "capacity 端点不可用：$base/api/cluster/pipeline-capacity -> HTTP ${capacityRaw.first}",
-            capacityRaw.first == 200,
-        )
-        val capacity = JSONObject(capacityRaw.second)
-        assumeTrue(
-            "capacity 未给出可用计划（reason=${capacity.optString("reason_code")}）" +
-                "⇒ 集群未就绪，本档 skip（不当失败）",
-            capacity.optBoolean("admitted", false),
-        )
-        val remoteRanges = remoteRangesOf(capacity)
-        assumeTrue(
-            "capacity 没有任何**远端**（非 master）段 ⇒ 无从验证'不是本地假装分布式'",
-            remoteRanges.isNotEmpty(),
+            "集群未就绪（等 ${PRECONDITION_WAIT_MS / 1000}s 仍不满足，最后一次：$lastReason）" +
+                "⇒ 本档 skip（不当失败）",
+            capacity != null && remoteRanges.isNotEmpty(),
         )
 
         // ---- 操作：只走 UI（聊天输入框 + 发送按钮）----
@@ -152,8 +175,8 @@ class ChatE2EInstrumentedTest {
                 "；已渲染内容（前 600 字）: ${dump.take(600)}",
             evidence != null,
         )
-        val segStart = evidence!!.groupValues[1].toInt()
-        val segEnd = evidence.groupValues[2].toInt()
+        val segStart = evidence!!.groupValues[2].toInt()
+        val segEnd = evidence.groupValues[3].toInt()
         assertTrue("承层区间非法：$segStart-$segEnd", segStart < segEnd)
 
         // ---- 交叉核验：承层区间必须与 capacity 的远端段有交叠（防本地假装分布式）----
@@ -206,6 +229,9 @@ class ChatE2EInstrumentedTest {
         const val DISTRIBUTED_MARK = "分布式 ✓"
         const val E2E_MAX_TOKENS = 24
         const val TIMEOUT_MS = 300_000L
+        /** 前置探测最长等待：instrumentation 重启 target 包后 worker 需重新注册并被重新求解。 */
+        const val PRECONDITION_WAIT_MS = 150_000L
+        const val PRECONDITION_POLL_MS = 5_000L
         /** 完整状态行片段：`分布式 ✓（2 段·层 0-24）`。 */
         val EVIDENCE_PATTERN = Regex("""分布式\s*✓\s*（\s*(\d+)\s*段·层\s*(\d+)-(\d+)\s*）""")
     }
