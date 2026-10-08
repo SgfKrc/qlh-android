@@ -15,6 +15,11 @@ ksp = "2.1.0-1.0.29"
 splashScreen = "1.0.1"
 junit = "4.13.2"
 androidxJunit = "1.2.1"
+# runner 必须与 core/monitor 同代：此前解析到 runner 1.5.0 配 core 1.6.1 +
+# monitor 1.7.1 的混搭，`InstrumentationActivityInvoker$EmptyActivity` 在 teardown
+# 阶段启动失败（ActivityNotFoundException），使所有 createAndroidComposeRule 档被
+# 报成 FAILED —— 2026-10-08 首次真跑 e2e 才暴露。
+androidxTestRunner = "1.6.2"
 
 [libraries]
 # AndroidX Core
@@ -60,6 +65,7 @@ kotlinx-coroutines-android = { group = "org.jetbrains.kotlinx", name = "kotlinx-
 # Tests
 junit = { group = "junit", name = "junit", version.ref = "junit" }
 androidx-test-ext-junit = { group = "androidx.test.ext", name = "junit", version.ref = "androidxJunit" }
+androidx-test-runner = { group = "androidx.test", name = "runner", version.ref = "androidxTestRunner" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

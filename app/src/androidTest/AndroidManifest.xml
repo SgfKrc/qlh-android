@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  ★ 2026-10-08：instrumentation 的 teardown 阶段必需这三个 invoker activity。
+  `ActivityScenario.close()` 会经 `InstrumentationActivityInvoker` 启动
+  `EmptyActivity` 把被测 activity 顶掉，缺声明即抛
+  `ActivityNotFoundException: com.qlh.inference.debug.test/androidx.test.core.app.InstrumentationActivityInvoker$EmptyActivity`
+  —— 那会把**已经跑完断言**的档报成 FAILED（`ChatE2EInstrumentedTest` 首次真跑才暴露）。
+
+  实测结论（2026-10-08，同一台设备）：
+  * 保留 AGP 从 `androidx.test:core` 合并进来的声明 + 解析到 `runner:1.5.0`
+    配 `core:1.6.1`/`monitor:1.7.1` 的混搭 ⇒ 恒抛上述异常；
+  * 显式对齐 `androidx.test:runner:1.6.2` 并**卸载设备上残留的测试包**
+    （`adb uninstall com.qlh.inference.debug.test`）后异常消失，
+    `ChatScreenTest` 从「4 个全 ActivityNotFound」变成只剩 2 个真实业务断言失败，
+    e2e 档从 FAILED 变成干净的 SKIPPED。
+  这里保留显式声明，是为了让合并结果不随 AAR/AGP 版本漂移而静默丢失。
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <application>
+        <activity
+            android:name="androidx.test.core.app.InstrumentationActivityInvoker$BootstrapActivity"
+            android:exported="true"
+            android:theme="@android:style/Theme.DeviceDefault"
+            tools:node="replace" />
+        <activity
+            android:name="androidx.test.core.app.InstrumentationActivityInvoker$EmptyActivity"
+            android:exported="true"
+            android:theme="@android:style/Theme.DeviceDefault"
+            tools:node="replace" />
+        <activity
+            android:name="androidx.test.core.app.InstrumentationActivityInvoker$EmptyFloatingActivity"
+            android:exported="true"
+            android:theme="@android:style/Theme.DeviceDefault"
+            tools:node="replace" />
+    </application>
+</manifest>

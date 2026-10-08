@@ -144,6 +144,9 @@ dependencies {
     androidTestImplementation(platform(libs.compose.bom))
     androidTestImplementation(libs.compose.ui.test.junit4)
     androidTestImplementation(libs.androidx.test.ext.junit)
+    // 显式对齐 runner：否则解析到 1.5.0，与 core 1.6.1 / monitor 1.7.1 混搭会让
+    // ActivityScenario 在 teardown 找不到 InstrumentationActivityInvoker$EmptyActivity。
+    androidTestImplementation(libs.androidx.test.runner)
     androidTestImplementation(libs.junit)
 
     // JVM 单元测试（纯逻辑，无需设备）
