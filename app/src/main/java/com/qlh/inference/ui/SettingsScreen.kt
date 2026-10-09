@@ -1478,14 +1478,31 @@ private fun ConnectionGroup(
             enabled = !isTesting
         )
         Spacer(modifier = Modifier.height(12.dp))
+        // ★ 2026-10-09 修 #79：端口输入框此前是 `value = serverPort.toString()` +
+        //   `onValueChange = { it.toIntOrNull()?.let(onServerPortChange) }` 的**逐位 Int 回写**：
+        //   每敲一位就 Int→String 重写整个输入框，中间态（空串/前导位）被丢弃或重排，
+        //   实测把想输的 8000 搞成了 `802500`；而当时**没有任何范围校验**，非法值直接写进
+        //   datastore ⇒ `Invalid URL port: "802500"` ⇒ App 启动即失败（且 UI 毫无提示）。
+        //   现在：本地 String 状态 + 只收数字 + 长度上限 + 1..65535 校验，非法时不提交且红框提示。
+        var portText by remember(serverPort) { mutableStateOf(serverPort.toString()) }
+        val portValue = portText.toIntOrNull()
+        val portInvalid = portValue == null || portValue !in 1..65535
         OutlinedTextField(
-            value = serverPort.toString(),
-            onValueChange = { it.toIntOrNull()?.let(onServerPortChange) },
+            value = portText,
+            onValueChange = { raw ->
+                val digits = raw.filter { it.isDigit() }.take(5)
+                portText = digits
+                digits.toIntOrNull()?.let { if (it in 1..65535) onServerPortChange(it) }
+            },
             label = { Text("端口") },
             modifier = Modifier.fillMaxWidth(),
             singleLine = true,
             shape = MaterialTheme.shapes.small,
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+            isError = portInvalid,
+            supportingText = if (portInvalid) {
+                { Text("端口需为 1–65535（TCP 工作端口，默认 8888）") }
+            } else null,
             enabled = !isTesting
         )
         Spacer(modifier = Modifier.height(16.dp))

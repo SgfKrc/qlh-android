@@ -1393,6 +1393,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun setServerPort(port: Int) {
+        // ★ 2026-10-09 修 #79：兜住非法端口。UI 已做校验，但 datastore 里可能已存在历史脏值
+        //   （实测 `802500`），且任何调用方都不该把非法值写进去 —— 非法端口会让
+        //   `httpBaseUrl()` 产出非法 URL（`Invalid URL port`）⇒ `ensureAndroidBootstrap` 直接失败
+        //   ⇒ 表现为「App 启动即坏、还不说原因」。
+        if (port !in 1..65535) {
+            QlhLogger.w("MainViewModel", "忽略非法端口: $port（应为 1..65535），保持 ${_uiState.value.serverPort}")
+            return
+        }
         viewModelScope.launch {
             settings.setServerPort(port)
             settings.clearBootstrapConfig()
