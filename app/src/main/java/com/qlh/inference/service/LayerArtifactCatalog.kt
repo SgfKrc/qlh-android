@@ -20,10 +20,19 @@ data class LayerArtifactDescriptor(
      * 整模不算段）。
      *
      * 为什么必须广告出去：`layer_ranges` 只说「本节点覆盖哪些层」，**不区分它是
-     * 中间段还是末段** —— 而中间段工件没有 `lm_head`/`final_norm`，被分到末段
-     * 必然执行失败。2026-10-05 三机实测正是如此：Y700 加载 `mid8-24`
-     * （`mode=middle`，`[8,24)`）却按区间被分到末段 `[20,24)`，master 只比对区间
-     * 覆盖就放行 ⇒ `remote worker reported a Stage error`。
+     * 首段 / 中间段 / 末段** ⇒ master 只比对区间覆盖就会放行**段类型不匹配**的分配。
+     * 2026-10-05 三机实测正是如此：Y700 加载 `mid8-24`
+     * （`mode=middle`，`[8,24)`）却按区间被分到末段位次 `[20,24)`
+     * ⇒ `remote worker reported a Stage error`。
+     *
+     * ⚠️ **2026-10-09 更正**：本注释原写「中间段工件没有 `lm_head`/`final_norm`」——
+     * **与实际产物矛盾**。实测 `build/keephead/q35-2b-cut-16-20.manifest.json`
+     * （`mode=middle`）的 `tensors_kept=55`，正是 3 个 linear 层×14 + 1 个 full 层×11
+     * + **2 个非 blk 张量**（`token_embd` 与 `output_norm`；该模型 tie embeddings，
+     * 故无独立 `output.weight`）⇒ **中间段工件是带 `output_norm` 的**。
+     * 真正导致失败的机制是**段角色与位次不符**（middle 工件的张量集合按"中间位次"切出，
+     * 被派到末段位次后职责对不上），**不是"缺少某些张量"**。
+     * 三机实测结论不变，只是归因写错了。
      *
      * Missing or unknown modes are rejected so an ambiguous artifact is never advertised.
      */
