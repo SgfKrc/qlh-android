@@ -186,6 +186,9 @@ class AndroidWorkerCapabilitiesTest {
                 modelId = "head0-8.gguf",
                 artifactSha256 = "b".repeat(64),
                 sourceModelSha256 = "a".repeat(64),
+                sourceModelId = "qwen3-5-2b",
+                hiddenSize = 2048,
+                tokenizerSha256 = "d".repeat(64),
             ),
             AndroidWorkerCapabilities.LayerArtifactCapability(
                 startLayer = 8,
@@ -210,6 +213,11 @@ class AndroidWorkerCapabilitiesTest {
         assertEquals(2, models.size)
         assertEquals("b".repeat(64), (models[0] as Map<*, *>)["sha256"])
         assertEquals("c".repeat(64), (models[1] as Map<*, *>)["sha256"])
+        val advertisedArtifacts = capabilities["layer_artifacts"] as List<*>
+        val headArtifact = advertisedArtifacts[0] as Map<*, *>
+        assertEquals("qwen3-5-2b", headArtifact["source_model_id"])
+        assertEquals(2048, headArtifact["hidden_size"])
+        assertEquals("d".repeat(64), headArtifact["tokenizer_sha256"])
         TaskWorkerProtocol.validate(
             TaskWorkerProtocol.buildHello(
                 nodeId = "android_multi_artifact_01",
@@ -288,6 +296,40 @@ class AndroidWorkerCapabilitiesTest {
                         8, 12, "middle", "mid4-8.gguf", "c".repeat(64),
                     ),
                 ),
+            )
+        }
+    }
+
+    @Test
+    fun `artifact preflight contract is validated as an all or none tuple`() {
+        assertThrows(IllegalArgumentException::class.java) {
+            AndroidWorkerCapabilities.LayerArtifactCapability(
+                4, 8, "middle", "mid4-8.gguf", "b".repeat(64),
+                sourceModelId = "qwen3-5-2b",
+            )
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            AndroidWorkerCapabilities.LayerArtifactCapability(
+                4, 8, "middle", "mid4-8.gguf", "b".repeat(64),
+                sourceModelId = "bad id",
+                hiddenSize = 2048,
+                tokenizerSha256 = "c".repeat(64),
+            )
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            AndroidWorkerCapabilities.LayerArtifactCapability(
+                4, 8, "middle", "mid4-8.gguf", "b".repeat(64),
+                sourceModelId = "qwen3-5-2b",
+                hiddenSize = 0,
+                tokenizerSha256 = "c".repeat(64),
+            )
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            AndroidWorkerCapabilities.LayerArtifactCapability(
+                4, 8, "middle", "mid4-8.gguf", "b".repeat(64),
+                sourceModelId = "qwen3-5-2b",
+                hiddenSize = 2048,
+                tokenizerSha256 = "not-a-digest",
             )
         }
     }

@@ -13,6 +13,9 @@ data class LayerArtifactDescriptor(
     val endLayerExclusive: Int,
     val artifactSha256: String,
     val sourceModelSha256: String,
+    val sourceModelId: String?,
+    val hiddenSize: Int?,
+    val tokenizerSha256: String?,
     val architecture: String,
     /**
      * ★ 2026-10-05（DIST-3 实测缺口）：工件在源模型里的**段类型**，取值同主仓
@@ -40,7 +43,9 @@ data class LayerArtifactDescriptor(
 )
 
 /** Parser for the main repository's layer artifact manifests. */
-object LayerArtifactManifestParser {    private val sha256Pattern = Regex("[0-9a-fA-F]{64}")
+object LayerArtifactManifestParser {
+    private val sha256Pattern = Regex("[0-9a-fA-F]{64}")
+    private val safeIdPattern = Regex("^[A-Za-z0-9_.:-]{1,128}$")
     private val segmentModes = setOf("head", "middle", "tail")
 
     fun parse(raw: String, manifestName: String): Result<LayerArtifactDescriptor> = runCatching {
@@ -63,6 +68,22 @@ object LayerArtifactManifestParser {    private val sha256Pattern = Regex("[0-9a
                 "manifest source model digest is invalid"
             }
         }
+        val sourceModelId = string(root, "source_model_id")
+        val tokenizerSha256 = string(root, "tokenizer_sha256").lowercase()
+        val hiddenSize = positiveInt(root, "hidden_size")
+        val modelPreflightContractPresent =
+            sourceModelId.isNotBlank() || tokenizerSha256.isNotBlank()
+        if (modelPreflightContractPresent) {
+            require(safeIdPattern.matches(sourceModelId)) {
+                "manifest source_model_id is invalid"
+            }
+            require(hiddenSize != null) {
+                "manifest hidden_size must be a positive integer"
+            }
+            require(sha256Pattern.matches(tokenizerSha256)) {
+                "manifest tokenizer_sha256 must be a 64-char hex digest"
+            }
+        }
         require(range.first >= 0 && range.second > range.first) {
             "manifest layer range must be non-empty"
         }
@@ -78,6 +99,9 @@ object LayerArtifactManifestParser {    private val sha256Pattern = Regex("[0-9a
             endLayerExclusive = range.second,
             artifactSha256 = artifactSha,
             sourceModelSha256 = sourceSha,
+            sourceModelId = sourceModelId.takeIf { modelPreflightContractPresent },
+            hiddenSize = hiddenSize,
+            tokenizerSha256 = tokenizerSha256.takeIf { modelPreflightContractPresent },
             architecture = string(root, "architecture"),
             mode = mode,
         )
@@ -100,6 +124,16 @@ object LayerArtifactManifestParser {    private val sha256Pattern = Regex("[0-9a
 
     private fun string(root: JsonObject, name: String): String =
         root.get(name)?.takeUnless { it.isJsonNull }?.asString?.trim().orEmpty()
+
+    private fun positiveInt(root: JsonObject, name: String): Int? {
+        val item = root.get(name)?.takeUnless { it.isJsonNull } ?: return null
+        if (!item.isJsonPrimitive || !item.asJsonPrimitive.isNumber) return null
+        val number = runCatching { item.asDouble }.getOrNull() ?: return null
+        if (!number.isFinite() || number % 1.0 != 0.0 || number < 1 || number > Int.MAX_VALUE) {
+            return null
+        }
+        return number.toInt()
+    }
 }
 
 /**

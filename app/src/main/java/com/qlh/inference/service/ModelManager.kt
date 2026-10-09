@@ -389,6 +389,9 @@ class ModelManager(private val context: Context) {
                     endLayerExclusive = descriptor.endLayerExclusive,
                     artifactSha256 = descriptor.artifactSha256,
                     sourceModelSha256 = descriptor.sourceModelSha256,
+                    sourceModelId = descriptor.sourceModelId,
+                    hiddenSize = descriptor.hiddenSize,
+                    tokenizerSha256 = descriptor.tokenizerSha256,
                     architecture = descriptor.architecture,
                     // ★ 2026-10-05（DIST-3）：段类型透传（`head`/`middle`/`tail`）。
                     mode = descriptor.mode,
@@ -1227,6 +1230,9 @@ class ModelManager(private val context: Context) {
         val endLayerExclusive: Int,
         val artifactSha256: String,
         val sourceModelSha256: String,
+        val sourceModelId: String?,
+        val hiddenSize: Int?,
+        val tokenizerSha256: String?,
         val architecture: String,
         /**
          * ★ 2026-10-05（DIST-3 实测缺口）：工件段类型（`head`/`middle`/`tail`），

@@ -341,13 +341,17 @@ class TaskWorkerProtocolTest {
         )
 
         val invalidItems = listOf(
-            validArtifact() + ("segment_mode" to "whole"),
-            validArtifact() + ("layer_range" to listOf(4.5, 16)),
-            validArtifact() + ("artifact_sha256" to "not-a-digest"),
-            validArtifact() + ("unexpected" to true),
+            validArtifact() + ("segment_mode" to "whole") to "invalid_capabilities",
+            validArtifact() + ("layer_range" to listOf(4.5, 16)) to "invalid_capabilities",
+            validArtifact() + ("artifact_sha256" to "not-a-digest") to "invalid_capabilities",
+            validArtifact() + ("source_model_id" to "bad id") to "invalid_capabilities",
+            validArtifact() + ("hidden_size" to 0) to "invalid_capabilities",
+            validArtifact() + ("tokenizer_sha256" to "not-a-digest") to "invalid_capabilities",
+            validArtifact() - "tokenizer_sha256" to "invalid_capabilities",
+            validArtifact() + ("unexpected" to true) to "invalid_fields",
         )
-        invalidItems.forEachIndexed { index, item ->
-            expectProtocolError(if (index == 3) "invalid_fields" else "invalid_capabilities") {
+        invalidItems.forEachIndexed { index, (item, errorCode) ->
+            expectProtocolError(errorCode) {
                 TaskWorkerProtocol.validate(
                     TaskWorkerProtocol.buildHello(
                         nodeId = "android_worker_01",
@@ -358,6 +362,19 @@ class TaskWorkerProtocolTest {
                 )
             }
         }
+
+        TaskWorkerProtocol.validate(
+            TaskWorkerProtocol.buildHello(
+                nodeId = "android_worker_01",
+                capabilities = artifactCapabilities(
+                    validArtifact() - setOf(
+                        "source_model_id", "hidden_size", "tokenizer_sha256",
+                    ),
+                ),
+                messageId = "msg_legacy_artifact_item_01",
+                sentAtMs = 1_700_000_000_000,
+            ),
+        )
     }
 
     @Test
@@ -424,6 +441,9 @@ class TaskWorkerProtocolTest {
         "model_id" to "mid4-16.gguf",
         "artifact_sha256" to "b".repeat(64),
         "source_model_sha256" to "a".repeat(64),
+        "source_model_id" to "qwen3-5-2b",
+        "hidden_size" to 2048,
+        "tokenizer_sha256" to "c".repeat(64),
     )
 
     private fun artifactCapabilities(

@@ -652,7 +652,28 @@ object TaskWorkerProtocol {
                 } else {
                     emptySet()
                 }
-                requireExact(artifact.keys.map { it.toString() }.toSet(), expectedFields, field)
+                val modelPreflightFields = setOf(
+                    "source_model_id", "hidden_size", "tokenizer_sha256",
+                )
+                val presentModelPreflightFields = modelPreflightFields.filterTo(mutableSetOf()) {
+                    artifact.containsKey(it)
+                }
+                if (
+                    presentModelPreflightFields.isNotEmpty() &&
+                    presentModelPreflightFields != modelPreflightFields
+                ) {
+                    fail(
+                        "source_model_id, hidden_size, and tokenizer_sha256 " +
+                            "must be declared together",
+                        "invalid_capabilities",
+                        field,
+                    )
+                }
+                requireExact(
+                    artifact.keys.map { it.toString() }.toSet(),
+                    expectedFields + presentModelPreflightFields,
+                    field,
+                )
                 val range = capabilityLayerRange(artifact["layer_range"], "$field.layer_range")
                 if (!artifactRanges.add(range)) {
                     fail(
@@ -696,6 +717,32 @@ object TaskWorkerProtocol {
                             "layer artifact source_model_sha256 is invalid",
                             "invalid_capabilities",
                             "$field.source_model_sha256",
+                        )
+                    }
+                }
+                if (presentModelPreflightFields.isNotEmpty()) {
+                    val sourceModelId = artifact["source_model_id"] as? String
+                    if (sourceModelId == null || !safeId.matches(sourceModelId)) {
+                        fail(
+                            "layer artifact source_model_id is invalid",
+                            "invalid_capabilities",
+                            "$field.source_model_id",
+                        )
+                    }
+                    val hiddenSize = exactNonNegativeInt(artifact["hidden_size"])
+                    if (hiddenSize == null || hiddenSize < 1) {
+                        fail(
+                            "layer artifact hidden_size must be a positive integer",
+                            "invalid_capabilities",
+                            "$field.hidden_size",
+                        )
+                    }
+                    val tokenizerSha = artifact["tokenizer_sha256"] as? String
+                    if (tokenizerSha == null || !sha256.matches(tokenizerSha)) {
+                        fail(
+                            "layer artifact tokenizer_sha256 is invalid",
+                            "invalid_capabilities",
+                            "$field.tokenizer_sha256",
                         )
                     }
                 }

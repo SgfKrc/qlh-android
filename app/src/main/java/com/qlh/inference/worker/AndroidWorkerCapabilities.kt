@@ -23,6 +23,9 @@ object AndroidWorkerCapabilities {
         val modelId: String,
         val artifactSha256: String,
         val sourceModelSha256: String? = null,
+        val sourceModelId: String? = null,
+        val hiddenSize: Int? = null,
+        val tokenizerSha256: String? = null,
     ) {
         init {
             require(startLayer >= 0 && endLayerExclusive > startLayer) {
@@ -38,6 +41,21 @@ object AndroidWorkerCapabilities {
             require(sourceModelSha256 == null || SHA256.matches(sourceModelSha256)) {
                 "layer artifact source model digest must be a 64-char hex digest"
             }
+            val modelPreflightFields = listOf(sourceModelId, hiddenSize, tokenizerSha256)
+            require(modelPreflightFields.all { it == null } || modelPreflightFields.all { it != null }) {
+                "source model id, hidden size, and tokenizer digest must be declared together"
+            }
+            if (sourceModelId != null) {
+                require(SAFE_ID.matches(sourceModelId)) {
+                    "layer artifact source model id is invalid"
+                }
+                require(requireNotNull(hiddenSize) > 0) {
+                    "layer artifact hidden size must be positive"
+                }
+                require(SHA256.matches(requireNotNull(tokenizerSha256))) {
+                    "layer artifact tokenizer digest must be a 64-char hex digest"
+                }
+            }
         }
 
         fun toMap(): Map<String, Any> = linkedMapOf<String, Any>(
@@ -47,6 +65,11 @@ object AndroidWorkerCapabilities {
             "artifact_sha256" to artifactSha256.lowercase(),
         ).also { output ->
             sourceModelSha256?.let { output["source_model_sha256"] = it.lowercase() }
+            if (sourceModelId != null) {
+                output["source_model_id"] = sourceModelId
+                output["hidden_size"] = requireNotNull(hiddenSize)
+                output["tokenizer_sha256"] = requireNotNull(tokenizerSha256).lowercase()
+            }
         }
 
         fun modelIdentity(): Map<String, Any?> = mapOf(

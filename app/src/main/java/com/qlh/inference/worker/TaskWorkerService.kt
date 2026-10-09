@@ -174,6 +174,28 @@ class TaskWorkerService : Service() {
         // snapshot; re-hashing multi-GB GGUF files for every token would make
         // the stage path unusable.
         val verifiedLayerArtifacts = AtomicReference<List<ModelManager.LayerArtifact>>(emptyList())
+        val layerArtifactCapability = { artifact: ModelManager.LayerArtifact ->
+            val hasModelPreflightContract =
+                artifact.sourceModelId != null &&
+                    artifact.hiddenSize != null &&
+                    artifact.tokenizerSha256 != null
+            AndroidWorkerCapabilities.LayerArtifactCapability(
+                startLayer = artifact.startLayer,
+                endLayerExclusive = artifact.endLayerExclusive,
+                segmentMode = artifact.mode,
+                modelId = AndroidWorkerCapabilities.artifactModelId(
+                    artifact.document.name,
+                    artifact.artifactSha256,
+                ),
+                artifactSha256 = artifact.artifactSha256,
+                sourceModelSha256 = artifact.sourceModelSha256.ifBlank { null },
+                sourceModelId = artifact.sourceModelId.takeIf { hasModelPreflightContract },
+                hiddenSize = artifact.hiddenSize.takeIf { hasModelPreflightContract },
+                tokenizerSha256 = artifact.tokenizerSha256.takeIf {
+                    hasModelPreflightContract
+                },
+            )
+        }
         if (QlhApplication.instance.inferenceService == null && !BuildConfig.IS_LITE) {
             runCatching {
                 ContextCompat.startForegroundService(this, Intent(this, InferenceService::class.java))
@@ -195,19 +217,7 @@ class TaskWorkerService : Service() {
             verifiedLayerArtifacts.set(layerArtifacts.toList())
             val layerRanges = layerArtifacts
                 .map { listOf(it.startLayer, it.endLayerExclusive) }
-            val advertisedLayerArtifacts = layerArtifacts.map {
-                AndroidWorkerCapabilities.LayerArtifactCapability(
-                    startLayer = it.startLayer,
-                    endLayerExclusive = it.endLayerExclusive,
-                    segmentMode = it.mode,
-                    modelId = AndroidWorkerCapabilities.artifactModelId(
-                        it.document.name,
-                        it.artifactSha256,
-                    ),
-                    artifactSha256 = it.artifactSha256,
-                    sourceModelSha256 = it.sourceModelSha256.ifBlank { null },
-                )
-            }
+            val advertisedLayerArtifacts = layerArtifacts.map(layerArtifactCapability)
             val layerForwardInfo = QlhApplication.instance.inferenceService
                 ?.engine
                 ?.layerForwardInfo()
@@ -377,19 +387,7 @@ class TaskWorkerService : Service() {
                                 it.artifactSha256,
                             ) == requested["model_id"] &&
                             it.artifactSha256 == requested["sha256"]
-                    }?.let {
-                        AndroidWorkerCapabilities.LayerArtifactCapability(
-                            startLayer = it.startLayer,
-                            endLayerExclusive = it.endLayerExclusive,
-                            segmentMode = it.mode,
-                            modelId = AndroidWorkerCapabilities.artifactModelId(
-                                it.document.name,
-                                it.artifactSha256,
-                            ),
-                            artifactSha256 = it.artifactSha256,
-                            sourceModelSha256 = it.sourceModelSha256.ifBlank { null },
-                        ).modelIdentity()
-                    }
+                    }?.let { layerArtifactCapability(it).modelIdentity() }
                 },
             ),
         ).also { it.start() }
