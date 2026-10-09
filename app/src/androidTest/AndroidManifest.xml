@@ -19,20 +19,21 @@
     xmlns:tools="http://schemas.android.com/tools">
 
     <application>
+        <!-- ★ 2026-10-09：两条都试过、都不行，最终形态是「只声明 activity 名 + exported」：
+             1) `tools:node="replace"` ⇒ 宿主里原本没有同名节点时替换成"**置空**"而非"新增"
+                ⇒ teardown 仍抛 `ActivityNotFoundException: ...EmptyActivity`（本轮实测）；
+             2) 去掉后自带 `android:theme` ⇒ 与 `androidx.test:core:1.6.1` 的
+                `WhiteBackgroundDialogTheme` **冲突** ⇒ `Manifest merger failed`（本轮实测）。
+             ⇒ 故：不写 tools:node、不写 android:theme，只保证"这三个 activity 存在"，
+                其余属性交给 AAR 合并。 -->
         <activity
             android:name="androidx.test.core.app.InstrumentationActivityInvoker$BootstrapActivity"
-            android:exported="true"
-            android:theme="@android:style/Theme.DeviceDefault"
-            tools:node="replace" />
+            android:exported="true" />
         <activity
             android:name="androidx.test.core.app.InstrumentationActivityInvoker$EmptyActivity"
-            android:exported="true"
-            android:theme="@android:style/Theme.DeviceDefault"
-            tools:node="replace" />
+            android:exported="true" />
         <activity
             android:name="androidx.test.core.app.InstrumentationActivityInvoker$EmptyFloatingActivity"
-            android:exported="true"
-            android:theme="@android:style/Theme.DeviceDefault"
-            tools:node="replace" />
+            android:exported="true" />
     </application>
 </manifest>
