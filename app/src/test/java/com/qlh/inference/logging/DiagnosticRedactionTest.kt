@@ -11,6 +11,12 @@ class DiagnosticRedactionTest {
             """request Authorization: Bearer abcDEF_123456789
                access_token="token-secret-value"
                recovery_code=code-secret-value
+               cluster_secret="cluster-root-value"
+               private_key=private-key-value
+               join_credential=join-secret-value
+               -----BEGIN PRIVATE KEY-----
+               raw-private-material
+               -----END PRIVATE KEY-----
                model loaded successfully
             """.trimIndent(),
         )
@@ -18,6 +24,10 @@ class DiagnosticRedactionTest {
         assertFalse(redacted.contains("abcDEF_123456789"))
         assertFalse(redacted.contains("token-secret-value"))
         assertFalse(redacted.contains("code-secret-value"))
+        assertFalse(redacted.contains("cluster-root-value"))
+        assertFalse(redacted.contains("private-key-value"))
+        assertFalse(redacted.contains("join-secret-value"))
+        assertFalse(redacted.contains("raw-private-material"))
         assertTrue(redacted.contains("[REDACTED]"))
         assertTrue(redacted.contains("model loaded successfully"))
     }

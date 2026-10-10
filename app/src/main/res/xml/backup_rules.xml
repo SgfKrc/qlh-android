@@ -1,4 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <full-backup-content>
     <exclude domain="sharedpref" path="qlh_auth_session.xml" />
+    <exclude domain="sharedpref" path="qlh_cluster_credential.xml" />
+    <exclude domain="file" path="datastore/" />
+    <exclude domain="file" path="logs/" />
+    <exclude domain="database" path="." />
 </full-backup-content>

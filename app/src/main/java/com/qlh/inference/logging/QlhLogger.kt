@@ -114,48 +114,59 @@ object QlhLogger {
     // ──────────────────────────────────────────────
 
     fun v(tag: String, msg: String) {
-        log('V', tag, msg)
-        Log.v(tag, msg)
+        val safe = redactDiagnosticText(msg)
+        log('V', tag, safe)
+        Log.v(tag, safe)
     }
 
     fun d(tag: String, msg: String) {
-        log('D', tag, msg)
-        Log.d(tag, msg)
+        val safe = redactDiagnosticText(msg)
+        log('D', tag, safe)
+        Log.d(tag, safe)
     }
 
     fun i(tag: String, msg: String) {
-        log('I', tag, msg)
-        Log.i(tag, msg)
+        val safe = redactDiagnosticText(msg)
+        log('I', tag, safe)
+        Log.i(tag, safe)
     }
 
     fun w(tag: String, msg: String) {
-        log('W', tag, msg)
-        Log.w(tag, msg)
+        val safe = redactDiagnosticText(msg)
+        log('W', tag, safe)
+        Log.w(tag, safe)
     }
 
     fun e(tag: String, msg: String) {
-        log('E', tag, msg)
-        Log.e(tag, msg)
+        val safe = redactDiagnosticText(msg)
+        log('E', tag, safe)
+        Log.e(tag, safe)
     }
 
     fun e(tag: String, msg: String, tr: Throwable) {
-        log('E', tag, "$msg: ${tr.message}\n${Log.getStackTraceString(tr)}")
-        Log.e(tag, msg, tr)
+        val safe = redactDiagnosticText(
+            "$msg: ${tr.message}\n${Log.getStackTraceString(tr)}",
+        )
+        log('E', tag, safe)
+        Log.e(tag, safe)
     }
 
     /** 崩溃兜底日志：同步写文件，避免进程退出前 executor 尚未 flush。 */
     @Synchronized
     fun crash(tag: String, msg: String, tr: Throwable) {
+        val safe = redactDiagnosticText(
+            "$msg: ${tr.message}\n${Log.getStackTraceString(tr)}",
+        )
         try {
             if (logDir != null && writer == null) openCurrentFile()
             writer?.write(
                 "[${timestampFmt.format(LocalDateTime.now())}] [E/$tag] " +
-                    "$msg: ${tr.message}\n${Log.getStackTraceString(tr)}\n"
+                    "$safe\n"
             )
             writer?.flush()
         } catch (_: Exception) {
         }
-        Log.e(tag, msg, tr)
+        Log.e(tag, safe)
     }
 
     private fun log(level: Char, tag: String, msg: String) {

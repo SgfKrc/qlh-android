@@ -5,6 +5,9 @@ import com.google.gson.JsonParser
 import com.google.gson.annotations.SerializedName
 import com.qlh.inference.BuildConfig
 import com.qlh.inference.security.AuthSessionStore
+import com.qlh.inference.security.BootstrapCredentialEnvelope
+import com.qlh.inference.security.BootstrapCredentialExchange
+import com.qlh.inference.security.BootstrapCredentialException
 import com.qlh.inference.security.StoredAuthSession
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -250,7 +253,13 @@ data class BootstrapRequest(
     val appVariant: String = if (BuildConfig.IS_LITE) "lite" else "full",
     @SerializedName("app_version")
     val appVersion: String = BuildConfig.VERSION_NAME,
-    val capabilities: Map<String, Any?> = emptyMap()
+    val capabilities: Map<String, Any?> = emptyMap(),
+    @SerializedName("credential_public_key")
+    val credentialPublicKey: String = "",
+    @SerializedName("credential_request_nonce")
+    val credentialRequestNonce: String = "",
+    @SerializedName("credential_requested_at")
+    val credentialRequestedAt: Long = 0L,
 )
 
 data class BootstrapCluster(
@@ -264,8 +273,8 @@ data class BootstrapCluster(
     val masterTcpHost: String = "",
     @SerializedName("master_tcp_port")
     val masterTcpPort: Int = 8888,
-    @SerializedName("cluster_secret")
-    val clusterSecret: String = ""
+    @SerializedName("cluster_secret_epoch")
+    val clusterSecretEpoch: Int = 1,
 )
 
 data class BootstrapNode(
@@ -291,7 +300,14 @@ data class BootstrapResponse(
     val status: String = "",
     val cluster: BootstrapCluster = BootstrapCluster(),
     val node: BootstrapNode = BootstrapNode(),
-    val android: BootstrapAndroid = BootstrapAndroid()
+    val android: BootstrapAndroid = BootstrapAndroid(),
+    @SerializedName("credential_envelope")
+    val credentialEnvelope: BootstrapCredentialEnvelope? = null,
+)
+
+class BootstrapResult internal constructor(
+    val response: BootstrapResponse,
+    val clusterSecret: String,
 )
 
 // ================================================================
@@ -1110,9 +1126,16 @@ class ApiClient(
     }
 
     /** 首次连接自动部署：从主节点获取 Android 节点配置。 */
-    suspend fun firstConnectBootstrap(request: BootstrapRequest): Result<BootstrapResponse> = withContext(Dispatchers.IO) {
+    suspend fun firstConnectBootstrap(request: BootstrapRequest): Result<BootstrapResult> = withContext(Dispatchers.IO) {
         try {
-            val body = gson.toJson(request).toRequestBody(jsonMediaType)
+            val exchange = BootstrapCredentialExchange.create(request.nodeId)
+            val credentialRequest = exchange.requestFields
+            val protectedRequest = request.copy(
+                credentialPublicKey = credentialRequest.publicKey,
+                credentialRequestNonce = credentialRequest.requestNonce,
+                credentialRequestedAt = credentialRequest.requestedAt,
+            )
+            val body = gson.toJson(protectedRequest).toRequestBody(jsonMediaType)
             val httpRequest = Request.Builder()
                 .url("$baseUrl/api/bootstrap/first-connect")
                 .post(body)
@@ -1122,9 +1145,48 @@ class ApiClient(
             val response = executeAsync(httpRequest)
             val responseBody = response.body?.string() ?: "{}"
             if (!response.isSuccessful) {
-                return@withContext Result.failure(IOException("HTTP ${response.code}: $responseBody"))
+                return@withContext Result.failure(IOException("Bootstrap failed: HTTP ${response.code}"))
             }
-            Result.success(gson.fromJson(responseBody, BootstrapResponse::class.java))
+            val bootstrapResponse = try {
+                val responseJson = JsonParser.parseString(responseBody).asJsonObject
+                if (responseJson.getAsJsonObject("cluster")?.has("cluster_secret") == true) {
+                    throw BootstrapCredentialException("plaintext_secret_rejected")
+                }
+                val aadFields = responseJson.getAsJsonObject("credential_envelope")
+                    ?.getAsJsonObject("aad")
+                    ?.keySet()
+                if (aadFields != setOf(
+                        "cluster_id",
+                        "expires_at",
+                        "issued_at",
+                        "node_id",
+                        "request_nonce",
+                        "secret_epoch",
+                    )
+                ) {
+                    throw BootstrapCredentialException("aad_invalid")
+                }
+                gson.fromJson(responseJson, BootstrapResponse::class.java)
+                    ?: throw BootstrapCredentialException("response_invalid")
+            } catch (e: BootstrapCredentialException) {
+                throw e
+            } catch (_: Exception) {
+                throw BootstrapCredentialException("response_invalid")
+            }
+            if (bootstrapResponse.status !in setOf("ok", "registered", "updated")) {
+                throw BootstrapCredentialException("response_status_invalid")
+            }
+            val envelope = bootstrapResponse.credentialEnvelope
+                ?: throw BootstrapCredentialException("envelope_missing")
+            val secret = exchange.decrypt(
+                envelope = envelope,
+                clusterId = bootstrapResponse.cluster.clusterId,
+                nodeId = bootstrapResponse.node.nodeId,
+                secretEpoch = bootstrapResponse.cluster.clusterSecretEpoch,
+            )
+            Result.success(BootstrapResult(bootstrapResponse, secret))
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             Result.failure(e)
         }

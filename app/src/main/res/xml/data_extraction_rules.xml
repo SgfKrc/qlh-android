@@ -2,8 +2,16 @@
 <data-extraction-rules>
     <cloud-backup>
         <exclude domain="sharedpref" path="qlh_auth_session.xml" />
+        <exclude domain="sharedpref" path="qlh_cluster_credential.xml" />
+        <exclude domain="file" path="datastore/" />
+        <exclude domain="file" path="logs/" />
+        <exclude domain="database" path="." />
     </cloud-backup>
     <device-transfer>
         <exclude domain="sharedpref" path="qlh_auth_session.xml" />
+        <exclude domain="sharedpref" path="qlh_cluster_credential.xml" />
+        <exclude domain="file" path="datastore/" />
+        <exclude domain="file" path="logs/" />
+        <exclude domain="database" path="." />
     </device-transfer>
 </data-extraction-rules>

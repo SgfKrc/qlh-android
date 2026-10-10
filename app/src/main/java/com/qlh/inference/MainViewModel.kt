@@ -1093,7 +1093,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             )
         )
 
-        result.onSuccess { response ->
+        result.onSuccess { bootstrap ->
+            val response = bootstrap.response
             val cluster = response.cluster
             val android = response.android
             val newHost = cluster.masterApiHost.ifBlank { state.serverHost }
@@ -1104,7 +1105,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 masterTcpHost = cluster.masterTcpHost,
                 masterTcpPort = cluster.masterTcpPort,
                 clusterId = cluster.clusterId,
-                clusterSecret = cluster.clusterSecret,
+                clusterSecret = bootstrap.clusterSecret,
+                clusterSecretEpoch = cluster.clusterSecretEpoch,
                 nodeId = response.node.nodeId.ifBlank { nodeId },
                 modelManifestUrl = android.modelManifestUrl,
             )
@@ -1215,14 +1217,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private suspend fun ensureAndroidTaskWorker() {
         if (BuildConfig.IS_LITE || _uiState.value.inferenceMode != SettingsDataStore.MODE_DISTRIBUTED) {
-            getApplication<Application>().stopService(TaskWorkerService.stopIntent(getApplication()))
+            stopAndroidTaskWorker("worker_disabled")
             return
         }
         val secret = settings.getClusterSecret()
+        val secretEpoch = settings.getClusterSecretEpoch()
         val host = settings.getMasterTcpHost().ifBlank { _uiState.value.serverHost }
         val port = settings.getMasterTcpPort()
         val nodeId = settings.getOrCreateAndroidNodeId()
-        if (secret.isBlank() || host.isBlank() || port !in 1..65535) return
+        if (secret.isBlank() || host.isBlank() || port !in 1..65535) {
+            stopAndroidTaskWorker("worker_credentials_or_endpoint_unavailable")
+            return
+        }
 
         val selected = modelManager.getSelectedModel()
         val selectedSha256 = modelManager.getSelectedModelSha256()
@@ -1298,6 +1304,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     port = port,
                     nodeId = nodeId,
                     clusterSecret = secret,
+                    clusterSecretEpoch = secretEpoch,
                     hostname = listOf(android.os.Build.MANUFACTURER, android.os.Build.MODEL)
                         .filter { it.isNotBlank() }.joinToString(" ").ifBlank { nodeId },
                     networkType = detectNetworkType(),
@@ -1319,9 +1326,33 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    private suspend fun stopAndroidTaskWorker(reason: String) {
+        val application = getApplication<Application>()
+        try {
+            TaskWorkerService.requestStop(application)
+        } catch (error: RuntimeException) {
+            application.stopService(Intent(application, TaskWorkerService::class.java))
+            settings.clearTaskWorkerStartupConfig()
+            QlhLogger.w(
+                "MainViewModel",
+                "task worker stop action unavailable; forced stop and cleared startup config: " +
+                    "reason=$reason error=${error.javaClass.simpleName}",
+            )
+        }
+    }
+
     override fun onCleared() {
-        getApplication<Application>().stopService(AndroidPresenceService.stopIntent(getApplication()))
-        getApplication<Application>().stopService(TaskWorkerService.stopIntent(getApplication()))
+        val application = getApplication<Application>()
+        application.stopService(AndroidPresenceService.stopIntent(application))
+        runCatching { TaskWorkerService.requestStop(application) }
+            .onFailure { error ->
+                application.stopService(Intent(application, TaskWorkerService::class.java))
+                QlhLogger.w(
+                    "MainViewModel",
+                    "task worker stop action unavailable during ViewModel cleanup: " +
+                        error.javaClass.simpleName,
+                )
+            }
         super.onCleared()
     }
 

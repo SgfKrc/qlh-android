@@ -1,5 +1,6 @@
 package com.qlh.inference.worker
 
+import com.google.gson.JsonParser
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -18,12 +19,12 @@ class TaskWorkerStartupTest {
         host: String = "100.90.76.108",
         port: Int = 8888,
         nodeId: String = "android_worker_01",
-        secret: String = "s3cret",
+        clusterSecretEpoch: Int = 1,
     ) = TaskWorkerStartupConfig(
         coordinatorHost = host,
         coordinatorPort = port,
         nodeId = nodeId,
-        clusterSecret = secret,
+        clusterSecretEpoch = clusterSecretEpoch,
         hostname = "TB321FU",
         networkType = "wifi",
         deviceInfo = mapOf("runtime_profile" to "llama_cpp_only"),
@@ -34,29 +35,76 @@ class TaskWorkerStartupTest {
     )
 
     @Test
-    fun `usable requires host port node and secret`() {
+    fun `usable requires only non-sensitive startup metadata`() {
         assertTrue(config().usable)
         assertFalse(config(host = "  ").usable)
         assertFalse(config(port = 0).usable)
         assertFalse(config(port = 70_000).usable)
         assertFalse(config(nodeId = "").usable)
-        assertFalse(config(secret = "").usable)
+        assertFalse(config(clusterSecretEpoch = 0).usable)
     }
 
     @Test
     fun `json round trip preserves the fields needed to rebuild`() {
         val original = config()
-        val restored = TaskWorkerStartupConfig.fromJson(original.toJson())
+        val json = original.toJson()
+        val restored = TaskWorkerStartupConfig.fromJson(json)
+        val jsonObject = JsonParser.parseString(json).asJsonObject
 
         assertNotNull(restored)
         assertEquals(original, restored)
+        assertFalse(jsonObject.has("clusterSecret"))
+        assertFalse(jsonObject.has("cluster_secret"))
         // 重建路径真的用得上的字段逐项核对（不只依赖 data class equals）
         assertEquals("100.90.76.108", restored!!.coordinatorHost)
         assertEquals(8888, restored.coordinatorPort)
         assertEquals("android_worker_01", restored.nodeId)
-        assertEquals("s3cret", restored.clusterSecret)
+        assertEquals(1, restored.clusterSecretEpoch)
         assertEquals("llama_cpp_only", restored.deviceInfo["runtime_profile"])
         assertTrue(restored.usable)
+    }
+
+    @Test
+    fun `legacy json secret can be migrated but is never serialized again`() {
+        val legacySecret = "legacy-worker-secret-${"x".repeat(24)}"
+        val legacyJson = config().toJson().dropLast(1) +
+            ",\"clusterSecret\":\"$legacySecret\"}"
+
+        assertTrue(TaskWorkerStartupConfig.containsLegacyClusterSecret(legacyJson))
+        assertEquals(
+            legacySecret,
+            TaskWorkerStartupConfig.legacyClusterSecretFromJson(legacyJson),
+        )
+        val sanitized = TaskWorkerStartupConfig.fromJson(legacyJson)!!.toJson()
+        val sanitizedObject = JsonParser.parseString(sanitized).asJsonObject
+        assertFalse(sanitizedObject.has("clusterSecret"))
+        assertFalse(sanitized.contains(legacySecret))
+    }
+
+    @Test
+    fun `legacy json without an epoch defaults to generation one`() {
+        val legacyJson = JsonParser.parseString(config().toJson()).asJsonObject.apply {
+            remove("clusterSecretEpoch")
+        }.toString()
+        val restored = TaskWorkerStartupConfig.fromJson(legacyJson)
+
+        assertEquals(1, restored!!.clusterSecretEpoch)
+        assertTrue(restored.usable)
+    }
+
+    @Test
+    fun `legacy secretEpoch field migrates to clusterSecretEpoch`() {
+        val legacyJson = JsonParser.parseString(config().toJson()).asJsonObject.apply {
+            remove("clusterSecretEpoch")
+            addProperty("secretEpoch", 7)
+        }.toString()
+
+        val restored = TaskWorkerStartupConfig.fromJson(legacyJson)!!
+        val sanitized = JsonParser.parseString(restored.toJson()).asJsonObject
+
+        assertEquals(7, restored.clusterSecretEpoch)
+        assertEquals(7, sanitized.get("clusterSecretEpoch").asInt)
+        assertFalse(sanitized.has("secretEpoch"))
     }
 
     @Test
@@ -68,7 +116,7 @@ class TaskWorkerStartupTest {
         // 结构合法但配置不可用 ⇒ 仍可解析，由 `usable` 判定
         val incomplete = TaskWorkerStartupConfig.fromJson(
             TaskWorkerStartupConfig(coordinatorHost = "", coordinatorPort = 0,
-                nodeId = "", clusterSecret = "").toJson(),
+                nodeId = "").toJson(),
         )
         assertNotNull(incomplete)
         assertFalse(incomplete!!.usable)

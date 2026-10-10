@@ -25,6 +25,8 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.util.concurrent.atomic.AtomicReference
 
 /** Foreground lifecycle shell for the Android Full Worker client. */
@@ -32,6 +34,7 @@ class TaskWorkerService : Service() {
     private val binder = LocalBinder()
     private var client: TaskWorkerClient? = null
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val commandMutex = Mutex()
 
     /** ★ 2026-10-07（DIST-NEXT-5）：启动配置的持久化载体（系统重建时读回）。 */
     private val settings by lazy { SettingsDataStore(applicationContext) }
@@ -50,23 +53,58 @@ class TaskWorkerService : Service() {
         // ★ 2026-10-07（DIST-NEXT-5）：决策抽成纯函数（`decideTaskWorkerStartup`，可单测），
         //   这里只做 IO 与分派。关键变化：`intent == null`（系统 `START_STICKY` 回收后重建）
         //   不再落进默认分支什么都不做，而是用**持久化配置**恢复 worker。
-        scope.launch { handleStartCommand(intent, startId) }
+        scope.launch {
+            commandMutex.withLock { handleStartCommand(intent, startId) }
+        }
         return if (BuildConfig.IS_LITE) START_NOT_STICKY else START_STICKY
     }
 
     private suspend fun handleStartCommand(intent: Intent?, startId: Int) {
         val action = intent?.action
-        val persisted = TaskWorkerStartupConfig.fromJson(
-            settings.getTaskWorkerStartupConfig(),
-        )
+        val persistedRaw = settings.getTaskWorkerStartupConfig()
+        val persisted = TaskWorkerStartupConfig.fromJson(persistedRaw)
+        val legacyWorkerSecret = TaskWorkerStartupConfig.legacyClusterSecretFromJson(persistedRaw)
+        var clusterSecret = runCatching { settings.getClusterSecret() }
+            .onFailure { error ->
+                QlhLogger.e(
+                    "TaskWorkerService",
+                    "cluster credential unavailable; worker startup will fail closed",
+                    error,
+                )
+            }
+            .getOrDefault("")
+        if (clusterSecret.isBlank() && !legacyWorkerSecret.isNullOrBlank()) {
+            clusterSecret = runCatching {
+                settings.saveClusterSecret(legacyWorkerSecret)
+                settings.getClusterSecret()
+            }.onFailure { error ->
+                QlhLogger.e(
+                    "TaskWorkerService",
+                    "legacy worker credential migration failed; worker startup will fail closed",
+                    error,
+                )
+            }.getOrDefault("")
+        }
+        if (
+            TaskWorkerStartupConfig.containsLegacyClusterSecret(persistedRaw) &&
+            (legacyWorkerSecret.isNullOrBlank() || clusterSecret.isNotBlank())
+        ) {
+            if (persisted == null) {
+                settings.clearTaskWorkerStartupConfig()
+            } else {
+                settings.setTaskWorkerStartupConfig(persisted.toJson())
+            }
+        }
         when (decideTaskWorkerStartup(
             action = action,
-            hasPersistedConfig = persisted?.usable == true,
+            hasPersistedConfig = persisted?.usable == true && clusterSecret.isNotBlank(),
             hasActiveClient = client != null,
         )) {
             TaskWorkerStartupDecision.Start -> {
                 val config = startupConfigFromIntent(intent)
-                if (config == null || !config.usable) {
+                val incomingSecret = intent?.getStringExtra(EXTRA_CLUSTER_SECRET).orEmpty()
+                intent?.removeExtra(EXTRA_CLUSTER_SECRET)
+                if (config == null || !config.usable || incomingSecret.isBlank()) {
                     // 配置不足以建 client ⇒ 明确停止，并把坏配置清掉（免得重建时再撞一次）。
                     QlhLogger.w(
                         "TaskWorkerService",
@@ -76,9 +114,24 @@ class TaskWorkerService : Service() {
                     stopSelf(startId)
                     return
                 }
+                val securedSecret = runCatching {
+                    settings.saveClusterSecret(incomingSecret)
+                    settings.getClusterSecret()
+                }.onFailure { error ->
+                    QlhLogger.e(
+                        "TaskWorkerService",
+                        "ACTION_START rejected: cluster credential could not be secured",
+                        error,
+                    )
+                }.getOrDefault("")
+                if (securedSecret.isBlank()) {
+                    settings.clearTaskWorkerStartupConfig()
+                    stopSelf(startId)
+                    return
+                }
                 // 持久化：系统回收后凭它恢复（`START_STICKY` 重建路径的前提）。
                 settings.setTaskWorkerStartupConfig(config.toJson())
-                startWorker(config)
+                startWorker(config, securedSecret)
             }
             TaskWorkerStartupDecision.Resume -> {
                 QlhLogger.i(
@@ -86,7 +139,7 @@ class TaskWorkerService : Service() {
                     "system recreated the worker without an intent; resuming from " +
                         "persisted config (node=${persisted?.nodeId} host=${persisted?.coordinatorHost})",
                 )
-                startWorker(persisted!!)
+                startWorker(persisted!!, clusterSecret)
             }
             TaskWorkerStartupDecision.Stop -> {
                 // 用户主动停止 ⇒ 连同持久化配置一起清掉，否则系统重建会把它拉起来。
@@ -114,7 +167,7 @@ class TaskWorkerService : Service() {
             coordinatorHost = intent.getStringExtra(EXTRA_COORDINATOR_HOST).orEmpty().trim(),
             coordinatorPort = intent.getIntExtra(EXTRA_COORDINATOR_PORT, 0),
             nodeId = intent.getStringExtra(EXTRA_NODE_ID).orEmpty().trim(),
-            clusterSecret = intent.getStringExtra(EXTRA_CLUSTER_SECRET).orEmpty(),
+            clusterSecretEpoch = intent.getIntExtra(EXTRA_CLUSTER_SECRET_EPOCH, 1),
             hostname = intent.getStringExtra(EXTRA_HOSTNAME).orEmpty(),
             networkType = intent.getStringExtra(EXTRA_NETWORK_TYPE).orEmpty(),
             deviceInfo = deviceInfo,
@@ -140,7 +193,7 @@ class TaskWorkerService : Service() {
 
     fun cancelActive(reasonCode: String = "user_cancelled"): Boolean = client?.cancelActive(reasonCode) == true
 
-    private suspend fun startWorker(config: TaskWorkerStartupConfig) {
+    private suspend fun startWorker(config: TaskWorkerStartupConfig, clusterSecret: String) {
         if (BuildConfig.IS_LITE) {
             stopSelf()
             return
@@ -151,7 +204,6 @@ class TaskWorkerService : Service() {
         val host = config.coordinatorHost
         val port = config.coordinatorPort
         val nodeId = config.nodeId
-        val clusterSecret = config.clusterSecret
         val hostname = config.hostname.ifBlank { nodeId }
         val networkType = config.networkType.ifBlank { "unknown" }
         val deviceInfo = config.deviceInfo
@@ -287,6 +339,7 @@ class TaskWorkerService : Service() {
             registration = TaskWorkerRegistration(
                 nodeId = nodeId,
                 clusterSecret = clusterSecret,
+                clusterSecretEpoch = config.clusterSecretEpoch,
                 hostname = hostname,
                 networkType = networkType,
                 deviceInfo = deviceInfo,
@@ -471,6 +524,7 @@ class TaskWorkerService : Service() {
         const val EXTRA_COORDINATOR_PORT = "coordinator_port"
         const val EXTRA_NODE_ID = "node_id"
         const val EXTRA_CLUSTER_SECRET = "cluster_secret"
+        const val EXTRA_CLUSTER_SECRET_EPOCH = "cluster_secret_epoch"
         const val EXTRA_HOSTNAME = "hostname"
         const val EXTRA_NETWORK_TYPE = "network_type"
         const val EXTRA_DEVICE_INFO_JSON = "device_info_json"
@@ -489,6 +543,7 @@ class TaskWorkerService : Service() {
             port: Int,
             nodeId: String,
             clusterSecret: String,
+            clusterSecretEpoch: Int = 1,
             hostname: String,
             networkType: String,
             deviceInfo: Map<String, Any?>,
@@ -507,6 +562,7 @@ class TaskWorkerService : Service() {
             .putExtra(EXTRA_COORDINATOR_PORT, port)
             .putExtra(EXTRA_NODE_ID, nodeId)
             .putExtra(EXTRA_CLUSTER_SECRET, clusterSecret)
+            .putExtra(EXTRA_CLUSTER_SECRET_EPOCH, clusterSecretEpoch.coerceAtLeast(1))
             .putExtra(EXTRA_HOSTNAME, hostname)
             .putExtra(EXTRA_NETWORK_TYPE, networkType)
             .putExtra(EXTRA_DEVICE_INFO_JSON, com.google.gson.Gson().toJson(deviceInfo))
@@ -520,6 +576,11 @@ class TaskWorkerService : Service() {
 
         fun stopIntent(context: Context): Intent = Intent(context, TaskWorkerService::class.java)
             .setAction(ACTION_STOP)
+
+        fun requestStop(context: Context) {
+            val appContext = context.applicationContext
+            ContextCompat.startForegroundService(appContext, stopIntent(appContext))
+        }
 
         fun cancelIntent(context: Context, reasonCode: String = "user_cancelled"): Intent = Intent(
             context,

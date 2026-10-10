@@ -23,6 +23,8 @@ import java.io.EOFException
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.nio.charset.StandardCharsets
+import java.security.SecureRandom
+import java.util.Base64
 import java.util.Locale
 import java.util.UUID
 import javax.crypto.Mac
@@ -310,6 +312,7 @@ sealed class TaskWorkerInboundEvent {
 data class TaskWorkerRegistration(
     val nodeId: String,
     val clusterSecret: String,
+    val clusterSecretEpoch: Int = 1,
     val hostname: String,
     val networkType: String,
     val deviceInfo: Map<String, Any?>,
@@ -392,8 +395,18 @@ class SocketTaskWorkerTransport(
     suspend fun register(registration: TaskWorkerRegistration) {
         require(registration.nodeId.isNotBlank()) { "node id must not be blank" }
         require(registration.clusterSecret.isNotBlank()) { "cluster secret must not be blank" }
+        require(registration.clusterSecretEpoch >= 1) { "cluster secret epoch must be positive" }
         val timestamp = System.currentTimeMillis() / 1000.0
-        val authMessage = String.format(Locale.US, "%s:%.6f", registration.nodeId, timestamp)
+        val nonceBytes = ByteArray(18).also { SecureRandom().nextBytes(it) }
+        val authNonce = Base64.getUrlEncoder().withoutPadding().encodeToString(nonceBytes)
+        val authMessage = String.format(
+            Locale.US,
+            "v2\n%s\n%.6f\n%s\n%d",
+            registration.nodeId,
+            timestamp,
+            authNonce,
+            registration.clusterSecretEpoch,
+        )
         val mac = Mac.getInstance("HmacSHA256")
         mac.init(SecretKeySpec(registration.clusterSecret.toByteArray(StandardCharsets.UTF_8), "HmacSHA256"))
         val signature = mac.doFinal(authMessage.toByteArray(StandardCharsets.UTF_8))
@@ -412,7 +425,10 @@ class SocketTaskWorkerTransport(
                 "device_info" to registration.deviceInfo,
                 "model_sha256" to registration.modelSha256,
                 "auth" to mapOf(
+                    "auth_version" to 2,
                     "auth_timestamp" to timestamp,
+                    "auth_nonce" to authNonce,
+                    "auth_secret_epoch" to registration.clusterSecretEpoch,
                     "auth_signature" to signature,
                 ),
             ),

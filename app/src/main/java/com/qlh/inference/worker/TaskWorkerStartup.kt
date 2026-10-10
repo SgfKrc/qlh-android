@@ -1,6 +1,8 @@
 package com.qlh.inference.worker
 
 import com.google.gson.Gson
+import com.google.gson.JsonParser
+import com.google.gson.annotations.SerializedName
 
 /**
  * ★ 2026-10-07（DIST-NEXT-5）：task-worker 的**启动配置**（可持久化）与**重建决策**。
@@ -15,7 +17,8 @@ data class TaskWorkerStartupConfig(
     val coordinatorHost: String,
     val coordinatorPort: Int,
     val nodeId: String,
-    val clusterSecret: String,
+    @SerializedName(value = "clusterSecretEpoch", alternate = ["secretEpoch"])
+    val clusterSecretEpoch: Int = 1,
     val hostname: String = "",
     val networkType: String = "unknown",
     val deviceInfo: Map<String, Any?> = emptyMap(),
@@ -30,14 +33,14 @@ data class TaskWorkerStartupConfig(
     /**
      * 配置是否足以建 client —— **唯一**的校验判据。
      *
-     * 调用方（`TaskWorkerService.startWorker`）不再各自检查 host/port/node/secret：
-     * 系统重建读回的旧配置也必须过这一关，否则应明确停止而不是带着半个配置去握手。
+     * 调用方（`TaskWorkerService.startWorker`）不再各自检查 host/port/node；凭据在独立的
+     * AndroidKeyStore 边界校验。系统重建读回的旧配置也必须过这一关，否则应明确停止。
      */
     val usable: Boolean
         get() = coordinatorHost.isNotBlank() &&
             coordinatorPort in 1..65535 &&
             nodeId.isNotBlank() &&
-            clusterSecret.isNotBlank()
+            clusterSecretEpoch >= 1
 
     fun toJson(): String = GSON.toJson(this)
 
@@ -50,7 +53,37 @@ data class TaskWorkerStartupConfig(
             if (text.isEmpty()) return null
             return runCatching {
                 GSON.fromJson(text, TaskWorkerStartupConfig::class.java)
+                    ?.let { parsed ->
+                        if (parsed.clusterSecretEpoch >= 1) {
+                            parsed
+                        } else {
+                            parsed.copy(clusterSecretEpoch = 1)
+                        }
+                    }
             }.getOrNull()
+        }
+
+        /** Reads the old persisted field only long enough to migrate it to secure storage. */
+        fun legacyClusterSecretFromJson(raw: String?): String? {
+            val text = raw?.trim().orEmpty()
+            if (text.isEmpty()) return null
+            return runCatching {
+                JsonParser.parseString(text)
+                    .asJsonObject
+                    .get("clusterSecret")
+                    ?.takeUnless { it.isJsonNull }
+                    ?.asString
+                    ?.takeIf { it.isNotBlank() }
+            }.getOrNull()
+        }
+
+        /** True even for a blank old field so the caller can scrub the obsolete JSON key. */
+        fun containsLegacyClusterSecret(raw: String?): Boolean {
+            val text = raw?.trim().orEmpty()
+            if (text.isEmpty()) return false
+            return runCatching {
+                JsonParser.parseString(text).asJsonObject.has("clusterSecret")
+            }.getOrDefault(false)
         }
     }
 }

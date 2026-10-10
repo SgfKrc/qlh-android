@@ -15,6 +15,9 @@ import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.net.ServerSocket
 import java.nio.charset.StandardCharsets
+import java.util.Locale
+import javax.crypto.Mac
+import javax.crypto.spec.SecretKeySpec
 import kotlin.concurrent.thread
 
 class TaskWorkerTransportContractTest {
@@ -111,6 +114,69 @@ class TaskWorkerTransportContractTest {
     }
 
     @Test
+    fun `socket registration binds the credential epoch into payload and signature`() = runBlocking {
+        val server = ServerSocket(0)
+        val clusterSecret = "registration-secret"
+        var serverFailure: Throwable? = null
+        val serverThread = thread(start = true, name = "task-worker-registration-contract") {
+            try {
+                server.accept().use { socket ->
+                    val input = DataInputStream(BufferedInputStream(socket.getInputStream()))
+                    val output = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
+                    val frame = readFrame(input)
+                    val data = frame.getAsJsonObject("data")
+                    val auth = data.getAsJsonObject("auth")
+                    val timestamp = auth.get("auth_timestamp").asDouble
+                    val nonce = auth.get("auth_nonce").asString
+                    val epoch = auth.get("auth_secret_epoch").asInt
+                    val authMessage = String.format(
+                        Locale.US,
+                        "v2\n%s\n%.6f\n%s\n%d",
+                        data.get("client_id").asString,
+                        timestamp,
+                        nonce,
+                        epoch,
+                    )
+
+                    assertEquals("register", frame.get("type").asString)
+                    assertEquals(7, epoch)
+                    assertEquals(
+                        hmacSha256Hex(clusterSecret, authMessage),
+                        auth.get("auth_signature").asString,
+                    )
+                    writeJsonFrame(
+                        output,
+                        """{"type":"register","format":"json","data":{"status":"registered"}}""",
+                    )
+                }
+            } catch (error: Throwable) {
+                serverFailure = error
+            }
+        }
+
+        try {
+            val transport = SocketTaskWorkerTransportFactory(
+                connectTimeoutMs = 2_000,
+                readTimeoutMs = 2_000,
+                registration = TaskWorkerRegistration(
+                    nodeId = "android_12345678",
+                    clusterSecret = clusterSecret,
+                    clusterSecretEpoch = 7,
+                    hostname = "test-device",
+                    networkType = "wifi",
+                    deviceInfo = emptyMap(),
+                ),
+            ).connect("127.0.0.1", server.localPort)
+            transport.close()
+        } finally {
+            server.close()
+        }
+        serverThread.join(3_000)
+        assertFalse(serverThread.isAlive)
+        assertNull(serverFailure)
+    }
+
+    @Test
     fun `socket transport rejects non task worker outer frame`() = runBlocking {
         val server = ServerSocket(0)
         val serverThread = thread(start = true, name = "task-worker-invalid-contract") {
@@ -174,5 +240,19 @@ class TaskWorkerTransportContractTest {
         output.writeInt(bytes.size)
         output.write(bytes)
         output.flush()
+    }
+
+    private fun writeJsonFrame(output: DataOutputStream, json: String) {
+        val bytes = json.toByteArray(StandardCharsets.UTF_8)
+        output.writeInt(bytes.size)
+        output.write(bytes)
+        output.flush()
+    }
+
+    private fun hmacSha256Hex(secret: String, message: String): String {
+        val mac = Mac.getInstance("HmacSHA256")
+        mac.init(SecretKeySpec(secret.toByteArray(StandardCharsets.UTF_8), "HmacSHA256"))
+        return mac.doFinal(message.toByteArray(StandardCharsets.UTF_8))
+            .joinToString("") { "%02x".format(Locale.US, it) }
     }
 }

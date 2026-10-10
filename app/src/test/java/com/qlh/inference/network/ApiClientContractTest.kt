@@ -16,6 +16,15 @@ import java.io.BufferedInputStream
 import java.io.IOException
 import java.net.ServerSocket
 import java.net.Socket
+import java.security.KeyFactory
+import java.security.spec.MGF1ParameterSpec
+import java.security.spec.X509EncodedKeySpec
+import java.util.Base64
+import javax.crypto.Cipher
+import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.OAEPParameterSpec
+import javax.crypto.spec.PSource
+import javax.crypto.spec.SecretKeySpec
 
 /**
  * ApiClient HTTP 契约测试（JVM，本地 ServerSocket 桩，无需设备/网络/新依赖）。
@@ -191,6 +200,96 @@ class ApiClientContractTest {
         displayName = "Owner",
         role = "owner",
     )
+
+    private fun bootstrapResponseFor(request: Request, clusterSecret: String): String {
+        val body = parseJson(request.body)
+        val nodeId = body.get("node_id").asString
+        val requestNonce = body.get("credential_request_nonce").asString
+        val requestedAt = body.get("credential_requested_at").asLong
+        val publicKeyDer = Base64.getUrlDecoder().decode(
+            body.get("credential_public_key").asString,
+        )
+        val publicKey = KeyFactory.getInstance("RSA").generatePublic(
+            X509EncodedKeySpec(publicKeyDer),
+        )
+        val issuedAt = System.currentTimeMillis() / 1000L
+        assertTrue(kotlin.math.abs(issuedAt - requestedAt) <= 5L)
+        val expiresAt = issuedAt + 60L
+        val epoch = 4
+        val clusterId = "c1"
+        val aad = linkedMapOf<String, Any>(
+            "cluster_id" to clusterId,
+            "node_id" to nodeId,
+            "request_nonce" to requestNonce,
+            "secret_epoch" to epoch,
+            "issued_at" to issuedAt,
+            "expires_at" to expiresAt,
+        )
+        val canonicalAad = "{\"cluster_id\":\"$clusterId\"," +
+            "\"expires_at\":$expiresAt," +
+            "\"issued_at\":$issuedAt," +
+            "\"node_id\":\"$nodeId\"," +
+            "\"request_nonce\":\"$requestNonce\"," +
+            "\"secret_epoch\":$epoch}"
+
+        val aesKey = ByteArray(32) { (it + 3).toByte() }
+        val nonce = ByteArray(12) { (it + 11).toByte() }
+        val wrappingCipher = Cipher.getInstance("RSA/ECB/OAEPWithSHA-256AndMGF1Padding")
+        wrappingCipher.init(
+            Cipher.ENCRYPT_MODE,
+            publicKey,
+            OAEPParameterSpec(
+                "SHA-256",
+                "MGF1",
+                MGF1ParameterSpec.SHA256,
+                PSource.PSpecified.DEFAULT,
+            ),
+        )
+        val wrappedKey = wrappingCipher.doFinal(aesKey)
+
+        val contentCipher = Cipher.getInstance("AES/GCM/NoPadding")
+        contentCipher.init(
+            Cipher.ENCRYPT_MODE,
+            SecretKeySpec(aesKey, "AES"),
+            GCMParameterSpec(128, nonce),
+        )
+        contentCipher.updateAAD(canonicalAad.toByteArray(Charsets.UTF_8))
+        val plaintext = Gson().toJson(mapOf("cluster_secret" to clusterSecret))
+            .toByteArray(Charsets.UTF_8)
+        val ciphertext = contentCipher.doFinal(plaintext)
+        aesKey.fill(0)
+        plaintext.fill(0)
+
+        val encoder = Base64.getUrlEncoder().withoutPadding()
+        return Gson().toJson(
+            linkedMapOf(
+                "status" to "ok",
+                "cluster" to linkedMapOf(
+                    "cluster_id" to clusterId,
+                    "master_api_host" to "100.1.2.3",
+                    "master_api_port" to 8000,
+                    "master_tcp_host" to "100.1.2.3",
+                    "master_tcp_port" to 8888,
+                    "cluster_secret_epoch" to epoch,
+                ),
+                "node" to linkedMapOf(
+                    "node_id" to nodeId,
+                    "role" to "client",
+                    "node_type" to "android",
+                ),
+                "android" to emptyMap<String, Any>(),
+                "credential_envelope" to linkedMapOf(
+                    "schema" to "qlh.cluster.bootstrap-credential.v1",
+                    "key_algorithm" to "RSA-OAEP-SHA256",
+                    "content_algorithm" to "AES-256-GCM",
+                    "aad" to aad,
+                    "wrapped_key" to encoder.encodeToString(wrappedKey),
+                    "nonce" to encoder.encodeToString(nonce),
+                    "ciphertext" to encoder.encodeToString(ciphertext),
+                ),
+            ),
+        )
+    }
 
     @Test
     fun `auth capability is public and supports gateway shape`() {
@@ -738,15 +837,56 @@ class ApiClientContractTest {
     @Test
     fun `firstConnectBootstrap posts to bootstrap endpoint`() {
         var seen: Request? = null
+        val clusterSecret = "bootstrap-secret-never-sent-in-plaintext"
         route("/api/bootstrap/first-connect") { req, reply ->
             seen = req
-            reply(200, """{"cluster":{"cluster_id":"c1","master_api_host":"100.1.2.3"}}""")
+            reply(200, bootstrapResponseFor(req, clusterSecret))
         }
-        val response = runBlocking { client.firstConnectBootstrap(
+        val result = runBlocking { client.firstConnectBootstrap(
             BootstrapRequest(nodeId = "n1", hostname = "100.1.2.3")
         ) }.getOrNull()!!
-        assertEquals("c1", response.cluster.clusterId)
+        assertEquals("c1", result.response.cluster.clusterId)
+        assertEquals(4, result.response.cluster.clusterSecretEpoch)
+        assertEquals(clusterSecret, result.clusterSecret)
         assertEquals("/api/bootstrap/first-connect", seen?.path)
+        val requestBody = parseJson(seen!!.body)
+        assertEquals(18, Base64.getUrlDecoder().decode(
+            requestBody.get("credential_request_nonce").asString,
+        ).size)
+        assertTrue(requestBody.get("credential_requested_at").asLong > 0L)
+        assertFalse(requestBody.get("credential_public_key").asString.contains('='))
+        assertFalse(seen!!.body.contains(clusterSecret))
+    }
+
+    @Test
+    fun `firstConnectBootstrap failure never exposes response body`() {
+        val leakedMaterial = "server-body-secret-that-must-not-reach-exception"
+        route("/api/bootstrap/first-connect") { _, reply ->
+            reply(403, """{"cluster_secret":"$leakedMaterial"}""")
+        }
+
+        val error = runBlocking {
+            client.firstConnectBootstrap(BootstrapRequest(nodeId = "n1"))
+        }.exceptionOrNull()!!
+        assertEquals("Bootstrap failed: HTTP 403", error.message)
+        assertFalse(error.message.orEmpty().contains(leakedMaterial))
+    }
+
+    @Test
+    fun firstConnectBootstrap_rejectsPlaintextClusterSecret() {
+        val leakedMaterial = "legacy-plaintext-cluster-secret"
+        route("/api/bootstrap/first-connect") { _, reply ->
+            reply(
+                200,
+                """{"status":"ok","cluster":{"cluster_id":"c1","cluster_secret":"$leakedMaterial"},"node":{"node_id":"n1"}}""",
+            )
+        }
+
+        val error = runBlocking {
+            client.firstConnectBootstrap(BootstrapRequest(nodeId = "n1"))
+        }.exceptionOrNull() as com.qlh.inference.security.BootstrapCredentialException
+        assertEquals("plaintext_secret_rejected", error.errorCode)
+        assertFalse(error.message.orEmpty().contains(leakedMaterial))
     }
 
     @Test

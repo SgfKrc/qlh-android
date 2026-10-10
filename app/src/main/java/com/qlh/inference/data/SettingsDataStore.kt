@@ -11,14 +11,27 @@ import androidx.datastore.preferences.core.floatPreferencesKey
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import com.qlh.inference.security.ClusterCredentialStorage
+import com.qlh.inference.security.ClusterCredentialStore
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.util.UUID
 
 private val Context.dataStore: DataStore<Preferences> by preferencesDataStore(name = "qlh_settings")
 
-class SettingsDataStore(private val context: Context) {
+class SettingsDataStore internal constructor(
+    private val dataStore: DataStore<Preferences>,
+    private val credentialStore: ClusterCredentialStorage,
+) {
+    constructor(context: Context) : this(
+        dataStore = context.applicationContext.dataStore,
+        credentialStore = ClusterCredentialStore(context.applicationContext),
+    )
+
+    private val credentialMigrationMutex = Mutex()
 
     companion object {
         // ---- 主节点连接 ----
@@ -30,6 +43,7 @@ class SettingsDataStore(private val context: Context) {
         val KEY_MASTER_TCP_HOST = stringPreferencesKey("master_tcp_host")
         val KEY_MASTER_TCP_PORT = intPreferencesKey("master_tcp_port")
         val KEY_CLUSTER_SECRET = stringPreferencesKey("cluster_secret")
+        val KEY_CLUSTER_SECRET_EPOCH = intPreferencesKey("cluster_secret_epoch")
         val KEY_MODEL_MANIFEST_URL = stringPreferencesKey("model_manifest_url")
 
         // ---- 推理模式 ----
@@ -79,64 +93,64 @@ class SettingsDataStore(private val context: Context) {
 
     // ==================== 流式读取 ====================
 
-    val serverHost: Flow<String> = context.dataStore.data.map { prefs ->
+    val serverHost: Flow<String> = dataStore.data.map { prefs ->
         prefs[KEY_SERVER_HOST] ?: DEFAULT_HOST
     }
 
-    val serverPort: Flow<Int> = context.dataStore.data.map { prefs ->
+    val serverPort: Flow<Int> = dataStore.data.map { prefs ->
         prefs[KEY_SERVER_PORT] ?: DEFAULT_PORT
     }
 
-    val bootstrapped: Flow<Boolean> = context.dataStore.data.map { prefs ->
+    val bootstrapped: Flow<Boolean> = dataStore.data.map { prefs ->
         prefs[KEY_BOOTSTRAPPED] ?: false
     }
 
-    val inferenceMode: Flow<String> = context.dataStore.data.map { prefs ->
+    val inferenceMode: Flow<String> = dataStore.data.map { prefs ->
         normalizeInferenceMode(prefs[KEY_INFERENCE_MODE] ?: DEFAULT_MODE)
     }
 
-    val maxTokens: Flow<Int> = context.dataStore.data.map { prefs ->
+    val maxTokens: Flow<Int> = dataStore.data.map { prefs ->
         prefs[KEY_MAX_TOKENS] ?: DEFAULT_MAX_TOKENS
     }
 
-    val temperature: Flow<Float> = context.dataStore.data.map { prefs ->
+    val temperature: Flow<Float> = dataStore.data.map { prefs ->
         prefs[KEY_TEMPERATURE] ?: DEFAULT_TEMPERATURE
     }
 
-    val topP: Flow<Float> = context.dataStore.data.map { prefs ->
+    val topP: Flow<Float> = dataStore.data.map { prefs ->
         prefs[KEY_TOP_P] ?: DEFAULT_TOP_P
     }
 
-    val showThinking: Flow<Boolean> = context.dataStore.data.map { prefs ->
+    val showThinking: Flow<Boolean> = dataStore.data.map { prefs ->
         prefs[KEY_SHOW_THINKING] ?: false
     }
 
-    val modelPath: Flow<String> = context.dataStore.data.map { prefs ->
+    val modelPath: Flow<String> = dataStore.data.map { prefs ->
         prefs[KEY_MODEL_PATH] ?: ""
     }
 
-    val modelTreeUri: Flow<String> = context.dataStore.data.map { prefs ->
+    val modelTreeUri: Flow<String> = dataStore.data.map { prefs ->
         prefs[KEY_MODEL_TREE_URI] ?: ""
     }
 
-    val selectedModelUri: Flow<String> = context.dataStore.data.map { prefs ->
+    val selectedModelUri: Flow<String> = dataStore.data.map { prefs ->
         prefs[KEY_SELECTED_MODEL_URI] ?: ""
     }
 
-    val contextSize: Flow<Int> = context.dataStore.data.map { prefs ->
+    val contextSize: Flow<Int> = dataStore.data.map { prefs ->
         prefs[KEY_CONTEXT_SIZE] ?: DEFAULT_CONTEXT_SIZE
     }
 
-    val modelStorageMode: Flow<String> = context.dataStore.data.map { prefs ->
+    val modelStorageMode: Flow<String> = dataStore.data.map { prefs ->
         prefs[KEY_MODEL_STORAGE_MODE] ?: DEFAULT_MODEL_STORAGE_MODE
     }
 
-    val themeMode: Flow<String> = context.dataStore.data.map { prefs ->
+    val themeMode: Flow<String> = dataStore.data.map { prefs ->
         prefs[KEY_THEME_MODE] ?: DEFAULT_THEME_MODE
     }
 
     /** 获取完整的服务器 base URL */
-    val baseUrl: Flow<String> = context.dataStore.data.map { prefs ->
+    val baseUrl: Flow<String> = dataStore.data.map { prefs ->
         val host = prefs[KEY_SERVER_HOST] ?: DEFAULT_HOST
         val port = prefs[KEY_SERVER_PORT] ?: DEFAULT_PORT
         httpBaseUrl(host, port)
@@ -144,49 +158,78 @@ class SettingsDataStore(private val context: Context) {
 
     // ==================== 一次性读取 ====================
 
-    suspend fun getServerHost(): String = context.dataStore.data.first()[KEY_SERVER_HOST] ?: DEFAULT_HOST
-    suspend fun getServerPort(): Int = context.dataStore.data.first()[KEY_SERVER_PORT] ?: DEFAULT_PORT
-    suspend fun isBootstrapped(): Boolean = context.dataStore.data.first()[KEY_BOOTSTRAPPED] ?: false
-    suspend fun getClusterId(): String = context.dataStore.data.first()[KEY_CLUSTER_ID] ?: ""
-    suspend fun getMasterTcpHost(): String = context.dataStore.data.first()[KEY_MASTER_TCP_HOST] ?: ""
-    suspend fun getMasterTcpPort(): Int = context.dataStore.data.first()[KEY_MASTER_TCP_PORT] ?: 8888
-    suspend fun getClusterSecret(): String = context.dataStore.data.first()[KEY_CLUSTER_SECRET] ?: ""
-    suspend fun getModelManifestUrl(): String = context.dataStore.data.first()[KEY_MODEL_MANIFEST_URL] ?: ""
+    suspend fun getServerHost(): String = dataStore.data.first()[KEY_SERVER_HOST] ?: DEFAULT_HOST
+    suspend fun getServerPort(): Int = dataStore.data.first()[KEY_SERVER_PORT] ?: DEFAULT_PORT
+    suspend fun isBootstrapped(): Boolean = dataStore.data.first()[KEY_BOOTSTRAPPED] ?: false
+    suspend fun getClusterId(): String = dataStore.data.first()[KEY_CLUSTER_ID] ?: ""
+    suspend fun getMasterTcpHost(): String = dataStore.data.first()[KEY_MASTER_TCP_HOST] ?: ""
+    suspend fun getMasterTcpPort(): Int = dataStore.data.first()[KEY_MASTER_TCP_PORT] ?: 8888
+    suspend fun getClusterSecretEpoch(): Int =
+        dataStore.data.first()[KEY_CLUSTER_SECRET_EPOCH]?.takeIf { it >= 1 } ?: 1
+
+    /**
+     * Reads the only supported credential store and migrates the legacy DataStore
+     * plaintext exactly once. The plaintext is removed only after encryption succeeds.
+     */
+    suspend fun getClusterSecret(): String = credentialMigrationMutex.withLock {
+        credentialStore.read()?.takeIf { it.isNotBlank() }?.also {
+            removeLegacyClusterSecret()
+        } ?: run {
+            val legacy = dataStore.data.first()[KEY_CLUSTER_SECRET].orEmpty()
+            if (legacy.isBlank()) {
+                removeLegacyClusterSecret()
+                ""
+            } else {
+                credentialStore.save(legacy)
+                removeLegacyClusterSecret()
+                legacy
+            }
+        }
+    }
+
+    suspend fun getModelManifestUrl(): String = dataStore.data.first()[KEY_MODEL_MANIFEST_URL] ?: ""
     suspend fun getInferenceMode(): String = normalizeInferenceMode(
-        context.dataStore.data.first()[KEY_INFERENCE_MODE] ?: DEFAULT_MODE,
+        dataStore.data.first()[KEY_INFERENCE_MODE] ?: DEFAULT_MODE,
     )
-    suspend fun getMaxTokens(): Int = context.dataStore.data.first()[KEY_MAX_TOKENS] ?: DEFAULT_MAX_TOKENS
-    suspend fun getTemperature(): Float = context.dataStore.data.first()[KEY_TEMPERATURE] ?: DEFAULT_TEMPERATURE
-    suspend fun getTopP(): Float = context.dataStore.data.first()[KEY_TOP_P] ?: DEFAULT_TOP_P
-    suspend fun getContextSize(): Int = context.dataStore.data.first()[KEY_CONTEXT_SIZE] ?: DEFAULT_CONTEXT_SIZE
-    suspend fun getModelPath(): String = context.dataStore.data.first()[KEY_MODEL_PATH] ?: ""
-    suspend fun getModelTreeUri(): String = context.dataStore.data.first()[KEY_MODEL_TREE_URI] ?: ""
-    suspend fun getSelectedModelUri(): String = context.dataStore.data.first()[KEY_SELECTED_MODEL_URI] ?: ""
+    suspend fun getMaxTokens(): Int = dataStore.data.first()[KEY_MAX_TOKENS] ?: DEFAULT_MAX_TOKENS
+    suspend fun getTemperature(): Float = dataStore.data.first()[KEY_TEMPERATURE] ?: DEFAULT_TEMPERATURE
+    suspend fun getTopP(): Float = dataStore.data.first()[KEY_TOP_P] ?: DEFAULT_TOP_P
+    suspend fun getContextSize(): Int = dataStore.data.first()[KEY_CONTEXT_SIZE] ?: DEFAULT_CONTEXT_SIZE
+    suspend fun getModelPath(): String = dataStore.data.first()[KEY_MODEL_PATH] ?: ""
+    suspend fun getModelTreeUri(): String = dataStore.data.first()[KEY_MODEL_TREE_URI] ?: ""
+    suspend fun getSelectedModelUri(): String = dataStore.data.first()[KEY_SELECTED_MODEL_URI] ?: ""
     suspend fun getModelStorageMode(): String =
-        context.dataStore.data.first()[KEY_MODEL_STORAGE_MODE] ?: DEFAULT_MODEL_STORAGE_MODE
-    suspend fun getThemeMode(): String = context.dataStore.data.first()[KEY_THEME_MODE] ?: DEFAULT_THEME_MODE
+        dataStore.data.first()[KEY_MODEL_STORAGE_MODE] ?: DEFAULT_MODEL_STORAGE_MODE
+    suspend fun getThemeMode(): String = dataStore.data.first()[KEY_THEME_MODE] ?: DEFAULT_THEME_MODE
 
     suspend fun getOrCreateAndroidNodeId(): String {
-        val existing = context.dataStore.data.first()[KEY_ANDROID_NODE_ID]
+        val existing = dataStore.data.first()[KEY_ANDROID_NODE_ID]
         if (!existing.isNullOrBlank()) return existing
         val generated = "android-${UUID.randomUUID().toString().take(8)}"
-        context.dataStore.edit { it[KEY_ANDROID_NODE_ID] = generated }
+        dataStore.edit { it[KEY_ANDROID_NODE_ID] = generated }
         return generated
     }
 
     suspend fun setAndroidNodeId(nodeId: String) {
         if (nodeId.isBlank()) return
-        context.dataStore.edit { it[KEY_ANDROID_NODE_ID] = nodeId }
+        dataStore.edit { it[KEY_ANDROID_NODE_ID] = nodeId }
     }
 
     // ==================== 写入 ====================
 
     suspend fun setServerHost(host: String) {
-        context.dataStore.edit { it[KEY_SERVER_HOST] = host }
+        dataStore.edit { it[KEY_SERVER_HOST] = host }
     }
 
     suspend fun setServerPort(port: Int) {
-        context.dataStore.edit { it[KEY_SERVER_PORT] = port }
+        dataStore.edit { it[KEY_SERVER_PORT] = port }
+    }
+
+    /** Saves a cluster credential without ever writing it to DataStore. */
+    suspend fun saveClusterSecret(clusterSecret: String) = credentialMigrationMutex.withLock {
+        if (clusterSecret.isBlank()) return@withLock
+        credentialStore.save(clusterSecret)
+        removeLegacyClusterSecret()
     }
 
     /**
@@ -196,28 +239,28 @@ class SettingsDataStore(private val context: Context) {
      * 用户主动停止（`ACTION_STOP`）或配置不足时清除，避免把坏配置反复拉起。
      */
     suspend fun getTaskWorkerStartupConfig(): String =
-        context.dataStore.data.first()[KEY_TASK_WORKER_STARTUP] ?: ""
+        dataStore.data.first()[KEY_TASK_WORKER_STARTUP] ?: ""
 
     suspend fun setTaskWorkerStartupConfig(json: String) {
-        context.dataStore.edit { it[KEY_TASK_WORKER_STARTUP] = json }
+        dataStore.edit { it[KEY_TASK_WORKER_STARTUP] = json }
     }
 
     suspend fun clearTaskWorkerStartupConfig() {
-        context.dataStore.edit { it.remove(KEY_TASK_WORKER_STARTUP) }
+        dataStore.edit { it.remove(KEY_TASK_WORKER_STARTUP) }
     }
 
     /**
      * ★ 2026-10-07（DIST-NEXT-5b）：本次安装内是否已经问过「忽略电池优化」。
      */
     suspend fun hasAskedBatteryExemption(): Boolean =
-        context.dataStore.data.first()[KEY_BATTERY_EXEMPTION_ASKED] ?: false
+        dataStore.data.first()[KEY_BATTERY_EXEMPTION_ASKED] ?: false
 
     /**
      * ★ 2026-10-07（DIST-NEXT-5b）：标记已问过 —— 系统对话框只在首次出现一次，
      * 用户拒绝后不再重复打扰（撤销豁免要用户自己去系统设置）。
      */
     suspend fun markBatteryExemptionAsked() {
-        context.dataStore.edit { it[KEY_BATTERY_EXEMPTION_ASKED] = true }
+        dataStore.edit { it[KEY_BATTERY_EXEMPTION_ASKED] = true }
     }
 
     suspend fun saveBootstrapConfig(
@@ -229,65 +272,78 @@ class SettingsDataStore(private val context: Context) {
         clusterSecret: String,
         nodeId: String,
         modelManifestUrl: String,
+        clusterSecretEpoch: Int = 1,
     ) {
-        context.dataStore.edit {
+        if (clusterSecret.isNotBlank()) saveClusterSecret(clusterSecret)
+        dataStore.edit {
             if (serverHost.isNotBlank()) it[KEY_SERVER_HOST] = serverHost
             it[KEY_SERVER_PORT] = serverPort
             if (masterTcpHost.isNotBlank()) it[KEY_MASTER_TCP_HOST] = masterTcpHost
             it[KEY_MASTER_TCP_PORT] = masterTcpPort
             it[KEY_CLUSTER_ID] = clusterId
-            if (clusterSecret.isNotBlank()) it[KEY_CLUSTER_SECRET] = clusterSecret
+            it.remove(KEY_CLUSTER_SECRET)
+            it[KEY_CLUSTER_SECRET_EPOCH] = clusterSecretEpoch.coerceAtLeast(1)
             if (nodeId.isNotBlank()) it[KEY_ANDROID_NODE_ID] = nodeId
             if (modelManifestUrl.isNotBlank()) it[KEY_MODEL_MANIFEST_URL] = modelManifestUrl
             it[KEY_BOOTSTRAPPED] = true
         }
     }
 
-    suspend fun clearBootstrapConfig() {
-        context.dataStore.edit {
+    suspend fun clearBootstrapConfig() = credentialMigrationMutex.withLock {
+        credentialStore.clear()
+        dataStore.edit {
             it.remove(KEY_BOOTSTRAPPED)
             it.remove(KEY_CLUSTER_ID)
             it.remove(KEY_MASTER_TCP_HOST)
             it.remove(KEY_MASTER_TCP_PORT)
             it.remove(KEY_CLUSTER_SECRET)
+            it.remove(KEY_CLUSTER_SECRET_EPOCH)
             it.remove(KEY_MODEL_MANIFEST_URL)
+            it.remove(KEY_TASK_WORKER_STARTUP)
+        }
+    }
+
+    private suspend fun removeLegacyClusterSecret() {
+        if (!dataStore.data.first().contains(KEY_CLUSTER_SECRET)) return
+        dataStore.edit { prefs ->
+            if (prefs.contains(KEY_CLUSTER_SECRET)) prefs.remove(KEY_CLUSTER_SECRET)
         }
     }
 
     suspend fun setInferenceMode(mode: String) {
-        context.dataStore.edit { it[KEY_INFERENCE_MODE] = mode }
+        dataStore.edit { it[KEY_INFERENCE_MODE] = mode }
     }
 
     suspend fun setMaxTokens(tokens: Int) {
-        context.dataStore.edit { it[KEY_MAX_TOKENS] = tokens }
+        dataStore.edit { it[KEY_MAX_TOKENS] = tokens }
     }
 
     suspend fun setTemperature(temp: Float) {
-        context.dataStore.edit { it[KEY_TEMPERATURE] = temp }
+        dataStore.edit { it[KEY_TEMPERATURE] = temp }
     }
 
     suspend fun setTopP(topP: Float) {
-        context.dataStore.edit { it[KEY_TOP_P] = topP }
+        dataStore.edit { it[KEY_TOP_P] = topP }
     }
 
     suspend fun setModelPath(path: String) {
-        context.dataStore.edit { it[KEY_MODEL_PATH] = path }
+        dataStore.edit { it[KEY_MODEL_PATH] = path }
     }
 
     suspend fun setModelTreeUri(uri: String) {
-        context.dataStore.edit { it[KEY_MODEL_TREE_URI] = uri }
+        dataStore.edit { it[KEY_MODEL_TREE_URI] = uri }
     }
 
     suspend fun setSelectedModelUri(uri: String) {
-        context.dataStore.edit { it[KEY_SELECTED_MODEL_URI] = uri }
+        dataStore.edit { it[KEY_SELECTED_MODEL_URI] = uri }
     }
 
     suspend fun setContextSize(size: Int) {
-        context.dataStore.edit { it[KEY_CONTEXT_SIZE] = size.coerceIn(512, 4096) }
+        dataStore.edit { it[KEY_CONTEXT_SIZE] = size.coerceIn(512, 4096) }
     }
 
     suspend fun setModelStorageMode(mode: String) {
-        context.dataStore.edit { it[KEY_MODEL_STORAGE_MODE] = mode }
+        dataStore.edit { it[KEY_MODEL_STORAGE_MODE] = mode }
     }
 
     suspend fun setThemeMode(mode: String) {
@@ -295,14 +351,14 @@ class SettingsDataStore(private val context: Context) {
             "light", "dark" -> mode
             else -> DEFAULT_THEME_MODE
         }
-        context.dataStore.edit { it[KEY_THEME_MODE] = normalized }
+        dataStore.edit { it[KEY_THEME_MODE] = normalized }
     }
 
     suspend fun clearSelectedModelUri() {
-        context.dataStore.edit { it.remove(KEY_SELECTED_MODEL_URI) }
+        dataStore.edit { it.remove(KEY_SELECTED_MODEL_URI) }
     }
 
     suspend fun clearModelPath() {
-        context.dataStore.edit { it.remove(KEY_MODEL_PATH) }
+        dataStore.edit { it.remove(KEY_MODEL_PATH) }
     }
 }
