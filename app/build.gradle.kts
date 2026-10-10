@@ -13,6 +13,14 @@ if (keystorePropertiesFile.exists()) {
     keystorePropertiesFile.inputStream().use { keystoreProperties.load(it) }
 }
 
+val releaseVersionFile = rootProject.file("version.properties")
+check(releaseVersionFile.isFile) {
+    "Missing generated version.properties; run python scripts/version_contract.py --write from the core checkout."
+}
+val releaseVersion = Properties().apply {
+    releaseVersionFile.inputStream().use { load(it) }
+}
+
 // ★ 2026-09-30：`keystore-lite.properties` / lite 专属签名随 full/lite 合并一并移除。
 
 android {
@@ -29,8 +37,8 @@ android {
         buildConfigField("boolean", "IS_LITE", "false")
         minSdk = 26
         targetSdk = 34
-        versionCode = 6
-        versionName = "0.1.8.3"
+        versionCode = releaseVersion.getProperty("versionCode").toInt()
+        versionName = releaseVersion.getProperty("productVersion")
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
