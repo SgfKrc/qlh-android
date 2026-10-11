@@ -170,7 +170,7 @@ class SettingsScreenTest {
 
         composeRule.onNodeWithTag("cluster_overview_details").performScrollTo().assertIsDisplayed().performClick()
         composeRule.onNodeWithTag("cluster_overview_node_master").performScrollTo().assertIsDisplayed()
-        composeRule.onNodeWithTag("cluster_overview_refresh").assertIsEnabled().performClick()
+        composeRule.onNodeWithTag("cluster_overview_refresh").performScrollTo().assertIsEnabled().performClick()
         composeRule.runOnIdle { assertTrue(refreshCalls >= 2) }
     }
 
@@ -204,7 +204,7 @@ class SettingsScreenTest {
 
         composeRule.onNodeWithTag("model_fleet_details").performScrollTo().assertIsDisplayed().performClick()
         composeRule.onNodeWithTag("model_fleet_entry_qwen-1_8b").performScrollTo().assertIsDisplayed()
-        composeRule.onNodeWithTag("model_fleet_refresh").assertIsEnabled().performClick()
+        composeRule.onNodeWithTag("model_fleet_refresh").performScrollTo().assertIsEnabled().performClick()
         composeRule.runOnIdle { assertTrue(refreshCalls >= 2) }
     }
 
@@ -262,7 +262,7 @@ class SettingsScreenTest {
         composeRule.onNodeWithTag("audit_overview_details").performScrollTo().assertIsDisplayed().performClick()
         composeRule.onNodeWithTag("audit_workflow_wf-1").performScrollTo().assertIsDisplayed()
         composeRule.onNodeWithTag("audit_review_review-1").performScrollTo().assertIsDisplayed()
-        composeRule.onNodeWithTag("audit_overview_refresh").assertIsEnabled().performClick()
+        composeRule.onNodeWithTag("audit_overview_refresh").performScrollTo().assertIsEnabled().performClick()
         composeRule.runOnIdle { assertTrue(refreshCalls >= 2) }
     }
 
@@ -291,8 +291,8 @@ class SettingsScreenTest {
 
         composeRule.onNodeWithTag("auth_control_details").performScrollTo().assertIsDisplayed().performClick()
         composeRule.onNodeWithTag("auth_account_summary").performScrollTo().assertIsDisplayed()
-        composeRule.onNodeWithTag("auth_logout").assertIsEnabled().performClick()
-        composeRule.onNodeWithTag("auth_refresh").assertIsEnabled().performClick()
+        composeRule.onNodeWithTag("auth_logout").performScrollTo().assertIsEnabled().performClick()
+        composeRule.onNodeWithTag("auth_refresh").performScrollTo().assertIsEnabled().performClick()
         composeRule.runOnIdle {
             assertEquals(1, logoutCalls)
             assertTrue(refreshCalls >= 2)
@@ -309,10 +309,10 @@ class SettingsScreenTest {
             ),
             onLogin = { username, code, recovery -> login = Triple(username, code, recovery) },
         )
-        composeRule.onNodeWithTag("auth_control_details").performClick()
+        composeRule.onNodeWithTag("auth_control_details").performScrollTo().performClick()
         composeRule.onNodeWithTag("auth_username").performScrollTo().assertIsDisplayed().performTextInput("alice")
         composeRule.onNodeWithTag("auth_code").performScrollTo().assertIsDisplayed().performTextInput("123456")
-        composeRule.onNodeWithTag("auth_login").assertIsEnabled().performClick()
+        composeRule.onNodeWithTag("auth_login").performScrollTo().assertIsEnabled().performClick()
         composeRule.runOnIdle { assertEquals(Triple("alice", "123456", null), login) }
     }
 
