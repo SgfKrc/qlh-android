@@ -64,8 +64,15 @@ class ApiClientContractTest {
     private class FakeAuthStore(initial: StoredAuthSession? = null) : AuthSessionStore {
         var session: StoredAuthSession? = initial
         var clearCount: Int = 0
+        var failNextRead: Boolean = false
 
-        override fun read(): StoredAuthSession? = session
+        override fun read(): StoredAuthSession? {
+            if (failNextRead) {
+                failNextRead = false
+                return null
+            }
+            return session
+        }
         override fun save(session: StoredAuthSession) {
             this.session = session
         }
@@ -359,6 +366,38 @@ class ApiClientContractTest {
         assertTrue(result.isFailure)
         assertEquals(1, store.clearCount)
         assertEquals(null, store.session)
+    }
+
+    @Test
+    fun `unauthorized response without readable bearer preserves local session`() {
+        val store = FakeAuthStore(storedSession()).apply { failNextRead = true }
+        client = ApiClient(baseUrl = "http://127.0.0.1:${server.port}", authStore = store)
+        var hadAuthorization = true
+        route("/api/auth/session") { request, reply ->
+            hadAuthorization = request.headers.keys.any { it.equals("Authorization", ignoreCase = true) }
+            reply(401, """{"error":"missing_bearer"}""")
+        }
+
+        assertTrue(runBlocking { client.getAuthSession() }.isFailure)
+        assertFalse(hadAuthorization)
+        assertEquals(0, store.clearCount)
+        assertEquals(storedSession(), store.session)
+        assertTrue(store.read()?.accessToken?.isNotBlank() == true)
+    }
+
+    @Test
+    fun `stale unauthorized response does not clear a newer session`() {
+        val store = FakeAuthStore(storedSession())
+        client = ApiClient(baseUrl = "http://127.0.0.1:${server.port}", authStore = store)
+        val newerSession = storedSession().copy(accessToken = "token_${"z".repeat(24)}")
+        route("/api/auth/session") { _, reply ->
+            store.save(newerSession)
+            reply(401, """{"error":"expired"}""")
+        }
+
+        assertTrue(runBlocking { client.getAuthSession() }.isFailure)
+        assertEquals(0, store.clearCount)
+        assertEquals(newerSession, store.session)
     }
 
     @Test
@@ -942,6 +981,27 @@ class ApiClientContractTest {
         assertEquals(1, fleet.localAssets.summary.total)
         assertEquals(1, fleet.verifiedGguf.size)
         assertEquals("qwen.gguf", fleet.verifiedGguf.single().filename)
+    }
+
+    @Test
+    fun `current model endpoint keeps prepared pipeline separate from full model`() {
+        route("/api/models/current") { request, reply ->
+            assertEquals("GET", request.method)
+            reply(200, """{"loaded":false,"pipeline_prepared":true,"segment_materialized":true,"model_id":"qwen-1_8b"}""")
+        }
+
+        val prepared = runBlocking { client.getCurrentModel() }.getOrThrow()
+        assertFalse(prepared.loaded)
+        assertTrue(prepared.pipelinePrepared)
+        assertEquals("qwen-1_8b", prepared.modelId)
+
+        route("/api/models/current") { _, reply ->
+            reply(200, """{"loaded":true,"model_id":"qwen-1_8b"}""")
+        }
+
+        val full = runBlocking { client.getCurrentModel() }.getOrThrow()
+        assertTrue(full.loaded)
+        assertFalse(full.pipelinePrepared)
     }
 
     @Test

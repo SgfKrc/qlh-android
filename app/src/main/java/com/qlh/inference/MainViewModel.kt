@@ -28,6 +28,8 @@ import com.qlh.inference.network.ChatRepository
 import com.qlh.inference.service.InferenceService
 import com.qlh.inference.service.AndroidPresenceService
 import com.qlh.inference.service.ModelManager
+import com.qlh.inference.service.toCandidate
+import com.qlh.inference.service.unambiguousLayerArtifactCandidates
 import com.qlh.inference.status.AndroidRuntimeStatus
 import com.qlh.inference.system.WorkerBatteryPolicy
 import com.qlh.inference.system.AndroidDeviceInfoProvider
@@ -1236,42 +1238,67 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             ?.substringBeforeLast('.', selected.name)
             ?.takeIf { it.isNotBlank() }
             .orEmpty()
+        val coordinatorModel = apiClient().getCurrentModel().getOrNull()
+        val coordinatorModelId = coordinatorModel?.modelId.orEmpty()
+        val coordinatorSha256 = coordinatorModel?.descriptor?.modelSha256
+            ?.trim()?.lowercase().orEmpty()
+        val hasCoordinatorIdentity = coordinatorModelId.isNotBlank() &&
+            coordinatorSha256.matches(Regex("[a-f0-9]{64}"))
+        val layerArtifacts = if (hasCoordinatorIdentity) {
+            modelManager.listLayerArtifacts(
+                expectedModelSha256 = coordinatorSha256,
+                verifyArtifactDigest = false,
+            ).getOrNull().orEmpty().filter {
+                it.sourceModelId == null || it.sourceModelId == coordinatorModelId
+            }
+        } else emptyList()
+        val selectedIsCrop = selectedSha256.isNotBlank() && (
+            layerArtifacts.any { it.artifactSha256.equals(selectedSha256, ignoreCase = true) } ||
+                (!hasCoordinatorIdentity && modelManager.listLayerArtifacts(
+                    verifyArtifactDigest = false,
+                ).getOrNull().orEmpty().any {
+                    it.artifactSha256.equals(selectedSha256, ignoreCase = true)
+                })
+            )
         val hasFullModelIdentity = selectedModelId.isNotBlank() &&
-            selectedSha256.matches(Regex("[a-fA-F0-9]{64}"))
-
-        // Route A is deliberately layer-only: a worker may have verified crop
-        // artifacts without selecting or loading the source GGUF. Resolve the
-        // source digest locally and the logical model id from the coordinator.
-        val layerArtifacts = modelManager.listLayerArtifacts(
-            expectedModelSha256 = if (hasFullModelIdentity) selectedSha256 else "",
-            verifyArtifactDigest = true,
-        ).getOrNull().orEmpty()
-        val layerSourceSha256 = layerArtifacts
-            .map { it.sourceModelSha256.trim().lowercase() }
-            .firstOrNull { it.matches(Regex("[a-fA-F0-9]{64}")) }
-            .orEmpty()
-        val coordinatorModel = if (!hasFullModelIdentity && layerSourceSha256.isNotBlank()) {
-            apiClient().getCurrentModel().getOrNull()
-        } else {
-            null
-        }
-        val layerAlias = layerSourceSha256.takeIf { it.isNotBlank() }
-            ?.let { "layer-${it.take(16)}" }
-            .orEmpty()
-        val modelId = if (hasFullModelIdentity) {
-            selectedModelId
-        } else {
-            coordinatorModel?.modelId?.takeIf { it.isNotBlank() } ?: layerAlias
-        }
-        val modelSha256 = if (hasFullModelIdentity) selectedSha256 else layerSourceSha256
+            selectedSha256.matches(Regex("[a-fA-F0-9]{64}")) && !selectedIsCrop &&
+            coordinatorModel?.pipelinePrepared != true &&
+            (!hasCoordinatorIdentity || selectedSha256.equals(coordinatorSha256, ignoreCase = true))
+        val publishableLayers = unambiguousLayerArtifactCandidates(
+            layerArtifacts.map { it.toCandidate() },
+        )
+        val hasAmbiguousLayers = publishableLayers.size != layerArtifacts.size
         val layerOnlyIdentity = !hasFullModelIdentity &&
-            modelSha256.matches(Regex("[a-fA-F0-9]{64}")) &&
-            layerArtifacts.isNotEmpty()
+            hasCoordinatorIdentity && publishableLayers.isNotEmpty()
+        val modelId = when {
+            hasFullModelIdentity -> selectedModelId
+            layerOnlyIdentity -> coordinatorModelId
+            else -> ""
+        }
+        val modelSha256 = when {
+            hasFullModelIdentity -> selectedSha256
+            layerOnlyIdentity -> coordinatorSha256
+            else -> ""
+        }
         val resourceAdmitted = hasFullModelIdentity || layerOnlyIdentity
         // An admitted resource must carry an empty reason_code: the scheduler
         // treats any non-empty reason as a closed resource gate. The log keeps
         // the distinction between full-model and layer-only admission.
-        val resourceReason = if (resourceAdmitted) "" else "model_identity_not_verified"
+        val resourceReason = when {
+            resourceAdmitted -> ""
+            layerArtifacts.isNotEmpty() -> "layer_artifact_ambiguous"
+            hasCoordinatorIdentity -> "master_model_artifact_not_found"
+            else -> "model_identity_not_verified"
+        }
+        if (hasAmbiguousLayers || !resourceAdmitted) {
+            _uiState.value = _uiState.value.copy(
+                modelMessage = if (hasAmbiguousLayers) {
+                    "同一层区间存在多个不同工件；请先移走冲突工件或仅授权目标工件目录，再重新扫描"
+                } else {
+                    "当前主节点模型工件未匹配；请在设置中授权 Download/QLH/models 子目录，确认源模型摘要、层区间和 manifest 后重试"
+                },
+            )
+        }
         QlhLogger.i(
             "MainViewModel",
             "task worker identity: modelId=$modelId sha=${modelSha256.take(12)} " +
@@ -1536,7 +1563,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     selectedModelUri = selected?.uri?.toString().orEmpty(),
                     isScanningModels = false,
                     modelMessage = if (showMessage) {
-                        if (models.isEmpty()) "未发现 .gguf 模型文件" else "已扫描到 ${models.size} 个模型"
+                        if (models.isEmpty()) {
+                            "未发现 .gguf 模型；请授权 Download/QLH/models 子目录后重试"
+                        } else "已扫描到 ${models.size} 个模型"
                     } else {
                         null
                     }

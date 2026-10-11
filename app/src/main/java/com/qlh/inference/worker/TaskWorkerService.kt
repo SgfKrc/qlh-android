@@ -19,22 +19,42 @@ import com.qlh.inference.data.SettingsDataStore
 import com.qlh.inference.logging.QlhLogger
 import com.qlh.inference.service.InferenceService
 import com.qlh.inference.service.ModelManager
+import com.qlh.inference.service.LayerArtifactChoice
+import com.qlh.inference.service.LayerArtifactDiagnostic
+import com.qlh.inference.service.LayerArtifactInventory
+import com.qlh.inference.service.chooseLayerArtifact
+import com.qlh.inference.service.toCandidate
+import com.qlh.inference.service.unambiguousLayerArtifactCandidates
+import com.qlh.inference.system.AndroidDeviceInfoProvider
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
 /** Foreground lifecycle shell for the Android Full Worker client. */
 class TaskWorkerService : Service() {
     private val binder = LocalBinder()
     private var client: TaskWorkerClient? = null
+    private var activeWorkerKey: TaskWorkerStartKey? = null
+    private var activeInferenceStartAccepted = false
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val commandMutex = Mutex()
+    private data class WorkerCommand(val intent: Intent?, val startId: Int)
+    private val commandQueue = TaskWorkerCommandQueue<WorkerCommand>(
+        scope = scope,
+        handle = { command -> handleStartCommand(command.intent, command.startId) },
+        onFailure = { command, error ->
+            QlhLogger.e("TaskWorkerService", "worker command failed; stopping worker", error)
+            runCatching { settings.clearTaskWorkerStartupConfig() }
+                .onFailure { failure ->
+                    QlhLogger.e("TaskWorkerService", "could not clear worker startup", failure)
+                }
+            stopWorker()
+            stopSelf(command.startId)
+        },
+    )
 
     /** ★ 2026-10-07（DIST-NEXT-5）：启动配置的持久化载体（系统重建时读回）。 */
     private val settings by lazy { SettingsDataStore(applicationContext) }
@@ -50,11 +70,11 @@ class TaskWorkerService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        // ★ 2026-10-07（DIST-NEXT-5）：决策抽成纯函数（`decideTaskWorkerStartup`，可单测），
-        //   这里只做 IO 与分派。关键变化：`intent == null`（系统 `START_STICKY` 回收后重建）
-        //   不再落进默认分支什么都不做，而是用**持久化配置**恢复 worker。
-        scope.launch {
-            commandMutex.withLock { handleStartCommand(intent, startId) }
+        val queuedIntent = intent?.let(::Intent)
+        intent?.removeExtra(EXTRA_CLUSTER_SECRET)
+        if (!commandQueue.enqueue(WorkerCommand(queuedIntent, startId))) {
+            QlhLogger.e("TaskWorkerService", "worker command queue unavailable")
+            stopSelf(startId)
         }
         return if (BuildConfig.IS_LITE) START_NOT_STICKY else START_STICKY
     }
@@ -184,6 +204,7 @@ class TaskWorkerService : Service() {
     override fun onBind(intent: Intent?): IBinder = binder
 
     override fun onDestroy() {
+        commandQueue.close()
         stopWorker()
         scope.cancel()
         super.onDestroy()
@@ -196,6 +217,21 @@ class TaskWorkerService : Service() {
     private suspend fun startWorker(config: TaskWorkerStartupConfig, clusterSecret: String) {
         if (BuildConfig.IS_LITE) {
             stopSelf()
+            return
+        }
+        val modelTreeUri = settings.getModelTreeUri()
+        val selectedModelUri = settings.getSelectedModelUri()
+        val treePermissionGranted = modelTreeUri.isBlank() ||
+            contentResolver.persistedUriPermissions.any {
+                it.uri.toString() == modelTreeUri && it.isReadPermission
+            }
+        if (client != null && client?.snapshot?.value?.connection != TaskWorkerConnectionState.STOPPED &&
+            (activeInferenceStartAccepted || QlhApplication.instance.inferenceService != null) &&
+            activeWorkerKey?.matches(
+                config, modelTreeUri, selectedModelUri, clusterSecret, treePermissionGranted,
+            ) == true
+        ) {
+            QlhLogger.i("TaskWorkerService", "worker_start_reused=true")
             return
         }
         // ★ 2026-10-07（DIST-NEXT-5）：参数来自 `TaskWorkerStartupConfig`（可持久化）
@@ -226,6 +262,7 @@ class TaskWorkerService : Service() {
         // snapshot; re-hashing multi-GB GGUF files for every token would make
         // the stage path unusable.
         val verifiedLayerArtifacts = AtomicReference<List<ModelManager.LayerArtifact>>(emptyList())
+        val verifiedInventory = AtomicReference<LayerArtifactInventory?>(null)
         val layerArtifactCapability = { artifact: ModelManager.LayerArtifact ->
             val hasModelPreflightContract =
                 artifact.sourceModelId != null &&
@@ -248,25 +285,57 @@ class TaskWorkerService : Service() {
                 },
             )
         }
+        var inferenceStartAccepted = true
         if (QlhApplication.instance.inferenceService == null && !BuildConfig.IS_LITE) {
             runCatching {
                 ContextCompat.startForegroundService(this, Intent(this, InferenceService::class.java))
             }.onFailure { error ->
+                inferenceStartAccepted = false
                 QlhLogger.w("TaskWorkerService", "inference service start failed: ${error.message}")
             }
         }
+        val verifiedResourceAdmitted = AtomicBoolean(false)
         val expectedModelIdentity = {
             AndroidWorkerCapabilities.modelIdentity(
-                modelId, modelFormat, modelRevision, modelSha256, resourceAdmitted,
+                modelId, modelFormat, modelRevision, modelSha256,
+                verifiedResourceAdmitted.get(),
             )
         }
         val buildCapabilities: suspend () -> Map<String, Any?> = suspend {
-            val inventory = modelManager.scanLayerArtifacts(
-                expectedModelSha256 = modelSha256,
-                verifyArtifactDigest = true,
-            ).getOrNull()
-            val layerArtifacts = inventory?.artifacts.orEmpty()
+            val inferenceReady = QlhApplication.instance.inferenceService != null ||
+                (inferenceStartAccepted && awaitInferenceService() != null)
+            val scanStartedAtMs = android.os.SystemClock.elapsedRealtime()
+            val inventory = if (inferenceReady && resourceAdmitted && modelId.isNotBlank() &&
+                modelSha256.matches(Regex("[0-9a-fA-F]{64}"))
+            ) {
+                modelManager.scanLayerArtifacts(
+                    expectedModelSha256 = modelSha256,
+                    verifyArtifactDigest = true,
+                ).getOrNull()
+            } else null
+            verifiedInventory.set(inventory)
+            val eligibleArtifacts = inventory?.artifacts.orEmpty().filter {
+                it.sourceModelSha256.equals(modelSha256, ignoreCase = true) &&
+                    (it.sourceModelId == null || it.sourceModelId == modelId)
+            }
+            val candidates = eligibleArtifacts.map { it.toCandidate() }
+            val allowedReferences = unambiguousLayerArtifactCandidates(candidates)
+                .map { it.reference }.toSet()
+            val layerArtifacts = eligibleArtifacts
+                .filter { it.document.uri.toString() in allowedReferences }
             verifiedLayerArtifacts.set(layerArtifacts.toList())
+            QlhLogger.i(
+                "TaskWorkerService",
+                "hello_scan_ms=${android.os.SystemClock.elapsedRealtime() - scanStartedAtMs} " +
+                    "scanned=${inventory != null} eligible_ranges=${layerArtifacts.size}",
+            )
+            val verifiedAdmission = AndroidWorkerCapabilities.verifiedAdmission(
+                resourceAdmitted, fullInferenceAvailable, layerArtifacts.size, inferenceReady,
+            )
+            verifiedResourceAdmitted.set(verifiedAdmission)
+            val verifiedReason = if (verifiedAdmission) "" else if (resourceAdmitted) {
+                if (inferenceReady) "layer_artifact_unavailable" else "inference_service_unavailable"
+            } else resourceReason
             val layerRanges = layerArtifacts
                 .map { listOf(it.startLayer, it.endLayerExclusive) }
             val advertisedLayerArtifacts = layerArtifacts.map(layerArtifactCapability)
@@ -286,11 +355,16 @@ class TaskWorkerService : Service() {
             // cutting exists, exact per-artifact ranges are the contract; only
             // retain the legacy budget hint when there is one artifact.
             val layerBudget = if (layerArtifacts.size == 1) {
-                AndroidWorkerCapabilities.computeLayerBudget(
-                    availableBytes = (deviceInfo["memory"] as? Map<*, *>)
+                val availableBytes = runCatching {
+                    AndroidDeviceInfoProvider(this@TaskWorkerService).getMemoryStatus().availableBytes
+                }.getOrDefault(
+                    (deviceInfo["memory"] as? Map<*, *>)
                         ?.get("available_bytes")
                         ?.let { (it as? Number)?.toLong() }
                         ?: 0L,
+                )
+                AndroidWorkerCapabilities.computeLayerBudget(
+                    availableBytes = availableBytes,
                     modelFileBytes = readyArtifact?.document?.sizeBytes ?: 0L,
                     coveredLayers = readyArtifact
                         ?.let { it.endLayerExclusive - it.startLayer } ?: 0,
@@ -303,8 +377,8 @@ class TaskWorkerService : Service() {
                 modelFormat = modelFormat,
                 modelRevision = modelRevision,
                 modelSha256 = modelSha256,
-                resourceAdmitted = resourceAdmitted,
-                resourceReason = resourceReason,
+                resourceAdmitted = verifiedAdmission,
+                resourceReason = verifiedReason,
                 layerRanges = layerRanges,
                 fullInferenceAvailable = fullInferenceAvailable,
                 layerWorker = !fullInferenceAvailable && layerRanges.isNotEmpty(),
@@ -327,7 +401,7 @@ class TaskWorkerService : Service() {
                     "ranges=${capabilities["layer_ranges"]} model=${modelId.ifBlank { "<none>" }} " +
                     "sha=${modelSha256.take(12)} profile=$runtimeProfile " +
                     "budget=${layerBudget?.maxLayers} " +
-                    "admitted=$resourceAdmitted full=$fullInferenceAvailable",
+                "admitted=$verifiedAdmission full=$fullInferenceAvailable",
             )
             capabilities
         }
@@ -427,23 +501,41 @@ class TaskWorkerService : Service() {
                             contextSize = contextSize,
                             extractHidden = wantHidden,
                             expectedModelSha256 = sha256,
+                            expectedSourceModelId = modelId,
+                            expectedSourceModelSha256 = modelSha256,
                             expectedEmbeddingWidth = embeddingWidth,
                         )
                         ?: Result.failure(IllegalStateException("inference_service_unavailable"))
                 },
                 resolveLayerModelIdentity = { range, requested ->
-                    verifiedLayerArtifacts.get().firstOrNull {
-                        it.startLayer == range.getOrNull(0) &&
-                            it.endLayerExclusive == range.getOrNull(1) &&
-                            AndroidWorkerCapabilities.artifactModelId(
-                                it.document.name,
-                                it.artifactSha256,
-                            ) == requested["model_id"] &&
-                            it.artifactSha256 == requested["sha256"]
-                    }?.let { layerArtifactCapability(it).modelIdentity() }
+                    val choice = chooseLayerArtifact(
+                        candidates = verifiedLayerArtifacts.get().map { it.toCandidate() },
+                        masterModelId = modelId,
+                        masterSourceSha256 = modelSha256,
+                        startLayer = range.getOrElse(0) { -1 },
+                        endLayerExclusive = range.getOrElse(1) { -1 },
+                        offeredArtifactSha256 = (requested["sha256"] as? String).orEmpty(),
+                        offeredArtifactModelId = (requested["model_id"] as? String).orEmpty(),
+                        storageUnavailable = verifiedInventory.get()?.failures?.any {
+                            it.errorCode == LayerArtifactDiagnostic.FALLBACK_UNAVAILABLE
+                        } == true,
+                    )
+                    when (choice) {
+                        is LayerArtifactChoice.Selected -> verifiedLayerArtifacts.get()
+                            .firstOrNull { it.document.uri.toString() == choice.artifact.reference }
+                            ?.let { layerArtifactCapability(it).modelIdentity() }
+                        is LayerArtifactChoice.ManualRequired -> {
+                            QlhLogger.w("TaskWorkerService", "${choice.reason}: ${choice.prompt}")
+                            null
+                        }
+                    }
                 },
             ),
         ).also { it.start() }
+        activeWorkerKey = TaskWorkerStartKey(
+            config, modelTreeUri, selectedModelUri, clusterSecret, treePermissionGranted,
+        )
+        activeInferenceStartAccepted = inferenceStartAccepted
     }
 
     /**
@@ -472,6 +564,8 @@ class TaskWorkerService : Service() {
     }
 
     private fun stopWorker() {
+        activeWorkerKey = null
+        activeInferenceStartAccepted = false
         val old = client ?: return
         client = null
         old.stop()

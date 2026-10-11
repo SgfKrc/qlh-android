@@ -45,6 +45,49 @@ class TaskWorkerStartupTest {
     }
 
     @Test
+    fun `identical worker start reuses client but credentials storage or config changes restart`() {
+        val original = config()
+        val secret = "worker-secret-first"
+        val key = TaskWorkerStartKey(original, "content://models/tree-A", "model-A", secret)
+
+        assertTrue(key.matches(original.copy(), "content://models/tree-A", "model-A", secret))
+        assertFalse(key.matches(original, "content://models/tree-A", "model-A", "new-secret"))
+        assertFalse(key.matches(original, "content://models/tree-B", "model-A", secret))
+        assertFalse(key.matches(original, "content://models/tree-A", "model-A", secret,
+            treePermissionGranted = false))
+        assertFalse(key.matches(original, "content://models/tree-A", "model-B", secret))
+        assertFalse(key.matches(original.copy(modelSha256 = "b".repeat(64)),
+            "content://models/tree-A", "model-A", secret))
+        assertFalse(key.matches(original.copy(coordinatorPort = 9000),
+            "content://models/tree-A", "model-A", secret))
+        assertFalse(key.matches(original.copy(clusterSecretEpoch = 2),
+            "content://models/tree-A", "model-A", secret))
+        assertFalse(key.toString().contains(secret))
+    }
+
+    @Test
+    fun `volatile telemetry does not interrupt worker but runtime capability changes do`() {
+        val baseInfo = mapOf<String, Any?>(
+            "runtime_profile" to "llama_cpp_only",
+            "memory" to mapOf("available_bytes" to 2_000L, "low_memory" to false,
+                "total_bytes" to 4_000L),
+            "android" to mapOf("sdk_int" to 35, "thermal_status" to 0),
+        )
+        val original = config().copy(deviceInfo = baseInfo)
+        val changedInfo = baseInfo + mapOf(
+            "memory" to mapOf("available_bytes" to 1_000L, "low_memory" to true,
+                "total_bytes" to 4_000L),
+            "android" to mapOf("sdk_int" to 35, "thermal_status" to 4),
+        )
+        val key = TaskWorkerStartKey(original, "tree", "model", "secret")
+
+        assertTrue(key.matches(original.copy(deviceInfo = changedInfo),
+            "tree", "model", "secret"))
+        assertFalse(key.matches(original.copy(deviceInfo = changedInfo +
+            ("runtime_profile" to "unspecified")), "tree", "model", "secret"))
+    }
+
+    @Test
     fun `json round trip preserves the fields needed to rebuild`() {
         val original = config()
         val json = original.toJson()

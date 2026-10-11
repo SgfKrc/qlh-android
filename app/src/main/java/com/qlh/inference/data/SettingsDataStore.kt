@@ -4,23 +4,73 @@ import com.qlh.inference.network.httpBaseUrl
 
 import android.content.Context
 import androidx.datastore.core.DataStore
+import androidx.datastore.core.handlers.ReplaceFileCorruptionHandler
 import androidx.datastore.preferences.core.Preferences
+import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.emptyPreferences
 import androidx.datastore.preferences.core.floatPreferencesKey
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
-import androidx.datastore.preferences.preferencesDataStore
+import androidx.datastore.preferences.preferencesDataStoreFile
+import com.qlh.inference.logging.QlhLogger
 import com.qlh.inference.security.ClusterCredentialStorage
 import com.qlh.inference.security.ClusterCredentialStore
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import java.io.File
 import java.util.UUID
 
-private val Context.dataStore: DataStore<Preferences> by preferencesDataStore(name = "qlh_settings")
+private const val SETTINGS_STORE_NAME = "qlh_settings"
+private val settingsStoreLock = Any()
+@Volatile private var settingsStore: DataStore<Preferences>? = null
+
+internal fun settingsCorruptionHandler(file: File): ReplaceFileCorruptionHandler<Preferences> =
+    ReplaceFileCorruptionHandler {
+        runCatching { backupCorruptSettingsFile(file) }
+            .onFailure {
+                QlhLogger.w(
+                    "SettingsDataStore",
+                    "corrupt preferences backup failed: ${it.javaClass.simpleName}",
+                )
+            }
+        QlhLogger.w("SettingsDataStore", "corrupt preferences replaced with defaults")
+        emptyPreferences()
+    }
+
+private val Context.dataStore: DataStore<Preferences>
+    get() = settingsStore ?: synchronized(settingsStoreLock) {
+        settingsStore ?: run {
+            val file = applicationContext.preferencesDataStoreFile(SETTINGS_STORE_NAME)
+            PreferenceDataStoreFactory.create(
+                corruptionHandler = settingsCorruptionHandler(file),
+                scope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
+                produceFile = { file },
+            ).also { settingsStore = it }
+        }
+    }
+
+internal fun backupCorruptSettingsFile(source: File): File? {
+    if (!source.isFile) return null
+    val backup = File(
+        source.parentFile,
+        "${source.name}.corrupt-${System.currentTimeMillis()}-${UUID.randomUUID()}",
+    )
+    try {
+        source.copyTo(backup)
+    } catch (error: Exception) {
+        backup.delete()
+        throw error
+    }
+    return backup
+}
 
 class SettingsDataStore internal constructor(
     private val dataStore: DataStore<Preferences>,
@@ -31,9 +81,9 @@ class SettingsDataStore internal constructor(
         credentialStore = ClusterCredentialStore(context.applicationContext),
     )
 
-    private val credentialMigrationMutex = Mutex()
-
     companion object {
+        private val credentialMigrationMutex = Mutex()
+
         // ---- 主节点连接 ----
         val KEY_SERVER_HOST = stringPreferencesKey("server_host")
         val KEY_SERVER_PORT = intPreferencesKey("server_port")

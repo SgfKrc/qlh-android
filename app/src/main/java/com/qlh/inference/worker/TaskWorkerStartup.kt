@@ -3,6 +3,7 @@ package com.qlh.inference.worker
 import com.google.gson.Gson
 import com.google.gson.JsonParser
 import com.google.gson.annotations.SerializedName
+import java.security.MessageDigest
 
 /**
  * ★ 2026-10-07（DIST-NEXT-5）：task-worker 的**启动配置**（可持久化）与**重建决策**。
@@ -86,6 +87,45 @@ data class TaskWorkerStartupConfig(
             }.getOrDefault(false)
         }
     }
+}
+
+/** In-memory START identity; the credential is represented only by a digest. */
+internal class TaskWorkerStartKey(
+    config: TaskWorkerStartupConfig,
+    private val modelTreeUri: String,
+    private val selectedModelUri: String,
+    clusterSecret: String,
+    private val treePermissionGranted: Boolean = true,
+) {
+    private val secretDigest = sha256(clusterSecret)
+    private val stableConfig = stable(config)
+
+    fun matches(
+        config: TaskWorkerStartupConfig,
+        modelTreeUri: String,
+        selectedModelUri: String,
+        clusterSecret: String,
+        treePermissionGranted: Boolean = true,
+    ): Boolean = stableConfig == stable(config) && this.modelTreeUri == modelTreeUri &&
+        this.selectedModelUri == selectedModelUri &&
+        this.treePermissionGranted == treePermissionGranted &&
+        MessageDigest.isEqual(secretDigest, sha256(clusterSecret))
+
+    private fun stable(config: TaskWorkerStartupConfig): TaskWorkerStartupConfig {
+        val deviceInfo = config.deviceInfo.toMutableMap()
+        (deviceInfo["memory"] as? Map<*, *>)?.let { memory ->
+            deviceInfo["memory"] = memory.filterKeys {
+                it != "available_bytes" && it != "low_memory"
+            }
+        }
+        (deviceInfo["android"] as? Map<*, *>)?.let { android ->
+            deviceInfo["android"] = android.filterKeys { it != "thermal_status" }
+        }
+        return config.copy(deviceInfo = deviceInfo)
+    }
+
+    private fun sha256(value: String): ByteArray = MessageDigest.getInstance("SHA-256")
+        .digest(value.toByteArray(Charsets.UTF_8))
 }
 
 /** ★ 2026-10-07（DIST-NEXT-5）：`onStartCommand` 该做什么。 */

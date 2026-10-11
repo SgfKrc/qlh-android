@@ -257,6 +257,14 @@ object AndroidWorkerCapabilities {
         )
     }
 
+    fun verifiedAdmission(
+        requested: Boolean,
+        fullInferenceAvailable: Boolean,
+        verifiedLayerCount: Int,
+        inferenceReady: Boolean = true,
+    ): Boolean = requested && inferenceReady &&
+        (fullInferenceAvailable || verifiedLayerCount > 0)
+
     fun build(
         modelId: String = "",
         modelFormat: String = "gguf",
@@ -321,10 +329,10 @@ object AndroidWorkerCapabilities {
             addAll(artifactModels)
         }.distinctBy { it["model_id"] }
         val capabilities = linkedMapOf<String, Any?>(
-            "stage_types" to if (normalizedRanges.isEmpty()) {
-                listOf("full_inference")
-            } else if (!fullInferenceAvailable) {
+            "stage_types" to if (!fullInferenceAvailable) {
                 listOf("layer_forward")
+            } else if (normalizedRanges.isEmpty()) {
+                listOf("full_inference")
             } else {
                 SUPPORTED_STAGE_TYPES
             },

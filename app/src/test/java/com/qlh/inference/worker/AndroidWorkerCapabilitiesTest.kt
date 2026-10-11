@@ -10,6 +10,36 @@ import org.junit.Test
 
 class AndroidWorkerCapabilitiesTest {
     @Test
+    fun `layer only resource admission follows the verified inventory`() {
+        assertFalse(AndroidWorkerCapabilities.verifiedAdmission(true, false, 0))
+        assertTrue(AndroidWorkerCapabilities.verifiedAdmission(true, false, 1))
+        assertTrue(AndroidWorkerCapabilities.verifiedAdmission(true, true, 0))
+        assertFalse(AndroidWorkerCapabilities.verifiedAdmission(false, true, 1))
+        assertFalse(AndroidWorkerCapabilities.verifiedAdmission(true, false, 1, false))
+        assertFalse(AndroidWorkerCapabilities.verifiedAdmission(true, true, 0, false))
+
+        val capabilities = AndroidWorkerCapabilities.build(
+            modelId = "qwen3-5-2b",
+            modelSha256 = "a".repeat(64),
+            resourceAdmitted = AndroidWorkerCapabilities.verifiedAdmission(true, false, 0),
+            resourceReason = "layer_artifact_unavailable",
+            fullInferenceAvailable = false,
+        )
+        assertEquals(listOf("layer_forward"), capabilities["stage_types"])
+        assertFalse(capabilities.containsKey("layer_ranges"))
+        assertEquals(
+            mapOf("admitted" to false, "reason_code" to "layer_artifact_unavailable"),
+            capabilities["resource_gate"],
+        )
+        TaskWorkerProtocol.validate(TaskWorkerProtocol.buildHello(
+            nodeId = "android_layer_only_01",
+            capabilities = capabilities,
+            messageId = "msg_capabilities_no_artifact",
+            sentAtMs = 1_700_000_000_000,
+        ))
+    }
+
+    @Test
     fun `resource gate defaults closed and withholds model identity`() {
         val capabilities = AndroidWorkerCapabilities.build(modelId = "qwen_1_8b")
         assertEquals(1, capabilities["max_concurrency"])

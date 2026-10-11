@@ -1005,7 +1005,8 @@ object TaskWorkerProtocol {
      */
     private val layerArtifactDiagnosticCodes = setOf(
         "manifest_unreadable", "manifest_invalid", "source_digest_mismatch",
-        "artifact_missing", "artifact_digest_mismatch",
+        "artifact_missing", "artifact_digest_mismatch", "fallback_storage_unavailable",
+        "artifact_ambiguous",
     )
     private val layerArtifactSegmentModes = setOf("head", "middle", "tail")
     private const val MAX_LAYER_ARTIFACT_DIAGNOSTICS = 32
@@ -1058,11 +1059,10 @@ object TaskWorkerProtocol {
                 )
             }
             requirePattern(string(entry, "manifest"), safeId, "$itemField.manifest")
-            requirePattern(
-                string(entry, "architecture", allowEmpty = true),
-                safeId,
-                "$itemField.architecture",
-            )
+            val architecture = string(entry, "architecture", allowEmpty = true)
+            if (architecture.isNotEmpty()) {
+                requirePattern(architecture, safeId, "$itemField.architecture")
+            }
             val mode = string(entry, "mode", allowEmpty = true)
             if (mode.isNotEmpty() && mode !in layerArtifactSegmentModes) {
                 fail(

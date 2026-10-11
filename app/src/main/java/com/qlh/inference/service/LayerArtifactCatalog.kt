@@ -4,6 +4,7 @@ import com.google.gson.JsonArray
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 import com.qlh.inference.service.ModelManager.LayerArtifact
+import com.qlh.inference.worker.AndroidWorkerCapabilities
 import java.io.File
 
 /** Metadata required to bind one GGUF artifact to a source-model layer range. */
@@ -51,7 +52,7 @@ object LayerArtifactManifestParser {
     fun parse(raw: String, manifestName: String): Result<LayerArtifactDescriptor> = runCatching {
         val root = JsonParser.parseString(raw).asJsonObject
         val artifact = string(root, "artifact")
-            .ifBlank { File(manifestName).nameWithoutExtension + ".gguf" }
+            .ifBlank { File(manifestName).nameWithoutExtension.removeSuffix(".manifest") + ".gguf" }
         val range = explicitRange(root) ?: derivedTailRange(root)
             ?: error("manifest has no layer range")
         val artifactSha = string(root, "artifact_sha256").lowercase()
@@ -184,6 +185,8 @@ data class LayerArtifactDiagnostic(
         const val SOURCE_DIGEST_MISMATCH = "source_digest_mismatch"
         const val ARTIFACT_MISSING = "artifact_missing"
         const val ARTIFACT_DIGEST_MISMATCH = "artifact_digest_mismatch"
+        const val FALLBACK_UNAVAILABLE = "fallback_storage_unavailable"
+        const val ARTIFACT_AMBIGUOUS = "artifact_ambiguous"
     }
 }
 
@@ -306,5 +309,124 @@ fun classifyLayerArtifact(
             artifactSizeBytes = probe.sizeBytes,
         ),
         descriptor,
+    )
+}
+
+/** Local-only reference; never include it in a task-worker capability advertisement. */
+data class LayerArtifactCandidate(
+    val descriptor: LayerArtifactDescriptor,
+    val reference: String,
+    val manifestName: String,
+    val root: Root,
+) {
+    enum class Root { SAF, FALLBACK, INTERNAL }
+}
+
+/** Local-only candidate metadata; callers must verify bytes before advertising it. */
+fun LayerArtifact.toCandidate(
+    root: LayerArtifactCandidate.Root = when (document.source) {
+        ModelManager.ModelSource.SAF -> LayerArtifactCandidate.Root.SAF
+        ModelManager.ModelSource.FALLBACK -> LayerArtifactCandidate.Root.FALLBACK
+        ModelManager.ModelSource.INTERNAL -> LayerArtifactCandidate.Root.INTERNAL
+    },
+): LayerArtifactCandidate = LayerArtifactCandidate(
+    descriptor = LayerArtifactDescriptor(
+        artifactName = document.name,
+        startLayer = startLayer,
+        endLayerExclusive = endLayerExclusive,
+        artifactSha256 = artifactSha256,
+        sourceModelSha256 = sourceModelSha256,
+        sourceModelId = sourceModelId,
+        hiddenSize = hiddenSize,
+        tokenizerSha256 = tokenizerSha256,
+        architecture = architecture,
+        mode = mode,
+    ),
+    reference = document.uri.toString(),
+    manifestName = manifest.name,
+    root = root,
+)
+
+const val FALLBACK_LAYER_ARTIFACT_DIRECTORY = "/sdcard/Download/QLH/models"
+
+private fun LayerArtifactCandidate.identityKey(): List<Any?> = listOf(
+    descriptor.sourceModelSha256.lowercase(),
+    descriptor.sourceModelId,
+    descriptor.startLayer,
+    descriptor.endLayerExclusive,
+    descriptor.artifactSha256.lowercase(),
+    descriptor.artifactName,
+    descriptor.mode,
+    descriptor.architecture,
+    descriptor.hiddenSize,
+    descriptor.tokenizerSha256,
+)
+
+/** Keep alternative digests and source identities until the master's request is known. */
+fun mergeLayerArtifactCandidates(
+    saf: List<LayerArtifactCandidate>,
+    fallback: List<LayerArtifactCandidate>,
+): List<LayerArtifactCandidate> = (saf + fallback)
+    .sortedBy { it.root.ordinal }
+    .distinctBy { it.identityKey() }
+
+fun unambiguousLayerArtifactCandidates(
+    candidates: List<LayerArtifactCandidate>,
+): List<LayerArtifactCandidate> = candidates
+    .groupBy { it.descriptor.startLayer to it.descriptor.endLayerExclusive }
+    .values.filter { it.size == 1 }.map { it.single() }
+
+sealed interface LayerArtifactChoice {
+    data class Selected(val artifact: LayerArtifactCandidate) : LayerArtifactChoice
+    data class ManualRequired(val reason: String, val prompt: String) : LayerArtifactChoice
+}
+
+/**
+ * Require a master source digest and [start, end); the offer carries a separate artifact digest.
+ * storageUnavailable is local-only: use it when neither SAF nor direct fallback can be read.
+ */
+fun chooseLayerArtifact(
+    candidates: List<LayerArtifactCandidate>,
+    masterModelId: String,
+    masterSourceSha256: String,
+    startLayer: Int,
+    endLayerExclusive: Int,
+    offeredArtifactSha256: String = "",
+    storageUnavailable: Boolean = false,
+    offeredArtifactModelId: String = "",
+): LayerArtifactChoice {
+    val sha256 = Regex("[0-9a-fA-F]{64}")
+    if (masterModelId.isBlank() || !sha256.matches(masterSourceSha256) ||
+        startLayer < 0 || endLayerExclusive <= startLayer ||
+        (offeredArtifactSha256.isNotBlank() && !sha256.matches(offeredArtifactSha256))
+    ) {
+        return LayerArtifactChoice.ManualRequired(
+            "model_identity_missing", "请确认主节点模型身份、摘要和层区间后重试。",
+        )
+    }
+    val matches = candidates.filter { candidate ->
+        val artifact = candidate.descriptor
+        artifact.sourceModelSha256.equals(masterSourceSha256, ignoreCase = true) &&
+            (artifact.sourceModelId == null || artifact.sourceModelId == masterModelId) &&
+            artifact.startLayer == startLayer && artifact.endLayerExclusive == endLayerExclusive &&
+            (offeredArtifactSha256.isBlank() || artifact.artifactSha256.equals(
+                offeredArtifactSha256, ignoreCase = true,
+            )) &&
+            (offeredArtifactModelId.isBlank() || AndroidWorkerCapabilities.artifactModelId(
+                artifact.artifactName, artifact.artifactSha256,
+            ) == offeredArtifactModelId)
+    }
+    val distinct = matches.sortedBy { it.root.ordinal }.distinctBy { it.identityKey() }
+    if (distinct.size == 1) return LayerArtifactChoice.Selected(distinct.single())
+    val reason = when {
+        distinct.size > 1 -> "layer_artifact_ambiguous"
+        storageUnavailable -> "artifact_storage_unavailable"
+        else -> "layer_artifact_not_found"
+    }
+    return LayerArtifactChoice.ManualRequired(
+        reason = reason,
+        prompt = "请在设置中用 SAF 授权 Download/QLH/models 子目录，不要选择 Download 根目录；" +
+            "其他应用创建的下载工件不能仅凭路径 $FALLBACK_LAYER_ARTIFACT_DIRECTORY 访问。" +
+            "确认 GGUF 与 manifest 的源摘要、工件摘要及层区间后重试。",
     )
 }

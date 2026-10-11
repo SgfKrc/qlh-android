@@ -4,7 +4,12 @@ import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
+import java.util.concurrent.Callable
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 /**
  * ★ 2026-10-07（DIST-NEXT-2b）：大 payload 分片装配（与主仓
@@ -14,6 +19,15 @@ import org.junit.Test
  */
 class StageChunkAssemblerTest {
     private fun digest(chunk: ByteArray): String = StageChunkAssembler.sha256Hex(chunk)
+
+    private fun rejects(code: String, action: () -> Unit) {
+        try {
+            action()
+            fail("expected $code")
+        } catch (error: AndroidFullWorkerStageException) {
+            assertEquals(code, error.code)
+        }
+    }
 
     @Test
     fun `chunks are ordered by index and must be complete`() {
@@ -126,6 +140,164 @@ class StageChunkAssemblerTest {
             assertTrue("discard 后装配必须失败", false)
         } catch (error: AndroidFullWorkerStageException) {
             assertEquals("incomplete_chunks", error.code)
+        }
+    }
+
+    @Test
+    fun `global byte budget is shared without mixing same named attempts`() {
+        val budget = StageChunkBudget(8, 4, TimeUnit.MINUTES.toNanos(1))
+        val first = StageChunkAssembler(budget)
+        val second = StageChunkAssembler(budget)
+        val six = ByteArray(6) { 1 }
+        val two = ByteArray(2) { 2 }
+        assertEquals(1, first.add("same", 0, 2, six, digest(six)))
+        assertEquals(0, second.receivedCount("same"))
+
+        rejects("chunk_budget_exceeded") {
+            second.add("same", 0, 1, ByteArray(3), digest(ByteArray(3)))
+        }
+        assertEquals(0, second.receivedCount("same"))
+        assertEquals(1, second.add("same", 0, 1, two, digest(two)))
+        assertArrayEquals(two, second.assemble("same"))
+        assertEquals(mapOf("same" to 1), first.pending())
+        assertEquals(emptyMap<String, Int>(), second.pending())
+
+        first.discard("same")
+        val replacement = ByteArray(6) { 3 }
+        assertEquals(1, first.add("another", 0, 1, replacement, digest(replacement)))
+        assertArrayEquals(replacement, first.assemble("another"))
+        second.discard("same")
+        first.discard("another")
+    }
+
+    @Test
+    fun `chunk bytes cannot be changed after admission`() {
+        val budget = StageChunkBudget(4, 2, TimeUnit.MINUTES.toNanos(1))
+        val assembler = StageChunkAssembler(budget)
+        val input = byteArrayOf(1, 2, 3, 4)
+        assembler.add("mutated", 0, 1, input, digest(input))
+        input.fill(0)
+        assertArrayEquals(byteArrayOf(1, 2, 3, 4), assembler.assemble("mutated"))
+        assembler.discard("mutated")
+    }
+
+    @Test
+    fun `idle ttl expires across instances but successful chunks renew it`() {
+        var now = 0L
+        val budget = StageChunkBudget(8, 3, ttlNanos = 10) { now }
+        val first = StageChunkAssembler(budget)
+        val second = StageChunkAssembler(budget)
+        val four = ByteArray(4) { 1 }
+        val two = ByteArray(2) { 2 }
+        first.add("old", 0, 3, four, digest(four))
+        now = 9
+        assertEquals(1, first.receivedCount("old"))
+        first.add("old", 1, 3, two, digest(two))
+        now = 18
+        assertEquals(listOf(2), first.missingIndices("old"))
+        second.add("live", 0, 1, two, digest(two))
+        now = 19
+        val six = ByteArray(6) { 3 }
+        second.add("new", 0, 1, six, digest(six))
+        assertEquals(0, first.receivedCount("old"))
+        assertEquals(emptyMap<String, Int>(), first.pending())
+        rejects("incomplete_chunks") { first.assemble("old") }
+        assertArrayEquals(two, second.assemble("live"))
+        assertArrayEquals(six, second.assemble("new"))
+    }
+
+    @Test
+    fun `reads and rejected chunks do not renew idle ttl`() {
+        var now = 0L
+        val budget = StageChunkBudget(4, 1, ttlNanos = 10) { now }
+        val assembler = StageChunkAssembler(budget)
+        val payload = ByteArray(4) { 1 }
+        assembler.add("old", 0, 1, payload, digest(payload))
+        now = 9
+        assertTrue(assembler.isComplete("old"))
+        rejects("duplicate_chunk") { assembler.add("old", 0, 1, payload, digest(payload)) }
+        now = 10
+        assertEquals(0, assembler.receivedCount("old"))
+        assertFalse(assembler.isComplete("old"))
+        rejects("incomplete_chunks") { assembler.assemble("old") }
+        assertEquals(1, assembler.add("again", 0, 1, payload, digest(payload)))
+    }
+
+    @Test
+    fun `zero byte attempts are bounded and freed on discard or ttl`() {
+        var now = 0L
+        val budget = StageChunkBudget(4, 2, ttlNanos = 10) { now }
+        val first = StageChunkAssembler(budget)
+        val second = StageChunkAssembler(budget)
+        val empty = byteArrayOf()
+        first.add("one", 0, 1, empty, digest(empty))
+        second.add("two", 0, 1, empty, digest(empty))
+        rejects("chunk_budget_exceeded") { first.add("three", 0, 1, empty, digest(empty)) }
+        assertEquals(0, first.receivedCount("three"))
+        assertTrue(first.isComplete("one"))
+        assertArrayEquals(empty, first.assemble("one"))
+
+        first.discard("one")
+        first.add("three", 0, 1, empty, digest(empty))
+        rejects("invalid_attempt") {
+            first.add("x".repeat(101), 0, 1, empty, digest(empty))
+        }
+        now = 10
+        assertFalse(second.isComplete("two"))
+        assertEquals(0, first.receivedCount("three"))
+        second.add("fresh", 0, 1, empty, digest(empty))
+    }
+
+    @Test
+    fun `maximum hidden payload still assembles at its protocol limit`() {
+        val limit = TaskWorkerProtocol.MAX_STAGE_PAYLOAD_BYTES
+        val budget = StageChunkBudget(limit.toLong(), 2, TimeUnit.MINUTES.toNanos(5))
+        val assembler = StageChunkAssembler(budget)
+        val chunk = ByteArray(TaskWorkerProtocol.STAGE_CHUNK_BYTES) { (it % 251).toByte() }
+        val sha = digest(chunk)
+        for (index in 0 until TaskWorkerProtocol.MAX_STAGE_CHUNKS) {
+            assembler.add("hidden", index, TaskWorkerProtocol.MAX_STAGE_CHUNKS, chunk, sha)
+        }
+        assertTrue(assembler.isComplete("hidden"))
+        val raw = assembler.assemble("hidden")
+        assertEquals(limit, raw.size)
+        assertArrayEquals(chunk, raw.copyOfRange(0, chunk.size))
+        assertArrayEquals(chunk, raw.copyOfRange(limit - chunk.size, limit))
+
+        val next = StageChunkAssembler(budget)
+        rejects("chunk_budget_exceeded") { next.add("next", 0, 1, chunk, sha) }
+        assembler.discard("hidden")
+        assertEquals(1, next.add("next", 0, 1, chunk, sha))
+        next.discard("next")
+    }
+
+    @Test
+    fun `simultaneous instances cannot oversubscribe the global budget`() {
+        val budget = StageChunkBudget(8, 2, TimeUnit.MINUTES.toNanos(1))
+        val first = StageChunkAssembler(budget)
+        val second = StageChunkAssembler(budget)
+        val chunk = ByteArray(6) { 4 }
+        val sha = digest(chunk)
+        val started = CountDownLatch(1)
+        val threads = Executors.newFixedThreadPool(2)
+        try {
+            val jobs = listOf(first, second).mapIndexed { index, assembler ->
+                threads.submit(Callable {
+                    started.await()
+                    try {
+                        assembler.add("attempt_$index", 0, 1, chunk, sha)
+                        true
+                    } catch (error: AndroidFullWorkerStageException) {
+                        assertEquals("chunk_budget_exceeded", error.code)
+                        false
+                    }
+                })
+            }
+            started.countDown()
+            assertEquals(1, jobs.count { it.get(5, TimeUnit.SECONDS) })
+            assertEquals(1, first.receivedCount("attempt_0") + second.receivedCount("attempt_1"))
+        } finally {
+            threads.shutdownNow()
         }
     }
 

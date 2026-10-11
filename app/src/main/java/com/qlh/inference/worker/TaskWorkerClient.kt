@@ -1007,16 +1007,20 @@ class TaskWorkerClient(
         if (rootInput["hidden_f32"] is String) return null
         if (rootInput["hidden_ref"] !is Map<*, *>) return null
         val identity = identityFrom(payload)
-        val raw = stageChunks.assemble(identity.attemptId)
-        val declared = (payload["hidden_sha256"] as? String).orEmpty()
-        val actual = StageChunkAssembler.sha256Hex(raw)
-        if (declared.isNotEmpty() && !actual.equals(declared, ignoreCase = true)) {
-            throw AndroidFullWorkerStageException(
-                "chunk_digest_mismatch",
-                "assembled hidden digest does not match the offer",
-            )
+        val raw = try {
+            val assembled = stageChunks.assemble(identity.attemptId)
+            val declared = (payload["hidden_sha256"] as? String).orEmpty()
+            val actual = StageChunkAssembler.sha256Hex(assembled)
+            if (declared.isNotEmpty() && !actual.equals(declared, ignoreCase = true)) {
+                throw AndroidFullWorkerStageException(
+                    "chunk_digest_mismatch",
+                    "assembled hidden digest does not match the offer",
+                )
+            }
+            assembled
+        } finally {
+            stageChunks.discard(identity.attemptId)
         }
-        stageChunks.discard(identity.attemptId)
         // 改写后**移除** `hidden_ref`：执行器只应看到内联 `hidden_f32`（避免两个来源并存）。
         val merged = LinkedHashMap<String, Any?>(
             rootInput.entries

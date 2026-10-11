@@ -3,7 +3,10 @@ package com.qlh.inference.service
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.os.Environment
 import android.os.ParcelFileDescriptor
+import android.system.Os
+import android.system.OsConstants
 import android.provider.DocumentsContract
 import android.provider.OpenableColumns
 import android.util.Log
@@ -13,6 +16,7 @@ import com.qlh.inference.model.Gemma4NativeAssetStatus
 import com.qlh.inference.model.Gemma4NativeAssets
 import com.qlh.inference.network.GgufModelInfo
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
@@ -48,15 +52,19 @@ class ModelManager(private val context: Context) {
         const val STORAGE_MODE_SAF_FD = "saf_fd"
         const val STORAGE_MODE_SAF_CACHE = "saf_cache"
         const val STORAGE_MODE_INTERNAL_TEST = "internal_test"
+        const val STORAGE_MODE_FALLBACK_FILE = "fallback_file"
 
         private const val GGUF_EXTENSION = ".gguf"
         private const val JSON_EXTENSION = ".json"
+        private val verifiedModelDigests = VerifiedModelDigestCache(
+            clockMs = { android.os.SystemClock.elapsedRealtime() },
+        )
     }
 
     private val settings = SettingsDataStore(context)
 
     /**
-     * ★ 2026-10-07（DIST-NEXT-6）：最近一次层段工件扫描的结构化结果（含失败原因）。
+     * ★ 2026-10-07（DIST-NEXT-6）：最近一次摘要校验扫描的结构化结果（含失败原因）。
      *
      * 供本地诊断 / UI 查询；跨端只上报 [LayerArtifactDiagnostic.toAdvertisement]
      * 那一行（无本地路径）。
@@ -83,6 +91,42 @@ class ModelManager(private val context: Context) {
     val defaultModelPath: String
         get() = File(modelsDir, DEFAULT_MODEL_FILENAME).absolutePath
 
+    private val fallbackModelsDir: File
+        get() = File(
+            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+            "QLH/models",
+        )
+
+    private fun listPhysicalModels(
+        directory: File,
+        source: ModelSource,
+        extensions: Set<String> = setOf(GGUF_EXTENSION),
+    ): List<ModelDocument> = scanModelFiles(directory, extensions).map { file ->
+        ModelDocument(file.name, Uri.fromFile(file), file.length(), source, directory.canonicalPath)
+    }
+
+    private fun physicalDocumentKey(document: ModelDocument): String {
+        val uri = document.uri
+        if (uri.scheme == "file") return File(uri.path.orEmpty()).canonicalPath
+        if (uri.scheme == "content" && uri.authority == "com.android.externalstorage.documents") {
+            val documentId = runCatching { DocumentsContract.getDocumentId(uri) }.getOrNull()
+            if (documentId?.startsWith("primary:", ignoreCase = true) == true) {
+                return File(
+                    Environment.getExternalStorageDirectory(),
+                    documentId.substringAfter(':'),
+                ).canonicalPath
+            }
+        }
+        return uri.toString()
+    }
+
+    private fun physicalModelSource(file: File): ModelSource =
+        if (file.canonicalPath.startsWith(fallbackModelsDir.canonicalPath + File.separator)) {
+            ModelSource.FALLBACK
+        } else {
+            ModelSource.INTERNAL
+        }
+
     private val cacheDir: File
         get() {
             val dir = File(context.cacheDir, MODEL_CACHE_DIR)
@@ -106,11 +150,11 @@ class ModelManager(private val context: Context) {
                 settings.clearSelectedModelUri()
                 settings.clearModelPath()
 
-                val models = listSafModels(treeUri)
-                if (models.size == 1) {
-                    settings.setSelectedModelUri(models.first().uri.toString())
+                val authorizedModels = listSafModels(treeUri)
+                if (authorizedModels.size == 1) {
+                    settings.setSelectedModelUri(authorizedModels.first().uri.toString())
                 }
-                Result.success(models)
+                listModels()
             } catch (e: Exception) {
                 Log.e(TAG, "保存 SAF 模型目录权限失败", e)
                 Result.failure(e)
@@ -120,23 +164,16 @@ class ModelManager(private val context: Context) {
     suspend fun listModels(): Result<List<ModelDocument>> = withContext(Dispatchers.IO) {
         try {
             val treeUri = getSavedTreeUri()
-            if (treeUri != null && hasPersistedPermission(treeUri)) {
-                return@withContext Result.success(listSafModels(treeUri))
-            }
-
-            val internalModels = modelsDir
-                .listFiles { file -> file.isFile && file.name.endsWith(GGUF_EXTENSION, true) }
-                ?.sortedBy { it.name.lowercase() }
-                ?.map {
-                    ModelDocument(
-                        name = it.name,
-                        uri = Uri.fromFile(it),
-                        sizeBytes = it.length(),
-                        source = ModelSource.INTERNAL
-                    )
-                }
-                ?: emptyList()
-            Result.success(internalModels)
+            val saf = if (treeUri != null && hasPersistedPermission(treeUri)) {
+                runCatching { listSafModels(treeUri) }
+                    .onFailure { Log.w(TAG, "authorized model directory is unavailable", it) }
+                    .getOrDefault(emptyList())
+            } else emptyList()
+            val fallback = runCatching { listPhysicalModels(fallbackModelsDir, ModelSource.FALLBACK) }
+                .onFailure { Log.w(TAG, "default model directory is unavailable", it) }
+                .getOrDefault(emptyList())
+            val internal = listPhysicalModels(modelsDir, ModelSource.INTERNAL)
+            Result.success((saf + fallback + internal).distinctBy(::physicalDocumentKey))
         } catch (e: Exception) {
             Log.e(TAG, "扫描模型失败", e)
             Result.failure(e)
@@ -149,8 +186,13 @@ class ModelManager(private val context: Context) {
             if (modelUri.scheme == "content") {
                 settings.setModelStorageMode(STORAGE_MODE_SAF_FD)
             } else {
-                settings.setModelStorageMode(STORAGE_MODE_INTERNAL_TEST)
-                settings.setModelPath(modelUri.path.orEmpty())
+                val file = File(modelUri.path.orEmpty())
+                settings.setModelStorageMode(
+                    if (physicalModelSource(file) == ModelSource.FALLBACK) {
+                        STORAGE_MODE_FALLBACK_FILE
+                    } else STORAGE_MODE_INTERNAL_TEST,
+                )
+                settings.setModelPath(file.absolutePath)
             }
             Result.success(Unit)
         } catch (e: Exception) {
@@ -177,7 +219,7 @@ class ModelManager(private val context: Context) {
             name = file.name,
             uri = Uri.fromFile(file),
             sizeBytes = file.length(),
-            source = ModelSource.INTERNAL
+            source = physicalModelSource(file)
         )
     }
 
@@ -187,7 +229,13 @@ class ModelManager(private val context: Context) {
     suspend fun getSelectedModelSha256(): String = withContext(Dispatchers.IO) {
         val selected = settings.getSelectedModelUri()
         if (selected.isBlank()) return@withContext ""
-        runCatching { computeSha256(Uri.parse(selected)) }.getOrDefault("")
+        try {
+            verifiedSha256(Uri.parse(selected), getSavedTreeUri()?.toString().orEmpty())
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            ""
+        }
     }
 
     suspend fun isModelReady(): Boolean = withContext(Dispatchers.IO) {
@@ -234,7 +282,9 @@ class ModelManager(private val context: Context) {
                                 loadPath = file.absolutePath,
                                 displayName = file.name,
                                 sourceUri = Uri.fromFile(file),
-                                mode = STORAGE_MODE_INTERNAL_TEST,
+                                mode = if (physicalModelSource(file) == ModelSource.FALLBACK) {
+                                    STORAGE_MODE_FALLBACK_FILE
+                                } else STORAGE_MODE_INTERNAL_TEST,
                                 pfd = null
                             )
                         )
@@ -273,21 +323,40 @@ class ModelManager(private val context: Context) {
      */
     suspend fun openLayerModelForLlama(
         layerRange: List<Int>,
-        expectedModelSha256: String = "",
+        expectedSourceModelId: String = "",
+        expectedSourceModelSha256: String = "",
+        expectedArtifactSha256: String = "",
         preferFd: Boolean = true,
     ): Result<LayerArtifactHandle> = withContext(Dispatchers.IO) {
         if (layerRange.size != 2 || layerRange[1] <= layerRange[0] || layerRange[0] < 0) {
             return@withContext Result.failure(IOException("invalid layer range"))
         }
+        if (expectedSourceModelId.isBlank() ||
+            !expectedSourceModelSha256.matches(Regex("[0-9a-fA-F]{64}")) ||
+            !expectedArtifactSha256.matches(Regex("[0-9a-fA-F]{64}"))
+        ) {
+            return@withContext Result.failure(IOException("source identity and artifact digest are required"))
+        }
         val artifacts = listLayerArtifacts(
-            expectedModelSha256 = expectedModelSha256,
+            expectedModelSha256 = expectedSourceModelSha256,
             verifyArtifactDigest = true,
         ).getOrElse { return@withContext Result.failure(it) }
-        val artifact = artifacts.firstOrNull {
-            it.startLayer == layerRange[0] && it.endLayerExclusive == layerRange[1]
-        } ?: return@withContext Result.failure(
-            IOException("layer artifact not found for [${layerRange[0]}, ${layerRange[1]})")
+        val choice = chooseLayerArtifact(
+            candidates = artifacts.map { it.toCandidate() },
+            masterModelId = expectedSourceModelId,
+            masterSourceSha256 = expectedSourceModelSha256,
+            startLayer = layerRange[0],
+            endLayerExclusive = layerRange[1],
+            offeredArtifactSha256 = expectedArtifactSha256,
         )
+        val artifact = when (choice) {
+            is LayerArtifactChoice.Selected -> artifacts.first {
+                it.document.uri.toString() == choice.artifact.reference
+            }
+            is LayerArtifactChoice.ManualRequired -> return@withContext Result.failure(
+                IOException("${choice.reason}: ${choice.prompt}"),
+            )
+        }
 
         openModelHandle(artifact.document.uri, preferFd).map { handle ->
             LayerArtifactHandle(
@@ -327,87 +396,150 @@ class ModelManager(private val context: Context) {
         verifyArtifactDigest: Boolean = false,
     ): Result<LayerArtifactInventory> = withContext(Dispatchers.IO) {
         try {
+            val scanStartedAtMs = android.os.SystemClock.elapsedRealtime()
+            var digestReused = 0
+            var digestStreamed = 0
             val treeUri = getSavedTreeUri()
-            val usingTree = treeUri != null && hasPersistedPermission(treeUri)
-            val modelDocuments = if (usingTree) {
-                listSafModels(treeUri!!)
-            } else {
-                modelsDir.listFiles { file ->
-                    file.isFile && file.name.endsWith(GGUF_EXTENSION, true)
-                }?.map {
-                    ModelDocument(it.name, Uri.fromFile(it), it.length(), ModelSource.INTERNAL)
-                }.orEmpty()
+            val roots = mutableListOf<Triple<String, List<ModelDocument>, List<ModelDocument>>>()
+            if (treeUri != null && hasPersistedPermission(treeUri)) {
+                runCatching {
+                    Triple("saf", listSafModels(treeUri), listSafFiles(treeUri, setOf(JSON_EXTENSION)))
+                }.onSuccess { roots += it }
+                    .onFailure { Log.w(TAG, "authorized layer directory is unavailable", it) }
             }
-            val manifests = if (usingTree) {
-                listSafFiles(treeUri!!, setOf(JSON_EXTENSION))
-            } else {
-                modelsDir.listFiles { file ->
-                    file.isFile && file.name.endsWith(JSON_EXTENSION, true)
-                }?.map {
-                    ModelDocument(it.name, Uri.fromFile(it), it.length(), ModelSource.INTERNAL)
-                }.orEmpty()
-            }
+            runCatching {
+                Triple(
+                    "fallback",
+                    listPhysicalModels(fallbackModelsDir, ModelSource.FALLBACK),
+                    listPhysicalModels(fallbackModelsDir, ModelSource.FALLBACK, setOf(JSON_EXTENSION)),
+                )
+            }.onSuccess { roots += it }
+                .onFailure { Log.w(TAG, "default layer directory is unavailable", it) }
+            roots += Triple(
+                "internal",
+                listPhysicalModels(modelsDir, ModelSource.INTERNAL),
+                listPhysicalModels(modelsDir, ModelSource.INTERNAL, setOf(JSON_EXTENSION)),
+            )
             val expected = expectedModelSha256.trim().lowercase()
+            val storageScope = treeUri?.toString().orEmpty()
             val output = mutableListOf<LayerArtifact>()
             val diagnostics = mutableListOf<LayerArtifactDiagnostic>()
-            for (manifest in manifests) {
-                val classification = classifyLayerArtifact(
-                    manifestName = manifest.name,
-                    raw = readDocument(manifest.uri),
-                    expectedModelSha256 = expected,
-                    probeArtifact = { descriptor ->
-                        val probed = modelDocuments.firstOrNull {
-                            it.name.equals(descriptor.artifactName, ignoreCase = true)
-                        } ?: return@classifyLayerArtifact null
-                        LayerArtifactProbe(
-                            sizeBytes = probed.sizeBytes,
-                            digestMatches = !verifyArtifactDigest ||
-                                computeSha256(probed.uri).equals(
-                                    descriptor.artifactSha256, ignoreCase = true,
-                                ),
-                        )
-                    },
+            if (roots.none { it.first == "saf" } &&
+                roots.none { it.first == "fallback" && (it.second.isNotEmpty() || it.third.isNotEmpty()) } &&
+                roots.none { it.third.isNotEmpty() }
+            ) {
+                diagnostics += LayerArtifactDiagnostic(
+                    manifestName = "default-storage",
+                    errorCode = LayerArtifactDiagnostic.FALLBACK_UNAVAILABLE,
+                    detail = "请在设置中授权 Download/QLH/models 子目录",
                 )
-                diagnostics += classification.diagnostic
-                val descriptor = classification.descriptor
-                if (!classification.usable || descriptor == null) {
-                    Log.w(
-                        TAG,
-                        "layer artifact unusable: manifest=${manifest.name} " +
-                            "code=${classification.diagnostic.errorCode} " +
-                            "detail=${classification.diagnostic.detail}",
-                    )
-                    continue
-                }
-                val document = modelDocuments.firstOrNull {
-                    it.name.equals(descriptor.artifactName, ignoreCase = true)
-                } ?: continue
-                val artifact = LayerArtifact(
-                    document = document,
-                    manifest = manifest,
-                    startLayer = descriptor.startLayer,
-                    endLayerExclusive = descriptor.endLayerExclusive,
-                    artifactSha256 = descriptor.artifactSha256,
-                    sourceModelSha256 = descriptor.sourceModelSha256,
-                    sourceModelId = descriptor.sourceModelId,
-                    hiddenSize = descriptor.hiddenSize,
-                    tokenizerSha256 = descriptor.tokenizerSha256,
-                    architecture = descriptor.architecture,
-                    // ★ 2026-10-05（DIST-3）：段类型透传（`head`/`middle`/`tail`）。
-                    mode = descriptor.mode,
-                )
-                output += artifact
             }
+            for ((_, modelDocuments, manifests) in roots) {
+                for (manifest in manifests) {
+                    var selectedDocument: ModelDocument? = null
+                    val raw = readDocument(manifest.uri)
+                    val preflightDescriptor = raw?.let {
+                        LayerArtifactManifestParser.parse(it, manifest.name).getOrNull()
+                    }
+                    val paired = preflightDescriptor?.takeIf {
+                        expected.isEmpty() || it.sourceModelSha256 == expected ||
+                            it.artifactSha256 == expected
+                    }?.let { parsed ->
+                        pairLayerArtifactVerified(
+                            manifestParentId = manifest.parentId,
+                            artifactName = parsed.artifactName,
+                            candidates = modelDocuments,
+                            parentId = { it.parentId },
+                            name = { it.name },
+                            verifyArtifactDigest = verifyArtifactDigest,
+                            verify = { candidate ->
+                                try {
+                                    verifiedSha256(candidate.uri, storageScope) { reused ->
+                                        if (reused) digestReused++ else digestStreamed++
+                                    }.equals(
+                                        parsed.artifactSha256, ignoreCase = true,
+                                    )
+                                } catch (cancelled: CancellationException) {
+                                    throw cancelled
+                                } catch (_: Exception) {
+                                    false
+                                }
+                            },
+                        )
+                    }
+                    val classification = classifyLayerArtifact(
+                        manifestName = manifest.name,
+                        raw = raw,
+                        expectedModelSha256 = expected,
+                        probeArtifact = {
+                            val (probed, digestMatches) = paired
+                                ?: return@classifyLayerArtifact null
+                            selectedDocument = probed
+                            LayerArtifactProbe(
+                                sizeBytes = probed.sizeBytes,
+                                digestMatches = digestMatches,
+                            )
+                        },
+                    )
+                    diagnostics += classification.diagnostic
+                    val descriptor = classification.descriptor
+                    if (!classification.usable || descriptor == null) {
+                        Log.w(
+                            TAG,
+                            "layer artifact unusable: manifest=${manifest.name} " +
+                                "code=${classification.diagnostic.errorCode} " +
+                                "detail=${classification.diagnostic.detail}",
+                        )
+                        continue
+                    }
+                    val document = selectedDocument ?: continue
+                    val artifact = LayerArtifact(
+                        document = document,
+                        manifest = manifest,
+                        startLayer = descriptor.startLayer,
+                        endLayerExclusive = descriptor.endLayerExclusive,
+                        artifactSha256 = descriptor.artifactSha256,
+                        sourceModelSha256 = descriptor.sourceModelSha256,
+                        sourceModelId = descriptor.sourceModelId,
+                        hiddenSize = descriptor.hiddenSize,
+                        tokenizerSha256 = descriptor.tokenizerSha256,
+                        architecture = descriptor.architecture,
+                        // ★ 2026-10-05（DIST-3）：段类型透传（`head`/`middle`/`tail`）。
+                        mode = descriptor.mode,
+                    )
+                    output += artifact
+                }
+            }
+            val distinctArtifacts = output.distinctBy {
+                listOf(
+                    it.sourceModelSha256.lowercase(), it.sourceModelId,
+                    it.startLayer, it.endLayerExclusive, it.artifactSha256.lowercase(),
+                    it.document.name, it.mode, it.architecture, it.hiddenSize,
+                    it.tokenizerSha256,
+                )
+            }
+            distinctArtifacts.groupBy { it.startLayer to it.endLayerExclusive }
+                .values.filter { it.size > 1 }
+                .forEach { alternatives ->
+                    val first = alternatives.first()
+                    diagnostics += LayerArtifactDiagnostic(
+                        manifestName = first.manifest.name,
+                        errorCode = LayerArtifactDiagnostic.ARTIFACT_AMBIGUOUS,
+                        detail = "同一区间存在多个不同工件，需指定工件摘要或移走冲突工件",
+                        startLayer = first.startLayer,
+                        endLayerExclusive = first.endLayerExclusive,
+                        artifactPresent = true,
+                    )
+                }
             val inventory = LayerArtifactInventory(
-                artifacts = output.distinctBy {
-                    "${it.startLayer}:${it.endLayerExclusive}:${it.document.uri}"
-                },
+                artifacts = distinctArtifacts,
                 diagnostics = diagnostics,
-                root = if (usingTree) "saf" else "internal",
-                manifestCount = manifests.size,
-                artifactFileCount = modelDocuments.size,
+                root = roots.filter { it.second.isNotEmpty() || it.third.isNotEmpty() }
+                    .joinToString("+") { it.first }.ifBlank { "internal" },
+                manifestCount = roots.sumOf { it.third.size },
+                artifactFileCount = roots.sumOf { it.second.size },
             )
-            lastLayerArtifactInventory = inventory
+            lastLayerArtifactInventory = if (verifyArtifactDigest) inventory else null
             for (diagnostic in diagnostics) {
                 Log.i(
                     TAG,
@@ -423,16 +555,56 @@ class ModelManager(private val context: Context) {
             }
             Log.i(
                 TAG,
-                "layer artifact scan: root=${inventory.root} " +
+                "layer artifact scan: verified=$verifyArtifactDigest " +
+                    "elapsed_ms=${android.os.SystemClock.elapsedRealtime() - scanStartedAtMs} " +
+                    "digest_reused=$digestReused digest_streamed=$digestStreamed " +
+                    "root=${inventory.root} " +
                     "manifests=${inventory.manifestCount} files=${inventory.artifactFileCount} " +
                     "usable=${inventory.artifacts.size} failures=${inventory.failureCounts()}",
             )
             Result.success(inventory)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (error: Exception) {
             Log.e(TAG, "layer artifact scan failed", error)
             Result.failure(error)
         }
     }
+
+    private suspend fun verifiedSha256(
+        uri: Uri,
+        storageScope: String,
+        onLookup: (Boolean) -> Unit = {},
+    ): String = verifiedModelDigests.digest(
+        "$storageScope|$uri", { fileFingerprint(uri) }, onLookup,
+    ) {
+        computeSha256(uri)
+    }
+
+    private fun fileFingerprint(uri: Uri): ModelFileFingerprint? = runCatching {
+        val stat = if (uri.scheme == "file") {
+            val file = File(uri.path.orEmpty())
+            if (file.isFile && file.canRead()) Os.stat(file.canonicalPath) else null
+        } else if (uri.scheme == "content" &&
+            uri.authority == "com.android.externalstorage.documents"
+        ) {
+            context.contentResolver.openFileDescriptor(uri, "r")?.use { descriptor ->
+                Os.fstat(descriptor.fileDescriptor)
+            }
+        } else null
+        stat?.takeIf {
+            OsConstants.S_ISREG(it.st_mode) && it.st_ino > 0L &&
+                it.st_size >= 0L && it.st_ctime > 0L
+        }?.let { valid ->
+            ModelFileFingerprint(
+                device = valid.st_dev,
+                inode = valid.st_ino,
+                size = valid.st_size,
+                modifiedSeconds = valid.st_mtime,
+                changedSeconds = valid.st_ctime,
+            )
+        }
+    }.getOrNull()
 
     private suspend fun openModelHandle(uri: Uri, preferFd: Boolean): Result<ModelOpenHandle> {
         if (uri.scheme == "content") {
@@ -451,7 +623,9 @@ class ModelManager(private val context: Context) {
                 loadPath = file.absolutePath,
                 displayName = file.name,
                 sourceUri = Uri.fromFile(file),
-                mode = STORAGE_MODE_INTERNAL_TEST,
+                mode = if (physicalModelSource(file) == ModelSource.FALLBACK) {
+                    STORAGE_MODE_FALLBACK_FILE
+                } else STORAGE_MODE_INTERNAL_TEST,
                 pfd = null,
             )
         )
@@ -639,7 +813,8 @@ class ModelManager(private val context: Context) {
                     name = name.ifBlank { "unknown.gguf" },
                     uri = documentUri,
                     sizeBytes = sizeBytes,
-                    source = ModelSource.SAF
+                    source = ModelSource.SAF,
+                    parentId = parentDocumentId,
                 )
             }
         } ?: throw IOException("无法读取模型目录，请重新授权")
@@ -1003,7 +1178,7 @@ class ModelManager(private val context: Context) {
         ?: throw IOException("模型已校验，但无法将临时文件重命名为 $finalName")
     }
 
-    private fun computeSha256(uri: Uri): String {
+    private suspend fun computeSha256(uri: Uri): String {
         val digest = MessageDigest.getInstance("SHA-256")
         val input = if (uri.scheme == "file") {
             File(uri.path.orEmpty()).inputStream()
@@ -1013,6 +1188,7 @@ class ModelManager(private val context: Context) {
         input?.use { stream ->
             val buffer = ByteArray(1024 * 1024)
             while (true) {
+                currentCoroutineContext().ensureActive()
                 val count = stream.read(buffer)
                 if (count < 0) break
                 digest.update(buffer, 0, count)
@@ -1213,6 +1389,7 @@ class ModelManager(private val context: Context) {
 
     enum class ModelSource {
         SAF,
+        FALLBACK,
         INTERNAL
     }
 
@@ -1220,7 +1397,8 @@ class ModelManager(private val context: Context) {
         val name: String,
         val uri: Uri,
         val sizeBytes: Long,
-        val source: ModelSource
+        val source: ModelSource,
+        val parentId: String = "",
     )
 
     data class LayerArtifact(
@@ -1237,7 +1415,7 @@ class ModelManager(private val context: Context) {
         /**
          * ★ 2026-10-05（DIST-3 实测缺口）：工件段类型（`head`/`middle`/`tail`），
          * 来自 manifest 的 `mode`。随能力快照广告给主仓，避免「中间段被分到末段」
-         * —— 中间段工件没有 `lm_head`/`final_norm`，接末段必然执行失败。
+         * —— 中间段的职责与末段位次不符，接末段会执行失败。
          * Missing or invalid modes make the manifest unusable.
          */
         val mode: String,

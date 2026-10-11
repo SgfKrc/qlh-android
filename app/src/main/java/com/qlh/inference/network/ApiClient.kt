@@ -347,11 +347,16 @@ data class ServerModelsResponse(
 )
 
 /** Runtime status deliberately excludes server filesystem paths. */
+data class CurrentModelDescriptor(
+    @SerializedName("model_sha256") val modelSha256: String = "",
+)
+
 data class CurrentModelStatus(
     val loaded: Boolean = false,
     @SerializedName("pipeline_prepared") val pipelinePrepared: Boolean = false,
     @SerializedName("model_id") val modelId: String? = null,
     @SerializedName("model_name") val modelName: String = "",
+    val descriptor: CurrentModelDescriptor? = null,
     val engine: String = "",
     @SerializedName("quant_type") val quantType: String? = null,
 )
@@ -629,7 +634,12 @@ class ApiClient(
                 original
             }
             val response = chain.proceed(request)
-            if (response.code == 401 && !anonymous) authStore?.clear()
+            if (response.code == 401 && !anonymous && !token.isNullOrBlank() &&
+                request.header("Authorization") == "Bearer $token" &&
+                authStore?.read()?.accessToken == token
+            ) {
+                authStore?.clear()
+            }
             response
         }
         .addInterceptor(HttpLoggingInterceptor().apply {

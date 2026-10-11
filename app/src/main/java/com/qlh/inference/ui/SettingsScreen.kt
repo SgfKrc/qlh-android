@@ -1986,7 +1986,9 @@ private fun ModelManagementPanel(
         Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
             StatusRow(
                 label = "存储位置",
-                value = if (modelTreeUri.isBlank()) "未选择" else "SAF 外部目录"
+                value = if (modelTreeUri.isBlank()) {
+                    "默认 Download/QLH/models（无授权时可能不可读）"
+                } else "SAF 外部目录（授权失效需重新选择）"
             )
             StatusRow(
                 label = "当前模型",
@@ -2073,7 +2075,7 @@ private fun ModelManagementPanel(
         }
 
         Text(
-            text = "建议选择直接包含 .gguf 的目录；也支持向下扫描 2 层子目录。模型保存在用户授权的外部目录中，卸载 APK 默认保留。",
+            text = "优先扫描已授权 SAF 目录，同时尝试 Download/QLH/models 和内部目录；系统限制直接读取共享文件时，请点击「选择目录」授权 models 子目录。卸载 APK 默认保留外部模型。",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
@@ -2162,7 +2164,11 @@ private fun ModelRow(
                 overflow = TextOverflow.Ellipsis
             )
             Text(
-                text = "${formatBytes(model.sizeBytes)} · ${if (model.source == ModelManager.ModelSource.SAF) "SAF" else "内部测试"}",
+                text = "${formatBytes(model.sizeBytes)} · ${when (model.source) {
+                    ModelManager.ModelSource.SAF -> "SAF"
+                    ModelManager.ModelSource.FALLBACK -> "Download 兜底"
+                    ModelManager.ModelSource.INTERNAL -> "内部测试"
+                }}",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -2173,6 +2179,7 @@ private fun ModelRow(
 private fun storageModeLabel(mode: String): String = when (mode) {
     ModelManager.STORAGE_MODE_SAF_FD -> "SAF fd"
     ModelManager.STORAGE_MODE_SAF_CACHE -> "SAF 缓存副本"
+    ModelManager.STORAGE_MODE_FALLBACK_FILE -> "Download 兜底文件"
     ModelManager.STORAGE_MODE_INTERNAL_TEST -> "内部测试目录"
     else -> mode.ifBlank { "未设置" }
 }

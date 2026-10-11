@@ -5,6 +5,7 @@ import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
 import java.security.KeyStore
+import javax.crypto.AEADBadTagException
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
@@ -20,10 +21,20 @@ interface ClusterCredentialStorage {
 /**
  * Stores the cluster secret encrypted with a non-exportable AndroidKeyStore key.
  *
- * SharedPreferences contains only the AES-GCM ciphertext and IV. Key invalidation,
- * malformed storage and tampering all fail closed and remove the unusable record.
+ * SharedPreferences contains only the AES-GCM ciphertext and IV. An unavailable
+ * Keystore key fails closed without destroying the record, so a later read can retry.
  */
-class ClusterCredentialStore(context: Context) : ClusterCredentialStorage {
+class ClusterCredentialStore internal constructor(
+    context: Context,
+    private val storeName: String,
+    private val keyAlias: String,
+    private val readKey: (String) -> SecretKey?,
+) : ClusterCredentialStorage {
+    constructor(context: Context) : this(context, STORE_NAME, KEY_ALIAS, ::existingKey)
+
+    internal constructor(context: Context, storeName: String, keyAlias: String) :
+        this(context, storeName, keyAlias, ::existingKey)
+
     companion object {
         internal const val STORE_NAME = "qlh_cluster_credential"
         internal const val KEY_CIPHERTEXT = "cluster_secret_ciphertext"
@@ -33,39 +44,58 @@ class ClusterCredentialStore(context: Context) : ClusterCredentialStorage {
         private const val KEYSTORE = "AndroidKeyStore"
         private const val TRANSFORMATION = "AES/GCM/NoPadding"
         private const val GCM_TAG_BITS = 128
+        private const val GCM_IV_BYTES = 12
         private val AAD = "qlh-cluster-credential-v1".toByteArray(Charsets.UTF_8)
         private val STORE_LOCK = Any()
+
+        private fun existingKey(alias: String): SecretKey? =
+            (KeyStore.getInstance(KEYSTORE).apply { load(null) }.getKey(alias, null) as? SecretKey)
     }
 
     private val preferences = context.applicationContext.getSharedPreferences(
-        STORE_NAME,
+        storeName,
         Context.MODE_PRIVATE,
     )
 
     override fun read(): String? = synchronized(STORE_LOCK) {
-        val ciphertext = preferences.getString(KEY_CIPHERTEXT, null)
-        val iv = preferences.getString(KEY_IV, null)
+        val (ciphertext, iv) = try {
+            preferences.getString(KEY_CIPHERTEXT, null) to preferences.getString(KEY_IV, null)
+        } catch (_: ClassCastException) {
+            discardRecord()
+            return@synchronized null
+        } catch (_: Exception) {
+            return@synchronized null
+        }
         if (ciphertext == null && iv == null) return@synchronized null
         if (ciphertext == null || iv == null) {
-            clear()
+            discardRecord()
+            return@synchronized null
+        }
+        val ivBytes = decodeStored(iv)
+        val encrypted = decodeStored(ciphertext)
+        if (ivBytes?.size != GCM_IV_BYTES || encrypted == null || encrypted.size < GCM_TAG_BITS / 8) {
+            discardRecord()
             return@synchronized null
         }
         try {
+            val key = readKey(keyAlias) ?: return@synchronized null
             val cipher = Cipher.getInstance(TRANSFORMATION)
             cipher.init(
                 Cipher.DECRYPT_MODE,
-                getOrCreateKey(),
-                GCMParameterSpec(GCM_TAG_BITS, decode(iv)),
+                key,
+                GCMParameterSpec(GCM_TAG_BITS, ivBytes),
             )
             cipher.updateAAD(AAD)
-            String(cipher.doFinal(decode(ciphertext)), Charsets.UTF_8)
+            String(cipher.doFinal(encrypted), Charsets.UTF_8)
                 .takeIf { it.isNotBlank() }
                 ?: run {
-                    clear()
+                    discardRecord()
                     null
                 }
+        } catch (_: AEADBadTagException) {
+            discardRecord()
+            null
         } catch (_: Exception) {
-            clear()
             null
         }
     }
@@ -86,22 +116,26 @@ class ClusterCredentialStore(context: Context) : ClusterCredentialStorage {
 
     override fun clear() {
         synchronized(STORE_LOCK) {
-            preferences.edit().remove(KEY_CIPHERTEXT).remove(KEY_IV).commit()
+            discardRecord()
             runCatching {
-                KeyStore.getInstance(KEYSTORE).apply { load(null) }.deleteEntry(KEY_ALIAS)
+                KeyStore.getInstance(KEYSTORE).apply { load(null) }.deleteEntry(keyAlias)
             }
         }
     }
 
+    private fun discardRecord() {
+        preferences.edit().remove(KEY_CIPHERTEXT).remove(KEY_IV).commit()
+    }
+
     private fun getOrCreateKey(): SecretKey {
         val keyStore = KeyStore.getInstance(KEYSTORE).apply { load(null) }
-        val existing = keyStore.getKey(KEY_ALIAS, null) as? SecretKey
+        val existing = keyStore.getKey(keyAlias, null) as? SecretKey
         if (existing != null) return existing
 
         val keyGenerator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, KEYSTORE)
         keyGenerator.init(
             KeyGenParameterSpec.Builder(
-                KEY_ALIAS,
+                keyAlias,
                 KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT,
             )
                 .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
@@ -115,4 +149,13 @@ class ClusterCredentialStore(context: Context) : ClusterCredentialStorage {
     private fun encode(value: ByteArray): String = Base64.encodeToString(value, Base64.NO_WRAP)
 
     private fun decode(value: String): ByteArray = Base64.decode(value, Base64.NO_WRAP)
+
+    private fun decodeStored(value: String): ByteArray? {
+        val bytes = try {
+            decode(value)
+        } catch (_: IllegalArgumentException) {
+            return null
+        }
+        return bytes.takeIf { encode(it) == value }
+    }
 }

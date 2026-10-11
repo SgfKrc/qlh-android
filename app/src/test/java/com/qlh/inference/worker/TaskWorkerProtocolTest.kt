@@ -657,6 +657,18 @@ class TaskWorkerProtocolTest {
         TaskWorkerProtocol.validate(helloWith(listOf(
             artifactDiagnostic(errorCode = "artifact_digest_mismatch", manifest = "x.manifest.json"),
         )))
+        TaskWorkerProtocol.validate(helloWith(listOf(
+            artifactDiagnostic(
+                errorCode = "fallback_storage_unavailable",
+                manifest = "default-storage",
+                architecture = "",
+                mode = "",
+                layerRange = null,
+            ),
+        )))
+        TaskWorkerProtocol.validate(helloWith(listOf(
+            artifactDiagnostic(errorCode = "artifact_ambiguous"),
+        )))
     }
 
     private fun artifactDiagnostic(
