@@ -7,6 +7,7 @@ import androidx.activity.compose.setContent
 import androidx.compose.ui.test.junit4.createEmptyComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performTextInput
 import com.qlh.inference.ClusterOverviewNode
 import com.qlh.inference.ClusterOverviewSnapshot
@@ -77,9 +78,9 @@ class SettingsScreenTest {
         )
 
         composeRule.onNodeWithTag("settings_screen").assertIsDisplayed()
-        composeRule.onNodeWithTag("settings_theme_system").assertIsDisplayed().assertIsEnabled()
-        composeRule.onNodeWithTag("settings_theme_light").assertIsDisplayed().assertIsEnabled()
-        composeRule.onNodeWithTag("settings_theme_dark").assertIsDisplayed().assertIsEnabled()
+        composeRule.onNodeWithTag("settings_theme_system").performScrollTo().assertIsDisplayed().assertIsEnabled()
+        composeRule.onNodeWithTag("settings_theme_light").performScrollTo().assertIsDisplayed().assertIsEnabled()
+        composeRule.onNodeWithTag("settings_theme_dark").performScrollTo().assertIsDisplayed().assertIsEnabled()
 
         composeRule.onNodeWithTag("settings_theme_light").performClick()
         composeRule.onNodeWithTag("settings_theme_dark").performClick()
@@ -96,9 +97,9 @@ class SettingsScreenTest {
         setSettingsContent(themeMode = "dark", darkTheme = true)
 
         composeRule.onNodeWithTag("settings_screen").assertIsDisplayed()
-        composeRule.onNodeWithTag("settings_theme_dark").assertIsDisplayed().assertIsEnabled()
-        composeRule.onNodeWithTag("settings_theme_light").assertIsDisplayed().assertIsEnabled()
-        composeRule.onNodeWithTag("settings_theme_system").assertIsDisplayed().assertIsEnabled()
+        composeRule.onNodeWithTag("settings_theme_dark").performScrollTo().assertIsDisplayed().assertIsEnabled()
+        composeRule.onNodeWithTag("settings_theme_light").performScrollTo().assertIsDisplayed().assertIsEnabled()
+        composeRule.onNodeWithTag("settings_theme_system").performScrollTo().assertIsDisplayed().assertIsEnabled()
     }
 
     @Test
@@ -120,7 +121,7 @@ class SettingsScreenTest {
             onDownloadRemoteModel = { selected = it },
         )
 
-        composeRule.onNodeWithTag("remote_model_panel").assertIsDisplayed()
+        composeRule.onNodeWithTag("remote_model_panel").performScrollTo().assertIsDisplayed()
         composeRule.onNodeWithTag("remote_model_download_tiny.gguf").assertIsEnabled().performClick()
         composeRule.runOnIdle { assertEquals(model, selected) }
     }
@@ -134,7 +135,7 @@ class SettingsScreenTest {
         )
 
         composeRule.onNodeWithTag("settings_device_details").assertIsDisplayed()
-        composeRule.onNodeWithTag("settings_show_thinking").assertIsDisplayed().performClick()
+        composeRule.onNodeWithTag("settings_show_thinking").performScrollTo().assertIsDisplayed().performClick()
         composeRule.runOnIdle { assertTrue(showThinking) }
     }
 
@@ -167,8 +168,8 @@ class SettingsScreenTest {
             onRefreshClusterOverview = { refreshCalls += 1 },
         )
 
-        composeRule.onNodeWithTag("cluster_overview_details").assertIsDisplayed().performClick()
-        composeRule.onNodeWithTag("cluster_overview_node_master").assertIsDisplayed()
+        composeRule.onNodeWithTag("cluster_overview_details").performScrollTo().assertIsDisplayed().performClick()
+        composeRule.onNodeWithTag("cluster_overview_node_master").performScrollTo().assertIsDisplayed()
         composeRule.onNodeWithTag("cluster_overview_refresh").assertIsEnabled().performClick()
         composeRule.runOnIdle { assertTrue(refreshCalls >= 2) }
     }
@@ -201,8 +202,8 @@ class SettingsScreenTest {
             onRefreshModelFleet = { refreshCalls += 1 },
         )
 
-        composeRule.onNodeWithTag("model_fleet_details").assertIsDisplayed().performClick()
-        composeRule.onNodeWithTag("model_fleet_entry_qwen-1_8b").assertIsDisplayed()
+        composeRule.onNodeWithTag("model_fleet_details").performScrollTo().assertIsDisplayed().performClick()
+        composeRule.onNodeWithTag("model_fleet_entry_qwen-1_8b").performScrollTo().assertIsDisplayed()
         composeRule.onNodeWithTag("model_fleet_refresh").assertIsEnabled().performClick()
         composeRule.runOnIdle { assertTrue(refreshCalls >= 2) }
     }
@@ -258,9 +259,9 @@ class SettingsScreenTest {
             onRefreshAudit = { refreshCalls += 1 },
         )
 
-        composeRule.onNodeWithTag("audit_overview_details").assertIsDisplayed().performClick()
-        composeRule.onNodeWithTag("audit_workflow_wf-1").assertIsDisplayed()
-        composeRule.onNodeWithTag("audit_review_review-1").assertIsDisplayed()
+        composeRule.onNodeWithTag("audit_overview_details").performScrollTo().assertIsDisplayed().performClick()
+        composeRule.onNodeWithTag("audit_workflow_wf-1").performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithTag("audit_review_review-1").performScrollTo().assertIsDisplayed()
         composeRule.onNodeWithTag("audit_overview_refresh").assertIsEnabled().performClick()
         composeRule.runOnIdle { assertTrue(refreshCalls >= 2) }
     }
@@ -288,8 +289,8 @@ class SettingsScreenTest {
             onRefreshAuthControl = { refreshCalls += 1 },
         )
 
-        composeRule.onNodeWithTag("auth_control_details").assertIsDisplayed().performClick()
-        composeRule.onNodeWithTag("auth_account_summary").assertIsDisplayed()
+        composeRule.onNodeWithTag("auth_control_details").performScrollTo().assertIsDisplayed().performClick()
+        composeRule.onNodeWithTag("auth_account_summary").performScrollTo().assertIsDisplayed()
         composeRule.onNodeWithTag("auth_logout").assertIsEnabled().performClick()
         composeRule.onNodeWithTag("auth_refresh").assertIsEnabled().performClick()
         composeRule.runOnIdle {
@@ -309,8 +310,8 @@ class SettingsScreenTest {
             onLogin = { username, code, recovery -> login = Triple(username, code, recovery) },
         )
         composeRule.onNodeWithTag("auth_control_details").performClick()
-        composeRule.onNodeWithTag("auth_username").assertIsDisplayed().performTextInput("alice")
-        composeRule.onNodeWithTag("auth_code").assertIsDisplayed().performTextInput("123456")
+        composeRule.onNodeWithTag("auth_username").performScrollTo().assertIsDisplayed().performTextInput("alice")
+        composeRule.onNodeWithTag("auth_code").performScrollTo().assertIsDisplayed().performTextInput("123456")
         composeRule.onNodeWithTag("auth_login").assertIsEnabled().performClick()
         composeRule.runOnIdle { assertEquals(Triple("alice", "123456", null), login) }
     }
