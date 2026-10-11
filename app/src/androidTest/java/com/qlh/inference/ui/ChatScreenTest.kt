@@ -2,16 +2,20 @@ package com.qlh.inference.ui
 
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.compose.ui.semantics.SemanticsProperties
+import androidx.compose.ui.test.SemanticsMatcher
+import androidx.compose.ui.test.assert
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
-import androidx.compose.ui.test.assertTextEquals
 import androidx.compose.ui.test.junit4.createEmptyComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performTextInput
+import androidx.compose.ui.text.AnnotatedString
 import androidx.test.core.app.ActivityScenario
+import com.qlh.inference.data.SettingsDataStore
 import com.qlh.inference.ui.theme.QlhTheme
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -57,7 +61,9 @@ class ChatScreenTest {
         composeRule.runOnIdle {
             assertEquals(listOf("你好 QLH"), sentMessages)
         }
-        composeRule.onNodeWithTag("chat_input").assertTextEquals("")
+        composeRule.onNodeWithTag("chat_input").assert(
+            SemanticsMatcher.expectValue(SemanticsProperties.EditableText, AnnotatedString(""))
+        )
     }
 
     @Test
@@ -89,11 +95,15 @@ class ChatScreenTest {
     }
 
     @Test
-    fun imagePickerIsEnabledOnlyInThinMode() {
-        setChatContent(inferenceMode = "thin")
+    fun imagePickerIsDisabledOnlyInDistributedMode() {
+        // 合法模式只有 local / distributed / fallback（SettingsDataStore.MODE_*，见
+        // SettingsDataStore.kt:125-127），实现判据是 inferenceMode != MODE_DISTRIBUTED
+        // （ChatScreen.kt:118 canAttachImage）。原测试用的是 "thin"/"full" —— 不是合法模式值，
+        // 两者都 != distributed 故都是 enabled，第二条断言恒失败（用首次真跑暴露）。
+        setChatContent(inferenceMode = "local")
         composeRule.onNodeWithTag("chat_image_pick").assertIsEnabled()
 
-        setChatContent(inferenceMode = "full")
+        setChatContent(inferenceMode = SettingsDataStore.MODE_DISTRIBUTED)
         composeRule.onNodeWithTag("chat_image_pick").assertIsNotEnabled()
     }
 
