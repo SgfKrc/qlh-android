@@ -1246,8 +1246,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val coordinatorModelId = coordinatorModel?.descriptor?.modelId
             ?.takeIf { it.isNotBlank() }
             ?: coordinatorModel?.modelId.orEmpty()
-        val coordinatorSha256 = coordinatorModel?.descriptor?.modelSha256
-            ?.trim()?.lowercase().orEmpty()
+        // ★ 2026-10-11（Y700 反复重选无效排查）：跨段校验必须用主节点报告的**源模型**摘要。
+        //   主节点现在同时给出 `model_sha256`（**该段工件**的 sha，每段不同）与
+        //   `source_model_sha256`（源模型 sha，三段共享）。此前只用前者 ⇒ 非主节点段
+        //   （如 tail）两边都不等 ⇒ `source_digest_mismatch` ⇒ ranges 不上报。
+        //   这里优先取源摘要，缺失时回退工件摘要（兼容旧服务端）。
+        val coordinatorSha256 = coordinatorModel?.descriptor?.sourceModelSha256
+            ?.trim()?.lowercase()?.takeIf { it.isNotBlank() }
+            ?: coordinatorModel?.descriptor?.modelSha256
+                ?.trim()?.lowercase().orEmpty()
         val hasCoordinatorIdentity = coordinatorModelId.isNotBlank() &&
             coordinatorSha256.matches(Regex("[a-f0-9]{64}"))
         val layerArtifacts = if (hasCoordinatorIdentity) {
@@ -1301,7 +1308,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 modelMessage = if (hasAmbiguousLayers) {
                     "同一层区间存在多个不同工件；请先移走冲突工件或仅授权目标工件目录，再重新扫描"
                 } else {
-                    "当前主节点模型工件未匹配；请在设置中授权 Download/QLH/models 子目录，确认源模型摘要、层区间和 manifest 后重试"
+                    "当前主节点模型工件未匹配：请确认已授权 Download/QLH/models 子目录，并确认所选工件的源模型摘要（source_model_sha256）与主节点报告的源摘要一致、层区间与 manifest 匹配，然后重试"
                 },
             )
         }

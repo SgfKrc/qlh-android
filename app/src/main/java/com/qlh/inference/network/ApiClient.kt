@@ -349,6 +349,11 @@ data class ServerModelsResponse(
 /** Runtime status deliberately excludes server filesystem paths. */
 data class CurrentModelDescriptor(
     @SerializedName("model_sha256") val modelSha256: String = "",
+    // ★ 2026-10-11（Y700 反复重选无效排查）：主节点报告的**源模型**摘要（三段共享）。
+    //   裁层工件的跨段校验必须用它 —— 每段的 `artifact_sha256` 天然不同（head/tail 各异），
+    //   只有 `source_model_sha256` 在三段间相同；服务端此前把它过滤掉了
+    //   （见 src/pipeline_model_descriptor.py 的 public_pipeline_descriptor 白名单）。
+    @SerializedName("source_model_sha256") val sourceModelSha256: String = "",
     // ★ 2026-10-11（三机实测 / #92）：`descriptor.model_id` 是**模型名**，与工件的
     //   `source_model_id` 同口径；而顶层 `model_id` 是模型**注册表 id**。身份判定必须优先用
     //   前者，否则注册 id 与工件命名不一致时会把工件整片过滤掉（真机表现为 ranges=[]）。
