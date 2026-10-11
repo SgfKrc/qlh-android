@@ -1,23 +1,50 @@
 package com.qlh.inference.ui
 
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.assertTextEquals
-import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.junit4.createEmptyComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performTextInput
+import androidx.test.core.app.ActivityScenario
 import com.qlh.inference.ui.theme.QlhTheme
+import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
+import org.junit.Before
 import org.junit.Rule
 import org.junit.Test
 
 class ChatScreenTest {
+    /**
+     * ★ 2026-10-11：改用 `createEmptyComposeRule()` + 自建宿主，**不**用 `createComposeRule()`。
+     * 原因：后者经 `ActivityScenarioRule`，其 `after()` 调 `ActivityScenario.close()`，而 close
+     * 会经 `InstrumentationActivityInvoker` 启动 `EmptyActivity` —— 本设备上恒抛
+     * `ActivityNotFoundException` 并**替换掉测试体的断言**（详见
+     * `docs/彻查后修复与重构排票计划-2026-10-09.md` 票12 的设备门小节）。
+     */
     @get:Rule
-    val composeRule = createComposeRule()
+    val composeRule = createEmptyComposeRule()
+
+    private lateinit var scenario: ActivityScenario<ComponentActivity>
+
+    @Before
+    fun launchHost() {
+        scenario = ActivityScenario.launch(ComponentActivity::class.java)
+    }
+
+    @After
+    fun finishHost() {
+        // 不调 close()：那正是触发 invoker activity 的那一步；直接 finish() 达到同样清理效果。
+        if (::scenario.isInitialized) {
+            runCatching { scenario.onActivity { it.finish() } }
+        }
+    }
 
     @Test
     fun inputTrimsAndSendsMessageThenClearsDraft() {
@@ -78,19 +105,21 @@ class ChatScreenTest {
         onClearError: () -> Unit = {},
         inferenceMode: String = "thin",
     ) {
-        composeRule.setContent {
-            QlhTheme(darkTheme = false) {
-                ChatScreen(
-                    sessionId = 1L,
-                    sessionTitle = "测试会话",
-                    messages = emptyList(),
-                    isLoading = isLoading,
-                    error = error,
-                    onSendMessage = onSendMessage,
-                    onRetry = onRetry,
-                    onClearError = onClearError,
-                    inferenceMode = inferenceMode,
-                )
+        scenario.onActivity { activity ->
+            activity.setContent {
+                QlhTheme(darkTheme = false) {
+                    ChatScreen(
+                        sessionId = 1L,
+                        sessionTitle = "测试会话",
+                        messages = emptyList(),
+                        isLoading = isLoading,
+                        error = error,
+                        onSendMessage = onSendMessage,
+                        onRetry = onRetry,
+                        onClearError = onClearError,
+                        inferenceMode = inferenceMode,
+                    )
+                }
             }
         }
     }
