@@ -373,10 +373,24 @@ class SocketTaskWorkerTransport(
             return@withContext null
         }
         if (size <= 0 || size > maxFrameBytes) {
+            QlhLogger.w(
+                "TaskWorkerClient",
+                "invalid frame length size=$size max=$maxFrameBytes",
+            )
             throw TaskWorkerProtocolException("invalid task worker frame length", "invalid_frame", "message")
         }
         val bytes = ByteArray(size)
-        input.readFully(bytes)
+        try {
+            input.readFully(bytes)
+        } catch (error: java.io.IOException) {
+            QlhLogger.w(
+                "TaskWorkerClient",
+                "frame body read failed size=$size " +
+                    "${error::class.simpleName}: ${error.message ?: ""}",
+            )
+            throw error
+        }
+        QlhLogger.d("TaskWorkerClient", "frame received size=$size")
         val root = try {
             JsonParser.parseString(String(bytes, StandardCharsets.UTF_8))
         } catch (error: Exception) {
@@ -474,9 +488,25 @@ class SocketTaskWorkerTransport(
                                 ""
                             }),
                     )
-                    return TaskWorkerInboundEvent.Envelope(
-                        TaskWorkerProtocol.decode(gson.toJson(data).toByteArray(StandardCharsets.UTF_8))
-                    )
+                    val decoded = try {
+                        TaskWorkerProtocol.decode(
+                            gson.toJson(data).toByteArray(StandardCharsets.UTF_8)
+                        )
+                    } catch (error: Exception) {
+                        // ★ 2026-10-11（三机验收实测）：帧字节完整到达、`message_type` 已能读出，
+                        //   但尾段 Stage 在本端**完全静默**就重连（主节点只看到
+                        //   `remote worker disconnected`）。decode 是这条路径上唯一还未留痕的
+                        //   一步，先把它暴露出来。
+                        QlhLogger.w(
+                            "TaskWorkerClient",
+                            "TaskWorkerProtocol.decode failed message_type=$innerType " +
+                                "payloadKeys=" +
+                                (data.asJsonObject.get("payload") as? com.google.gson.JsonObject)?.keySet() +
+                                " ${error::class.simpleName}: ${error.message ?: ""}",
+                        )
+                        throw error
+                    }
+                    return TaskWorkerInboundEvent.Envelope(decoded)
                 }
                 "heartbeat_ack" -> return TaskWorkerInboundEvent.HeartbeatAck
                 "stage_chunk" -> {
@@ -827,6 +857,13 @@ class TaskWorkerClient(
                 throw error
             } catch (error: java.io.IOException) {
                 // 传输层已坏 ⇒ 同样交上层重连，不要在这里吞掉。
+                // ★ 2026-10-11：此前该分支**不留任何痕**，真机表现为"帧已收到、随后静默重连"，
+                //   主节点只能看到 `remote worker disconnected`。先把失败类型/消息落盘。
+                QlhLogger.w(
+                    "TaskWorkerClient",
+                    "transport read failed, connection will reconnect " +
+                        "${error::class.simpleName}: ${error.message ?: ""}",
+                )
                 throw error
             } catch (error: Exception) {
                 // 单条消息处理失败**不得**掐死整条连接：记名后继续读下一帧。
@@ -841,7 +878,24 @@ class TaskWorkerClient(
 
     private suspend fun handleOffer(connection: TaskWorkerTransport, envelope: TaskWorkerEnvelope) {
         val payload = envelope.payload
-        val identity = identityFrom(payload)
+        // ★ 2026-10-11（三机验收实测）：尾段 Stage 在设备侧**完全静默**就重连了 —— 帧已能解析出
+        //   `message_type=stage_offer`，但本函数与读循环的任何日志都没出现 ⇒ 失败点落在
+        //   `identityFrom`/lease 解析这些**未留痕**路径。这里先把入口与身份解析暴露出来，
+        //   否则只能靠主节点侧的 `remote worker disconnected` 反推。
+        QlhLogger.d(
+            "TaskWorkerClient",
+            "handleOffer entered payloadKeys=${payload.keys.take(24)}",
+        )
+        val identity = try {
+            identityFrom(payload)
+        } catch (error: Exception) {
+            QlhLogger.w(
+                "TaskWorkerClient",
+                "handleOffer identityFrom failed ${error::class.simpleName}: " +
+                    "${error.message ?: ""}",
+            )
+            throw error
+        }
         // ★ 回程必须**原样回显** offer 里的 `provider_id` —— 它是主节点的 Provider 口径
         //   （`remote_<node_id>`），不是本节点的裸 nodeId。此前一律回裸 nodeId，被主节点
         //   以 `attempt_identity_mismatch` 拒掉，真机表现为 Stage 响应一直等到超时。

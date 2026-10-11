@@ -432,6 +432,17 @@ object TaskWorkerProtocol {
             } else {
                 emptySet()
             } +
+            // ★ 2026-10-11（ROG+Y700+本机三机验收实测）：`stage_offer` 的
+            //   `request_deadline_ms` 同属"**出现才允许**" —— 旧对端与既有 offer 构造器
+            //   都不带它，写进必填集合会被 `requireExact` 判 `field_mismatch`。
+            if (
+                envelope.messageType == STAGE_OFFER &&
+                envelope.payload.containsKey("request_deadline_ms")
+            ) {
+                setOf("request_deadline_ms")
+            } else {
+                emptySet()
+            } +
             // ★ 2026-10-07（DIST-NEXT-1）：取消 ACK 的执行状态同样只在真的出现时放宽
             //   （旧对端不带该字段，写进必填集合会判 `field_mismatch`）。
             if (
@@ -1186,6 +1197,15 @@ object TaskWorkerProtocol {
     private fun payloadFields(type: String): Set<String> = when (type) {
         HELLO -> setOf("node_id", "worker_kind", "min_version", "max_version", "capabilities")
         HELLO_ACK -> setOf("coordinator_node_id", "accepted", "selected_version", "reason_code")
+        // ★ 2026-10-11（ROG+Y700+本机三机验收实测）：主仓 v3 的 `stage_offer` **还带
+        //   `request_deadline_ms`**（请求级 deadline）。此前本端白名单没有它 ⇒
+        //   `requireExact` 判 `payload fields do not match schema` ⇒ 尾段 Stage 在设备侧
+        //   **静默重连**（帧已收到、`message_type` 已解析，但主节点只看到
+        //   `remote worker disconnected`，设备侧无任何执行/拒绝痕迹）。
+        //   ⚠️ 不能写进本**必填**集合：`requireExact` 是**双向精确**匹配，写进来会让
+        //   **不带**该字段的旧对端（含既有 offer 构造器/测试）统统被拒（实测：一写进去
+        //   20+ 个 `*StageParityTest`/`TaskWorkerProtocolTest` 全红）。
+        //   改在 `validate()` 里按"出现才允许"放宽，见那里的 `request_deadline_ms` 分支。
         STAGE_OFFER -> identityFields + setOf("request_id", "stage_type", "provider_id", "lease_expires_at_ms", "root_input", "dependencies", "input_sha256", "model_identity")
         STAGE_ACCEPT -> identityFields + setOf("provider_id", "accepted", "reason_code", "retryable")
         LEASE_RENEW -> identityFields + setOf("lease_expires_at_ms")
