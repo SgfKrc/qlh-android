@@ -1239,7 +1239,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             ?.takeIf { it.isNotBlank() }
             .orEmpty()
         val coordinatorModel = apiClient().getCurrentModel().getOrNull()
-        val coordinatorModelId = coordinatorModel?.modelId.orEmpty()
+        // ★ 2026-10-11（三机实测 / #92）：身份以 `descriptor.model_id`（模型名，与工件的
+        //   `source_model_id` 同口径）为准；顶层 `model_id` 是**注册表 id**，两者不同名时
+        //   用它过滤会把工件整片丢掉（真机表现为扫描 ok 但 ranges=[]）。仅在 descriptor
+        //   缺失该字段时回退顶层 id（兼容旧服务端）。
+        val coordinatorModelId = coordinatorModel?.descriptor?.modelId
+            ?.takeIf { it.isNotBlank() }
+            ?: coordinatorModel?.modelId.orEmpty()
         val coordinatorSha256 = coordinatorModel?.descriptor?.modelSha256
             ?.trim()?.lowercase().orEmpty()
         val hasCoordinatorIdentity = coordinatorModelId.isNotBlank() &&

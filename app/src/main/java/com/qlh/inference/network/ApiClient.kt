@@ -349,6 +349,10 @@ data class ServerModelsResponse(
 /** Runtime status deliberately excludes server filesystem paths. */
 data class CurrentModelDescriptor(
     @SerializedName("model_sha256") val modelSha256: String = "",
+    // ★ 2026-10-11（三机实测 / #92）：`descriptor.model_id` 是**模型名**，与工件的
+    //   `source_model_id` 同口径；而顶层 `model_id` 是模型**注册表 id**。身份判定必须优先用
+    //   前者，否则注册 id 与工件命名不一致时会把工件整片过滤掉（真机表现为 ranges=[]）。
+    @SerializedName("model_id") val modelId: String = "",
 )
 
 data class CurrentModelStatus(
