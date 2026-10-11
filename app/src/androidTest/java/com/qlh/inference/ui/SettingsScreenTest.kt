@@ -175,6 +175,17 @@ class SettingsScreenTest {
         composeRule.runOnIdle { assertTrue(refreshCalls >= 2) }
     }
 
+    // ------------------------------------------------------------------
+    // 票12（UI-CONTRACT-01）的模型舰队**文案契约**回归不在本文件 —— 见
+    // `src/test/java/com/qlh/inference/ui/ModelFleetRuntimeLabelTest.kt`。
+    //
+    // 原因：本类在 Y700（TB321FU / Android 15）上**整类失败** —— SettingsScreen 内容超出
+    // Compose 测试宿主视口，连首屏主题按钮都被判为不可见
+    // （`Assert failed: The component is not displayed!`，13/13，与本次改动无关）。
+    // 本票关心的是文案是否正确/互斥，与节点是否落在视口内无关 ⇒ 改用纯函数 + JVM 单测固定，
+    // 不在此处新增依赖UI可见性的用例，避免为该设备的环境问题再添红灯。
+    // ------------------------------------------------------------------
+
     @Test
     fun auditOverviewIsReadOnlyBoundedAndRefreshable() {
         var refreshCalls = 0

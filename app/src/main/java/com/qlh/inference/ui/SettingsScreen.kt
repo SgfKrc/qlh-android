@@ -91,6 +91,7 @@ import com.qlh.inference.clusterCapacitySummaryText
 import com.qlh.inference.clusterNodeParticipationText
 import com.qlh.inference.DiagnosticsUiState
 import com.qlh.inference.ModelFleetEntry
+import com.qlh.inference.ModelFleetSnapshot
 import com.qlh.inference.ModelFleetStatus
 import com.qlh.inference.ModelFleetUiState
 import com.qlh.inference.ManagementUiState
@@ -608,6 +609,26 @@ private fun ClusterOverviewGroup(
     }
 }
 
+/**
+ * 模型舰队的运行时标签 —— **纯函数**，便于在 JVM 单测里固定契约（票12 / `UI-CONTRACT-01`）。
+ *
+ * 契约来源：`/api/models/current`（`src/api/routes_models.py`）的**三种可达返回形状**为
+ * `{loaded:false, pipeline_prepared:true}`、`{false,false}`、`{true, pipeline 缺省}`。
+ * `currentLoaded` 与 `pipelinePrepared` 是**两路独立事实** —— 流水线就绪 ≠ 整模已加载，
+ * 反之亦然 ⇒ 三种可达态必须给出**互斥**的文案（任何一态都不得同时命中另两态的文案）。
+ *
+ * `{true,true}` 属**合成双真**：现行合同下送不到本 UI。此处 `when` 顺序把它解析为「已加载」
+ * （`currentLoaded` 优先），只为语义确定，**不代表产品存在可达的互斥展示故障**。
+ */
+internal fun modelFleetRuntimeLabel(snapshot: ModelFleetSnapshot): String {
+    val name = snapshot.currentModelName.ifBlank { snapshot.currentModelId ?: "当前模型" }
+    return when {
+        snapshot.currentLoaded -> "已加载：$name"
+        snapshot.pipelinePrepared -> "已准备流水线：$name"
+        else -> "主节点当前未加载模型"
+    }
+}
+
 @Composable
 private fun ModelFleetOverviewGroup(
     state: ModelFleetUiState,
@@ -644,11 +665,7 @@ private fun ModelFleetOverviewGroup(
             )
         }
         snapshot?.let { value ->
-            val runtimeLabel = when {
-                value.currentLoaded -> "已加载：${value.currentModelName.ifBlank { value.currentModelId ?: "当前模型" }}"
-                value.pipelinePrepared -> "已准备流水线：${value.currentModelName.ifBlank { value.currentModelId ?: "当前模型" }}"
-                else -> "主节点当前未加载模型"
-            }
+            val runtimeLabel = modelFleetRuntimeLabel(value)
             Text(
                 text = runtimeLabel,
                 style = MaterialTheme.typography.bodySmall,
