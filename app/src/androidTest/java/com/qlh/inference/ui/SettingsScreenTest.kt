@@ -2,7 +2,9 @@ package com.qlh.inference.ui
 
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsEnabled
-import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.compose.ui.test.junit4.createEmptyComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performTextInput
@@ -24,14 +26,44 @@ import com.qlh.inference.network.GgufModelInfo
 import com.qlh.inference.service.ModelManager
 import com.qlh.inference.status.AndroidRuntimeStatus
 import com.qlh.inference.ui.theme.QlhTheme
+import androidx.test.core.app.ActivityScenario
+import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
+import org.junit.Before
 import org.junit.Rule
 import org.junit.Test
 
 class SettingsScreenTest {
+    /**
+     * ★ 2026-10-11：**不用** `createComposeRule()` —— 它内部经 `ActivityScenarioRule`，其
+     * `after()` 会调 `ActivityScenario.close()`，而 `close()` 会经
+     * `InstrumentationActivityInvoker` 启动 `androidx.test.core` 的 `EmptyActivity`；
+     * 本设备上这一步恒抛 `ActivityNotFoundException`（见 `docs/彻查后修复与重构排票计划` 票12
+     * 的设备门小节），并且**该异常会替换掉测试体抛出的断言**，使 instrumented 面变成「哑」的。
+     *
+     * 改为：`createEmptyComposeRule()`（只提供 Compose 测试环境与空闲同步，不启动 activity）
+     * + 自建 `ActivityScenario.launch(ComponentActivity)`
+     * + `@After` 用 `onActivity { finish() }` 清理（**不**调 `close()`）。
+     */
     @get:Rule
-    val composeRule = createComposeRule()
+    val composeRule = createEmptyComposeRule()
+
+    private lateinit var scenario: ActivityScenario<ComponentActivity>
+
+    @Before
+    fun launchHost() {
+        scenario = ActivityScenario.launch(ComponentActivity::class.java)
+    }
+
+    @After
+    fun finishHost() {
+        // 故意不调 scenario.close()：那正是触发 invoker activity 的那一步。
+        // 直接 finish() 达到同样的清理效果，且不依赖测试 APK 之外的任何 activity。
+        if (::scenario.isInitialized) {
+            runCatching { scenario.onActivity { it.finish() } }
+        }
+    }
 
     @Test
     fun themeModeButtonsAreVisibleAndEmitExpectedModes() {
@@ -304,8 +336,9 @@ class SettingsScreenTest {
         onLogin: (String, String?, String?) -> Unit = { _, _, _ -> },
         onLogout: () -> Unit = {},
     ) {
-        composeRule.setContent {
-            QlhTheme(darkTheme = darkTheme) {
+        scenario.onActivity { activity ->
+            activity.setContent {
+                QlhTheme(darkTheme = darkTheme) {
                 SettingsScreen(
                     serverHost = "100.64.0.1",
                     serverPort = 8000,
@@ -354,6 +387,7 @@ class SettingsScreenTest {
                     onLogin = onLogin,
                     onLogout = onLogout,
                 )
+                }
             }
         }
     }
