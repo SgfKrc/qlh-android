@@ -1,11 +1,12 @@
 package com.qlh.inference.ui
 
-import androidx.compose.ui.test.junit4.createAndroidComposeRule
+import androidx.compose.ui.test.junit4.createEmptyComposeRule
 import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performTextInput
 import androidx.compose.ui.test.printToString
+import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.qlh.inference.MainActivity
@@ -97,10 +98,34 @@ class ChatE2EInstrumentedTest {
         }
     }
 
-    private val composeRule = createAndroidComposeRule<MainActivity>()
+    /**
+     * 宿主 rule：用 `ActivityScenario` 启动**真实入口** `MainActivity`。
+     *
+     * ★ 2026-10-11：不再用 `createAndroidComposeRule<MainActivity>()` —— 它内部经
+     * `ActivityScenarioRule`，其 `after()` 会调 `ActivityScenario.close()`，而 `close()` 会经
+     * `InstrumentationActivityInvoker` 启动 `androidx.test:core` 的 `EmptyActivity`；本设备上这一步
+     * 恒抛 `ActivityNotFoundException`，且该异常会**替换**测试体抛出的断言，使整个档变成「哑」的
+     * （详见 `docs/彻查后修复与重构排票计划-2026-10-09.md` 票12 的设备门小节）。
+     * 这里直接 launch / `finish()`，不依赖测试 APK 之外的任何 activity。
+     */
+    private val activityRule = TestRule { base, _ ->
+        object : Statement() {
+            override fun evaluate() {
+                val scenario = ActivityScenario.launch(MainActivity::class.java)
+                try {
+                    base.evaluate()
+                } finally {
+                    runCatching { scenario.onActivity { it.finish() } }
+                }
+            }
+        }
+    }
 
+    private val composeRule = createEmptyComposeRule()
+
+    // 顺序与已改造的 SettingsScreenTest 一致：Compose 测试环境先就绪，再启动被测 Activity。
     @get:Rule
-    val rules: RuleChain = RuleChain.outerRule(prepareDeviceRule).around(composeRule)
+    val rules: RuleChain = RuleChain.outerRule(prepareDeviceRule).around(composeRule).around(activityRule)
 
     @Test
     fun chatFromInputBoxReachesDistributedPipeline() {
