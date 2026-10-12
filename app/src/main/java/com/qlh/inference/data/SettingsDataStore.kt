@@ -1,6 +1,7 @@
 package com.qlh.inference.data
 
 import com.qlh.inference.network.httpBaseUrl
+import com.qlh.inference.network.canonicalHost
 
 import android.content.Context
 import androidx.datastore.core.DataStore
@@ -70,6 +71,23 @@ internal fun backupCorruptSettingsFile(source: File): File? {
         throw error
     }
     return backup
+}
+
+/** One preferences generation, containing only worker participation metadata. */
+internal data class WorkerParticipationSnapshot(
+    val inferenceMode: String,
+    val bootstrapped: Boolean,
+    val clusterId: String,
+    val masterTcpHost: String,
+    val masterTcpPort: Int,
+    val clusterSecretEpoch: Int,
+) {
+    fun bindingCurrent(cluster: String, host: String, port: Int, secretEpoch: Int): Boolean =
+        bootstrapped && clusterId == cluster && canonicalHost(masterTcpHost) == canonicalHost(host) &&
+            masterTcpPort == port && clusterSecretEpoch == secretEpoch
+
+    fun participationCurrent(cluster: String, host: String, port: Int, secretEpoch: Int): Boolean =
+        inferenceMode == SettingsDataStore.MODE_DISTRIBUTED && bindingCurrent(cluster, host, port, secretEpoch)
 }
 
 class SettingsDataStore internal constructor(
@@ -207,6 +225,19 @@ class SettingsDataStore internal constructor(
     }
 
     // ==================== 一次性读取 ====================
+
+    /** Fresh metadata read; never touches encrypted or legacy cluster credentials. */
+    internal suspend fun getWorkerParticipationSnapshot(): WorkerParticipationSnapshot {
+        val prefs = dataStore.data.first()
+        return WorkerParticipationSnapshot(
+            inferenceMode = normalizeInferenceMode(prefs[KEY_INFERENCE_MODE] ?: DEFAULT_MODE),
+            bootstrapped = prefs[KEY_BOOTSTRAPPED] ?: false,
+            clusterId = prefs[KEY_CLUSTER_ID] ?: "",
+            masterTcpHost = prefs[KEY_MASTER_TCP_HOST] ?: "",
+            masterTcpPort = prefs[KEY_MASTER_TCP_PORT] ?: 8888,
+            clusterSecretEpoch = prefs[KEY_CLUSTER_SECRET_EPOCH]?.takeIf { it >= 1 } ?: 1,
+        )
+    }
 
     suspend fun getServerHost(): String = dataStore.data.first()[KEY_SERVER_HOST] ?: DEFAULT_HOST
     suspend fun getServerPort(): Int = dataStore.data.first()[KEY_SERVER_PORT] ?: DEFAULT_PORT

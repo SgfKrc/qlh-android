@@ -24,6 +24,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
@@ -70,11 +71,14 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextAlign
@@ -119,6 +123,7 @@ import com.qlh.inference.ui.theme.qlhOnBrandGoldContainer
 import com.qlh.inference.ui.theme.qlhNeonGreen
 import com.qlh.inference.ui.theme.qlhOnNeonGreen
 import kotlinx.coroutines.launch
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 
 private data class QlhStatusTone(
     val containerColor: Color,
@@ -1484,42 +1489,123 @@ private fun ConnectionGroup(
     onConnectionTestSuccess: () -> Unit
 ) {
     val scope = rememberCoroutineScope()
+    val focusManager = LocalFocusManager.current
     var isTesting by remember { mutableStateOf(false) }
     var connectionResult by remember { mutableStateOf<Boolean?>(null) }
+    // Keep incomplete input local; persistence/bootstrap only receives a complete value.
+    var hostDraft by rememberSaveable { mutableStateOf(serverHost) }
+    var portDraft by rememberSaveable { mutableStateOf(serverPort.toString()) }
+    var hostFocused by remember { mutableStateOf(false) }
+    var portFocused by remember { mutableStateOf(false) }
+    var hostEdited by rememberSaveable { mutableStateOf(false) }
+    var portEdited by rememberSaveable { mutableStateOf(false) }
+    var pendingHost by rememberSaveable { mutableStateOf<String?>(null) }
+    var pendingPort by rememberSaveable { mutableStateOf<Int?>(null) }
+    var hostBeforeSubmit by rememberSaveable { mutableStateOf(serverHost) }
+    var portBeforeSubmit by rememberSaveable { mutableStateOf(serverPort) }
 
+    LaunchedEffect(serverHost, hostFocused, hostEdited, pendingHost) {
+        // Wait for the async echo, but also accept a new externally supplied address.
+        if (serverHost == pendingHost || serverHost != hostBeforeSubmit) pendingHost = null
+        if (!hostFocused && !hostEdited && pendingHost == null) hostDraft = serverHost
+    }
+    LaunchedEffect(serverPort, portFocused, portEdited, pendingPort) {
+        if (serverPort == pendingPort || serverPort != portBeforeSubmit) pendingPort = null
+        if (!portFocused && !portEdited && pendingPort == null) portDraft = serverPort.toString()
+    }
+
+    fun validHost(raw: String): String? {
+        val host = com.qlh.inference.network.canonicalHost(raw)
+        if (host.isBlank() || host.any { it.isWhitespace() || it in "/\\?#@" }) return null
+        return host.takeIf { httpBaseUrl(it, 80).toHttpUrlOrNull() != null }
+    }
+
+    fun validPort(raw: String): Int? {
+        val digits = raw.trim()
+        if (digits.isEmpty() || digits.any { it !in '0'..'9' }) return null
+        return digits.toIntOrNull()?.takeIf { it in 1..65535 }
+    }
+
+    fun commitHost(): Boolean {
+        val host = validHost(hostDraft) ?: return false
+        hostDraft = host
+        hostEdited = false
+        // Done, focus loss and the test button may all run before the datastore echo.
+        if (host != (pendingHost ?: serverHost)) {
+            hostBeforeSubmit = serverHost
+            pendingHost = host
+            onServerHostChange(host)
+        }
+        return true
+    }
+
+    fun commitPort(): Boolean {
+        val port = validPort(portDraft) ?: return false
+        portDraft = port.toString()
+        portEdited = false
+        if (port != (pendingPort ?: serverPort)) {
+            portBeforeSubmit = serverPort
+            pendingPort = port
+            onServerPortChange(port)
+        }
+        return true
+    }
+
+    val hostInvalid = validHost(hostDraft) == null
+    val portInvalid = validPort(portDraft) == null
     SettingsGroup(title = "主节点连接", icon = Icons.Default.NetworkCheck) {
         OutlinedTextField(
-            value = serverHost,
-            onValueChange = onServerHostChange,
+            value = hostDraft,
+            onValueChange = {
+                hostDraft = it
+                hostEdited = true
+                connectionResult = null
+            },
             label = { Text("主节点地址") },
             placeholder = { Text("例如: 192.168.1.100") },
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier
+                .fillMaxWidth()
+                .testTag("settings_server_host")
+                .onFocusChanged { state ->
+                    val lostFocus = hostFocused && !state.isFocused
+                    hostFocused = state.isFocused
+                    if (lostFocus && hostEdited) commitHost()
+                },
             singleLine = true,
             shape = MaterialTheme.shapes.small,
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri, imeAction = ImeAction.Done),
+            keyboardActions = KeyboardActions(onDone = {
+                if (!hostEdited || commitHost()) focusManager.clearFocus()
+            }),
+            isError = hostInvalid,
+            supportingText = if (hostInvalid) {
+                { Text("请输入有效的 IP 地址或主机名（不含协议、路径或端口）") }
+            } else null,
             enabled = !isTesting
         )
         Spacer(modifier = Modifier.height(12.dp))
-        // ★ 2026-10-09 修 #79：端口输入框此前是 `value = serverPort.toString()` +
-        //   `onValueChange = { it.toIntOrNull()?.let(onServerPortChange) }` 的**逐位 Int 回写**：
-        //   每敲一位就 Int→String 重写整个输入框，中间态（空串/前导位）被丢弃或重排，
-        //   实测把想输的 8000 搞成了 `802500`；而当时**没有任何范围校验**，非法值直接写进
-        //   datastore ⇒ `Invalid URL port: "802500"` ⇒ App 启动即失败（且 UI 毫无提示）。
-        //   现在：本地 String 状态 + 只收数字 + 长度上限 + 1..65535 校验，非法时不提交且红框提示。
-        var portText by remember(serverPort) { mutableStateOf(serverPort.toString()) }
-        val portValue = portText.toIntOrNull()
-        val portInvalid = portValue == null || portValue !in 1..65535
         OutlinedTextField(
-            value = portText,
-            onValueChange = { raw ->
-                val digits = raw.filter { it.isDigit() }.take(5)
-                portText = digits
-                digits.toIntOrNull()?.let { if (it in 1..65535) onServerPortChange(it) }
+            value = portDraft,
+            onValueChange = {
+                portDraft = it
+                portEdited = true
+                connectionResult = null
             },
             label = { Text("端口") },
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier
+                .fillMaxWidth()
+                .testTag("settings_server_port")
+                .onFocusChanged { state ->
+                    val lostFocus = portFocused && !state.isFocused
+                    portFocused = state.isFocused
+                    if (lostFocus && portEdited) commitPort()
+                },
             singleLine = true,
             shape = MaterialTheme.shapes.small,
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number, imeAction = ImeAction.Done),
+            keyboardActions = KeyboardActions(onDone = {
+                if (!portEdited || commitPort()) focusManager.clearFocus()
+            }),
             isError = portInvalid,
             supportingText = if (portInvalid) {
                 { Text("端口需为 1–65535（TCP 工作端口，默认 8888）") }
@@ -1532,28 +1618,39 @@ private fun ConnectionGroup(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            // 测试连接按钮
             Button(
                 onClick = {
+                    // Capture and validate both drafts before callbacks or focus changes.
+                    val host = validHost(hostDraft) ?: return@Button
+                    val port = validPort(portDraft) ?: return@Button
+                    val url = httpBaseUrl(host, port)
+                    if (url.toHttpUrlOrNull() == null) return@Button
+                    commitHost()
+                    commitPort()
+                    focusManager.clearFocus()
                     isTesting = true
                     connectionResult = null
                     scope.launch {
-                        val url = httpBaseUrl(serverHost, serverPort)
-                        QlhLogger.i("Settings", "测试连接: $url")
-                        val client = ApiClient(url)
-                        val raw = client.testConnection()
-                        connectionResult = raw.getOrDefault(false)
-                        isTesting = false
-                        raw.onSuccess {
-                            QlhLogger.i("Settings", "连接测试成功: $url")
-                            onConnectionTestSuccess()
-                        }.onFailure { e ->
-                            QlhLogger.w("Settings", "连接测试失败: $url — ${e.message ?: e.javaClass.simpleName}")
+                        try {
+                            QlhLogger.i("Settings", "测试连接: $url")
+                            val raw = ApiClient(url).testConnection()
+                            val success = raw.getOrDefault(false)
+                            connectionResult = success
+                            if (success) {
+                                QlhLogger.i("Settings", "连接测试成功: $url")
+                                onConnectionTestSuccess()
+                            } else {
+                                QlhLogger.w("Settings", "连接测试失败: $url — ${raw.exceptionOrNull()?.message ?: "HTTP 请求失败"}")
+                            }
+                        } finally {
+                            isTesting = false
                         }
                     }
                 },
-                modifier = Modifier.weight(1f),
-                enabled = !isTesting && serverHost.isNotBlank()
+                modifier = Modifier
+                    .weight(1f)
+                    .testTag("settings_test_connection"),
+                enabled = !isTesting && !hostInvalid && !portInvalid
             ) {
                 if (isTesting) {
                     CircularProgressIndicator(
@@ -1568,7 +1665,6 @@ private fun ConnectionGroup(
                 }
             }
 
-            // 连接状态角标
             connectionResult?.let { success ->
                 Spacer(modifier = Modifier.width(12.dp))
                 if (success) {

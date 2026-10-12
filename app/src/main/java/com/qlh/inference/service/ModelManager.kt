@@ -116,6 +116,15 @@ class ModelManager(private val context: Context) {
             return dir
         }
 
+    internal val suppliedSegmentsDir: File get() = File(modelsDir, "supply")
+
+    internal suspend fun currentSupplyBinding(): String = supplyBindingSha256(
+        settings.getClusterId(), settings.getMasterTcpHost(), settings.getMasterTcpPort(), settings.getClusterSecretEpoch(),
+    )
+
+    internal suspend fun currentSupply(): ModelSupplyManifest? =
+        if (settings.isBootstrapped()) ModelSupplyCurrent(suppliedSegmentsDir).read(currentSupplyBinding()) else null
+
     /** 默认内部测试模型路径。 */
     val defaultModelPath: String
         get() = File(modelsDir, DEFAULT_MODEL_FILENAME).absolutePath
@@ -202,7 +211,10 @@ class ModelManager(private val context: Context) {
                 .onFailure { Log.w(TAG, "default model directory is unavailable", it) }
                 .getOrDefault(emptyList())
             val internal = listPhysicalModels(modelsDir, ModelSource.INTERNAL)
-            Result.success((saf + fallback + internal).distinctBy(::physicalDocumentKey))
+            val supplied = currentSupply()?.let { current ->
+                listPhysicalModels(ModelSupplyCurrent(suppliedSegmentsDir).directory(current), ModelSource.INTERNAL)
+            }.orEmpty()
+            Result.success((saf + fallback + internal + supplied).distinctBy(::physicalDocumentKey))
         } catch (e: Exception) {
             Log.e(TAG, "扫描模型失败", e)
             Result.failure(e)
@@ -356,6 +368,7 @@ class ModelManager(private val context: Context) {
         expectedSourceModelSha256: String = "",
         expectedArtifactSha256: String = "",
         preferFd: Boolean = true,
+        expectedArtifactModelId: String = "",
     ): Result<LayerArtifactHandle> = withContext(Dispatchers.IO) {
         if (layerRange.size != 2 || layerRange[1] <= layerRange[0] || layerRange[0] < 0) {
             return@withContext Result.failure(IOException("invalid layer range"))
@@ -377,6 +390,7 @@ class ModelManager(private val context: Context) {
             startLayer = layerRange[0],
             endLayerExclusive = layerRange[1],
             offeredArtifactSha256 = expectedArtifactSha256,
+            offeredArtifactModelId = expectedArtifactModelId,
         )
         val artifact = when (choice) {
             is LayerArtifactChoice.Selected -> artifacts.first {
@@ -449,10 +463,40 @@ class ModelManager(private val context: Context) {
                 listPhysicalModels(modelsDir, ModelSource.INTERNAL),
                 listPhysicalModels(modelsDir, ModelSource.INTERNAL, setOf(JSON_EXTENSION)),
             )
+            val current = currentSupply()
+            val currentDirectory = current?.let { ModelSupplyCurrent(suppliedSegmentsDir).directory(it) }
+            val currentReference = if (current != null && currentDirectory != null) {
+                Uri.fromFile(File(currentDirectory, current.weight.path)).toString()
+            } else ""
+            var currentFailure: LayerArtifactDiagnostic? = null
+            if (current != null && currentDirectory != null) {
+                try {
+                    val marker = File(currentDirectory, ModelSupplyManifest.MARKER)
+                    checkSupply(!java.nio.file.Files.isSymbolicLink(marker.toPath()) && marker.isFile &&
+                        marker.length() <= 4 * 1024 * 1024 &&
+                        ModelSupplyManifest.parse(marker.readText(Charsets.UTF_8)).json == current.json,
+                        "SUPPLY_MANIFEST_DIGEST_MISMATCH", "current marker differs")
+                    // Recovery uses the same complete SHA/native/GGUF/tokenizer checks as receipt.
+                    if (verifyArtifactDigest) ModelSupplyReceiver(suppliedSegmentsDir, "unused").validateFiles(currentDirectory, current)
+                    val documents = listPhysicalModels(currentDirectory, ModelSource.INTERNAL)
+                    val native = listPhysicalModels(currentDirectory, ModelSource.INTERNAL, setOf(JSON_EXTENSION))
+                        .filter { it.name == current.native.path }
+                    roots += Triple("internal-supply", documents, native)
+                } catch (cancelled: CancellationException) { throw cancelled }
+                catch (error: Exception) {
+                    currentFailure = LayerArtifactDiagnostic(
+                        manifestName = current.native.path,
+                        errorCode = LayerArtifactDiagnostic.ARTIFACT_DIGEST_MISMATCH,
+                        detail = (error as? ModelSupplyException)?.reasonCode ?: "current supply unavailable",
+                        startLayer = current.start, endLayerExclusive = current.end,
+                    )
+                }
+            }
             val expected = expectedModelSha256.trim().lowercase()
             val storageScope = treeUri?.toString().orEmpty()
             val output = mutableListOf<LayerArtifact>()
             val diagnostics = mutableListOf<LayerArtifactDiagnostic>()
+            currentFailure?.let { diagnostics += it }
             if (roots.none { it.first == "saf" } &&
                 roots.none { it.first == "fallback" && (it.second.isNotEmpty() || it.third.isNotEmpty()) } &&
                 roots.none { it.third.isNotEmpty() }
@@ -538,7 +582,9 @@ class ModelManager(private val context: Context) {
                     output += artifact
                 }
             }
-            val distinctArtifacts = output.distinctBy {
+            val allowedReferences = preferCurrentSupplyCandidates(output.map { it.toCandidate() }, current, currentReference)
+                .map { it.reference }.toSet()
+            val distinctArtifacts = output.filter { it.document.uri.toString() in allowedReferences }.distinctBy {
                 listOf(
                     it.sourceModelSha256.lowercase(), it.sourceModelId,
                     it.startLayer, it.endLayerExclusive, it.artifactSha256.lowercase(),
@@ -559,6 +605,8 @@ class ModelManager(private val context: Context) {
                         artifactPresent = true,
                     )
                 }
+            checkSupply(currentSupply()?.manifestSha256 == current?.manifestSha256,
+                "SUPPLY_CURRENT_CHANGED", "current changed during artifact scan")
             val inventory = LayerArtifactInventory(
                 artifacts = distinctArtifacts,
                 diagnostics = diagnostics,

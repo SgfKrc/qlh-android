@@ -56,3 +56,16 @@ internal suspend fun <T> pairLayerArtifactVerified(
     }
     return firstMatch
 }
+
+/** Published private directories provide reuse bytes; only the current registration enters the catalog. */
+internal fun scanSuppliedSegmentRoots(root: File): List<Pair<File, ModelSupplyManifest>> {
+    if (!root.isDirectory || Files.isSymbolicLink(root.toPath())) return emptyList()
+    return root.listFiles().orEmpty().mapNotNull { directory ->
+        if (!directory.isDirectory || !Regex("segment-[0-9a-f]{64}").matches(directory.name) ||
+            Files.isSymbolicLink(directory.toPath()) || directory.canonicalFile.parentFile != root.canonicalFile) return@mapNotNull null
+        val marker = File(directory, ModelSupplyManifest.MARKER)
+        if (!marker.isFile || Files.isSymbolicLink(marker.toPath()) || marker.length() > 4 * 1024 * 1024) return@mapNotNull null
+        runCatching { ModelSupplyManifest.parse(marker.readText(Charsets.UTF_8)) }.getOrNull()
+            ?.takeIf { directory.name == "segment-${it.manifestSha256}" }?.let { directory to it }
+    }.sortedBy { it.first.name }
+}

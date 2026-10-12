@@ -299,12 +299,15 @@ interface TaskWorkerTransport {
     suspend fun receiveEvent(): TaskWorkerInboundEvent =
         receive()?.let { TaskWorkerInboundEvent.Envelope(it) }
             ?: TaskWorkerInboundEvent.Closed
+    suspend fun sendModelSupply(data: com.google.gson.JsonObject) { throw TaskWorkerProtocolException("supply transport unavailable", "supply_transport_unavailable") }
+    fun requireControlAuthority() = Unit
     suspend fun sendHeartbeat(nodeId: String, sentAtMs: Long) = Unit
     suspend fun close()
 }
 
 sealed class TaskWorkerInboundEvent {
     data class Envelope(val value: TaskWorkerEnvelope) : TaskWorkerInboundEvent()
+    data class ModelSupply(val data: com.google.gson.JsonObject) : TaskWorkerInboundEvent()
     data object HeartbeatAck : TaskWorkerInboundEvent()
     data object Closed : TaskWorkerInboundEvent()
 }
@@ -324,9 +327,10 @@ fun interface TaskWorkerTransportFactory {
 }
 
 /** Length-prefixed transport compatible with the existing PC TCP framing. */
-class SocketTaskWorkerTransport(
+internal class SocketTaskWorkerTransport(
     private val socket: Socket,
     private val maxFrameBytes: Int = TaskWorkerProtocol.MAX_MESSAGE_BYTES + 1024,
+    private val controlFence: TcpControlFence = TcpControlFence(),
 ) : TaskWorkerTransport {
     private val input = DataInputStream(BufferedInputStream(socket.getInputStream()))
     private val output = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
@@ -350,21 +354,17 @@ class SocketTaskWorkerTransport(
     }
 
     override suspend fun send(envelope: TaskWorkerEnvelope) = withContext(Dispatchers.IO) {
-        val inner = TaskWorkerProtocol.encode(envelope).toString(StandardCharsets.UTF_8)
-        sendOuterJson("{\"type\":\"task_worker\",\"format\":\"json\",\"data\":$inner}")
+        val inner = JsonParser.parseString(TaskWorkerProtocol.encode(envelope).toString(StandardCharsets.UTF_8)).asJsonObject
+        sendOuter("task_worker", controlFence.decorate(inner))
     }
 
-    private suspend fun sendOuterJson(json: String) = withContext(Dispatchers.IO) {
-        val outer = json.toByteArray(StandardCharsets.UTF_8)
-        if (outer.size > maxFrameBytes) throw TaskWorkerProtocolException(
-            "task worker frame exceeds maximum size", "message_too_large", "message",
-        )
-        synchronized(sendLock) {
-            output.writeInt(outer.size)
-            output.write(outer)
-            output.flush()
+    override fun requireControlAuthority() {
+        try { controlFence.requireCurrent() } catch (error: TaskWorkerProtocolException) {
+            runCatching { socket.close() }
+            throw error
         }
     }
+    override suspend fun sendModelSupply(data: com.google.gson.JsonObject) = sendOuter("model_supply", controlFence.decorate(data))
 
     private suspend fun receiveOuter(): com.google.gson.JsonObject? = withContext(Dispatchers.IO) {
         val size = try {
@@ -452,6 +452,8 @@ class SocketTaskWorkerTransport(
             throw TaskWorkerProtocolException("expected register acknowledgement", "unexpected_message_type", "type")
         }
         val data = ack.getAsJsonObject("data")
+        if (data?.get("control_fence_required")?.asBoolean == true) controlFence.required = true
+        if (data?.has("control_certificate") == true) controlFence.admit(data)
         if (data?.get("status")?.asString != "registered") {
             throw TaskWorkerProtocolException(
                 data?.get("reason")?.asString ?: "coordinator rejected registration",
@@ -469,6 +471,8 @@ class SocketTaskWorkerTransport(
                     if (data == null || !data.isJsonObject) {
                         throw TaskWorkerProtocolException("task worker frame has no data object", "invalid_frame", "data")
                     }
+                    controlFence.admit(data.asJsonObject)
+                    val admittedData = data.asJsonObject.deepCopy().apply { remove("control_certificate") }
                     // ★ 2026-10-08（诊断，定位后降级）：帧的内层契约是
                     //   `{"protocol","version","message_type","message_id","sent_at_ms","payload"}`
                     //   （主仓 `task_worker_protocol.build_message`），**不是** `type`/`data`
@@ -490,7 +494,7 @@ class SocketTaskWorkerTransport(
                     )
                     val decoded = try {
                         TaskWorkerProtocol.decode(
-                            gson.toJson(data).toByteArray(StandardCharsets.UTF_8)
+                            gson.toJson(admittedData).toByteArray(StandardCharsets.UTF_8)
                         )
                     } catch (error: Exception) {
                         // ★ 2026-10-11（三机验收实测）：帧字节完整到达、`message_type` 已能读出，
@@ -508,6 +512,11 @@ class SocketTaskWorkerTransport(
                     }
                     return TaskWorkerInboundEvent.Envelope(decoded)
                 }
+                "model_supply" -> {
+                    val data = objectValue.getAsJsonObject("data") ?: throw TaskWorkerProtocolException("supply data missing", "invalid_frame")
+                    controlFence.admit(data)
+                    return TaskWorkerInboundEvent.ModelSupply(data.deepCopy())
+                }
                 "heartbeat_ack" -> return TaskWorkerInboundEvent.HeartbeatAck
                 "stage_chunk" -> {
                     // ★ 2026-10-08（DIST-NEXT-2b 真机回归暴露）：`stage_chunk` 是**外层帧类型**
@@ -524,7 +533,8 @@ class SocketTaskWorkerTransport(
                             "stage_chunk rejected: invalid_frame (no data object)",
                         )
                     } else {
-                        val payload = data.asJsonObject.deepCopy()
+                        controlFence.admit(data.asJsonObject)
+                        val payload = data.asJsonObject.deepCopy().apply { remove("control_certificate") }
                         payload.addProperty("type", TaskWorkerProtocol.STAGE_CHUNK)
                         // ★ 2026-10-08（诊断，定位后降级）：逐片记录到达情况。真机上
                         //   `task_worker_stage_chunks_sent chunks=18` 之后 offer 始终未到，
@@ -543,7 +553,10 @@ class SocketTaskWorkerTransport(
                     }
                 }
                 // 已知但本端不消费的帧：吞掉，继续读下一帧。
-                "node_list_sync", "node_update", "layer_config" -> Unit
+                "node_list_sync", "node_update", "layer_config" -> {
+                    val data = objectValue.getAsJsonObject("data") ?: com.google.gson.JsonObject()
+                    controlFence.admit(data)
+                }
                 else -> {
                     // ★ 2026-10-08（真机闸门根因）：**未知帧不得断连**。
                     //
@@ -565,6 +578,7 @@ class SocketTaskWorkerTransport(
 
     override suspend fun receive(): TaskWorkerEnvelope? = when (val event = receiveEvent()) {
         is TaskWorkerInboundEvent.Envelope -> event.value
+        is TaskWorkerInboundEvent.ModelSupply -> throw TaskWorkerProtocolException("supply before hello acknowledgement", "unexpected_message_type")
         TaskWorkerInboundEvent.Closed -> null
         TaskWorkerInboundEvent.HeartbeatAck -> throw TaskWorkerProtocolException(
             "heartbeat acknowledgement is not a task worker envelope", "unexpected_message_type", "type",
@@ -586,6 +600,8 @@ class SocketTaskWorkerTransportFactory(
     private val connectTimeoutMs: Int = 8_000,
     private val readTimeoutMs: Int = 45_000,
     private val registration: TaskWorkerRegistration? = null,
+    private val controlFenceRequired: Boolean = false,
+    private val controlCertificateValidator: ((com.google.gson.JsonObject) -> Unit)? = null,
 ) : TaskWorkerTransportFactory {
     override suspend fun connect(host: String, port: Int): TaskWorkerTransport = withContext(Dispatchers.IO) {
         require(port in 1..65535) { "port must be between 1 and 65535" }
@@ -593,7 +609,7 @@ class SocketTaskWorkerTransportFactory(
         val socket = Socket()
         socket.connect(InetSocketAddress(normalizedHost, port), connectTimeoutMs)
         socket.soTimeout = readTimeoutMs
-        val transport = SocketTaskWorkerTransport(socket)
+        val transport = SocketTaskWorkerTransport(socket, controlFence = TcpControlFence(controlFenceRequired, controlCertificateValidator))
         try {
             registration?.let { transport.register(it) }
             transport
@@ -641,6 +657,7 @@ class TaskWorkerClient(
     private val transportFactory: TaskWorkerTransportFactory =
         SocketTaskWorkerTransportFactory(registration = registration),
     private val stageHandler: TaskWorkerStageHandler? = null,
+    private val modelSupplyHandler: TaskWorkerModelSupplyHandler? = null,
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
     private val clockMs: () -> Long = { System.currentTimeMillis() },
 ) {
@@ -720,6 +737,7 @@ class TaskWorkerClient(
 
     /** Non-blocking stop used by Android Service lifecycle callbacks. */
     fun stop() {
+        modelSupplyHandler?.cancelAll()
         machine.snapshot().activeAttempt.identity?.let { stageHandler?.requestCancel(it) }
         machine.stop()
         publish()
@@ -739,6 +757,7 @@ class TaskWorkerClient(
     }
 
     suspend fun stopAndJoin() = withContext(NonCancellable) {
+        modelSupplyHandler?.cancelAll()
         machine.snapshot().activeAttempt.identity?.let { stageHandler?.requestCancel(it) }
         machine.stop()
         publish()
@@ -823,6 +842,7 @@ class TaskWorkerClient(
                 machine.onDisconnected(clockMs(), errorCode(error), error.message ?: error.javaClass.simpleName)
                 publish()
             } finally {
+                modelSupplyHandler?.cancelAll()
                 runCatching { transport?.close() }
                 heartbeatJob?.cancel()
                 heartbeatJob = null
@@ -843,7 +863,24 @@ class TaskWorkerClient(
                 when (event) {
                     TaskWorkerInboundEvent.Closed -> throw EOFException("coordinator closed worker connection")
                     TaskWorkerInboundEvent.HeartbeatAck -> Unit
+                    is TaskWorkerInboundEvent.ModelSupply -> {
+                        modelSupplyHandler?.command(event.data, scope,
+                            reply = { data ->
+                                if (transport !== connection || machine.snapshot().connection != TaskWorkerConnectionState.READY) throw CancellationException("supply connection retired")
+                                connection.sendModelSupply(data)
+                            },
+                            refreshHello = {
+                                if (transport !== connection || machine.snapshot().connection != TaskWorkerConnectionState.READY) throw CancellationException("supply connection retired")
+                                connection.send(TaskWorkerProtocol.buildHello(nodeId, capabilities(), newMessageId("hello"), clockMs()))
+                            }, authorize = {
+                                if (transport !== connection || machine.snapshot().connection != TaskWorkerConnectionState.READY) throw CancellationException("supply connection retired")
+                                connection.requireControlAuthority()
+                            })
+                    }
                     is TaskWorkerInboundEvent.Envelope -> when (event.value.messageType) {
+                        TaskWorkerProtocol.HELLO_ACK -> {
+                            if (event.value.payload["accepted"] != true) throw java.io.IOException("capability refresh rejected")
+                        }
                         TaskWorkerProtocol.STAGE_OFFER -> handleOffer(connection, event.value)
                         TaskWorkerProtocol.STAGE_CANCEL -> handleCancel(connection, event.value)
                         TaskWorkerProtocol.LEASE_RENEW -> handleLeaseRenew(event.value)

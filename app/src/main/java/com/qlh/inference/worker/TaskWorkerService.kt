@@ -16,10 +16,15 @@ import com.qlh.inference.MainActivity
 import com.qlh.inference.QlhApplication
 import com.qlh.inference.R
 import com.qlh.inference.data.SettingsDataStore
+import com.qlh.inference.data.WorkerParticipationSnapshot
 import com.qlh.inference.logging.QlhLogger
 import com.qlh.inference.service.InferenceService
 import com.qlh.inference.service.inferenceModes
 import com.qlh.inference.service.ModelManager
+import com.qlh.inference.service.ModelSupplyManifest
+import com.qlh.inference.service.ModelSupplyCurrent
+import com.qlh.inference.service.ModelSupplyException
+import com.qlh.inference.network.canonicalHost
 import com.qlh.inference.service.LayerArtifactChoice
 import com.qlh.inference.service.LayerArtifactDiagnostic
 import com.qlh.inference.service.LayerArtifactInventory
@@ -289,13 +294,14 @@ class TaskWorkerService : Service() {
         val hostname = config.hostname.ifBlank { nodeId }
         val networkType = config.networkType.ifBlank { "unknown" }
         val deviceInfo = config.deviceInfo
+        val suppliedIdentity = AtomicReference<Pair<String, String>?>(null)
         val modelId = config.modelId
         val modelFormat = config.modelFormat.ifBlank { "gguf" }
         val modelRevision = config.modelRevision.ifBlank { "local" }
         val modelSha256 = config.modelSha256
         val resourceAdmitted = config.resourceAdmitted
         val resourceReason = config.resourceReason
-        val fullInferenceAvailable = config.fullInferenceAvailable
+        val fullInferenceAvailable = false // Distributed workers never accept full-model loads.
         val runtimeProfile = AndroidWorkerCapabilities.normalizeRuntimeProfile(
             deviceInfo["runtime_profile"]?.toString(),
         )
@@ -303,11 +309,16 @@ class TaskWorkerService : Service() {
         // the local inference service has loaded anything (or even exists yet).
         val modelManager = QlhApplication.instance.inferenceService?.modelManager
             ?: ModelManager(this)
+        val supplyBinding = modelManager.currentSupplyBinding()
+        val supplyCurrent = ModelSupplyCurrent(modelManager.suppliedSegmentsDir)
+        val currentSupply = { supplyCurrent.read(supplyBinding)?.takeIf { it.nodeId == nodeId } }
+        val currentModelId = { currentSupply()?.sourceModelId ?: suppliedIdentity.get()?.first ?: config.modelId }
+        val currentModelSha = { currentSupply()?.sourceSha256 ?: suppliedIdentity.get()?.second ?: config.modelSha256 }
         // Capability construction is the integrity boundary: it hashes each
         // artifact once. Decode offers only consult this immutable verified
         // snapshot; re-hashing multi-GB GGUF files for every token would make
         // the stage path unusable.
-        val verifiedLayerArtifacts = AtomicReference<List<ModelManager.LayerArtifact>>(emptyList())
+        val verifiedLayerArtifacts = AtomicReference<Pair<String?, List<ModelManager.LayerArtifact>>>(null to emptyList())
         val verifiedInventory = AtomicReference<LayerArtifactInventory?>(null)
         val layerArtifactCapability = { artifact: ModelManager.LayerArtifact,
                                         scan: GgufLayerWeightReader.ScanResult? ->
@@ -345,23 +356,31 @@ class TaskWorkerService : Service() {
         val verifiedResourceAdmitted = AtomicBoolean(false)
         val expectedModelIdentity = {
             AndroidWorkerCapabilities.modelIdentity(
-                modelId, modelFormat, modelRevision, modelSha256,
+                currentModelId(), modelFormat, modelRevision, currentModelSha(),
                 verifiedResourceAdmitted.get(),
             )
         }
         val buildCapabilities: suspend () -> Map<String, Any?> = suspend {
+            val supplyManifest = currentSupply()?.manifestSha256
+            var modelId = currentModelId()
+            var modelSha256 = currentModelSha()
             val inferenceReady = QlhApplication.instance.inferenceService != null ||
                 (inferenceStartAccepted && awaitInferenceService() != null)
             val scanStartedAtMs = android.os.SystemClock.elapsedRealtime()
-            val inventory = if (inferenceReady && resourceAdmitted && modelId.isNotBlank() &&
-                modelSha256.matches(Regex("[0-9a-fA-F]{64}"))
-            ) {
+            val inventory = if (inferenceReady) {
                 modelManager.scanLayerArtifacts(
                     expectedModelSha256 = modelSha256,
                     verifyArtifactDigest = true,
                 ).getOrNull()
             } else null
             verifiedInventory.set(inventory)
+            if (modelId.isBlank() || !modelSha256.matches(Regex("[0-9a-fA-F]{64}"))) {
+                inventory?.artifacts.orEmpty().mapNotNull { artifact ->
+                    artifact.sourceModelId?.let { it to artifact.sourceModelSha256 }
+                }.distinct().singleOrNull()?.let { identity ->
+                    suppliedIdentity.set(identity); modelId = identity.first; modelSha256 = identity.second
+                }
+            }
             val eligibleArtifacts = inventory?.artifacts.orEmpty().filter {
                 it.sourceModelSha256.equals(modelSha256, ignoreCase = true) &&
                     (it.sourceModelId == null || it.sourceModelId == modelId)
@@ -395,14 +414,17 @@ class TaskWorkerService : Service() {
                 .map { it.reference }.toSet()
             val layerArtifacts = checkedArtifacts
                 .filter { it.document.uri.toString() in allowedReferences }
-            verifiedLayerArtifacts.set(layerArtifacts.toList())
+            if (currentSupply()?.manifestSha256 != supplyManifest) {
+                throw ModelSupplyException("SUPPLY_CURRENT_CHANGED", "current changed during capability scan")
+            }
+            verifiedLayerArtifacts.set(supplyManifest to layerArtifacts.toList())
             QlhLogger.i(
                 "TaskWorkerService",
                 "hello_scan_ms=${android.os.SystemClock.elapsedRealtime() - scanStartedAtMs} " +
                     "scanned=${inventory != null} eligible_ranges=${layerArtifacts.size}",
             )
             val verifiedAdmission = AndroidWorkerCapabilities.verifiedAdmission(
-                resourceAdmitted, fullInferenceAvailable, layerArtifacts.size, inferenceReady,
+                layerArtifacts.isNotEmpty(), fullInferenceAvailable, layerArtifacts.size, inferenceReady,
             )
             verifiedResourceAdmitted.set(verifiedAdmission)
             val verifiedReason = if (verifiedAdmission) "" else if (resourceAdmitted) {
@@ -480,6 +502,30 @@ class TaskWorkerService : Service() {
             )
             capabilities
         }
+        val boundClusterId = settings.getClusterId()
+        fun bindingCurrent(snapshot: WorkerParticipationSnapshot): Boolean =
+            snapshot.bindingCurrent(boundClusterId, host, port, config.clusterSecretEpoch)
+        suspend fun participationCurrent(): Boolean = settings.getWorkerParticipationSnapshot()
+            .participationCurrent(boundClusterId, host, port, config.clusterSecretEpoch)
+        val supply = ModelSupplyController(
+            nodeId = nodeId, boundHost = host, root = modelManager.suppliedSegmentsDir,
+            distributed = { settings.getInferenceMode() == SettingsDataStore.MODE_DISTRIBUTED },
+            bindingCurrent = { bindingCurrent(settings.getWorkerParticipationSnapshot()) },
+            memoryAvailable = { AndroidDeviceInfoProvider(this@TaskWorkerService).getMemoryStatus().availableBytes },
+            publicationGate = { action ->
+                // Read inside the existing mode lock, then use that same generation for binding.
+                lateinit var snapshot: WorkerParticipationSnapshot
+                inferenceModes.worker({
+                    settings.getWorkerParticipationSnapshot().also { snapshot = it }.inferenceMode
+                }) {
+                    if (!bindingCurrent(snapshot)) Result.failure(ModelSupplyException("SUPPLY_MASTER_BINDING_CHANGED", "master binding changed"))
+                    else { action(); Result.success(Unit) }
+                }.getOrThrow()
+            },
+            available = { _ -> },
+            bindingSha256 = supplyBinding,
+            participationCurrent = { participationCurrent() },
+        )
         val worker = TaskWorkerClient(
             host = host,
             port = port,
@@ -494,6 +540,7 @@ class TaskWorkerService : Service() {
                 modelSha256 = modelSha256,
             ),
             capabilities = buildCapabilities,
+            modelSupplyHandler = supply,
             stageHandler = AndroidFullWorkerStageExecutor(
                 expectedModelIdentity = expectedModelIdentity,
                 allowLayerIdentityAlias = { !fullInferenceAvailable },
@@ -569,23 +616,34 @@ class TaskWorkerService : Service() {
                         ?.clearLayerForwardAbort()
                 },
                 ensureModelLoadedForLayer = { range, contextSize, embeddingWidth, wantHidden, sha256 ->
-                    awaitInferenceService()
-                        ?.ensureLayerModelLoaded(
-                            layerRange = range,
-                            contextSize = contextSize,
-                            extractHidden = wantHidden,
-                            expectedModelSha256 = sha256,
-                            expectedSourceModelId = modelId,
-                            expectedSourceModelSha256 = modelSha256,
-                            expectedEmbeddingWidth = embeddingWidth,
-                        )
-                        ?: Result.failure(IllegalStateException("inference_service_unavailable"))
+                    val snapshot = verifiedLayerArtifacts.get()
+                    val artifact = snapshot.second.singleOrNull {
+                        range == listOf(it.startLayer, it.endLayerExclusive) && it.artifactSha256.equals(sha256, ignoreCase = true)
+                    }
+                    if (currentSupply()?.manifestSha256 != snapshot.first || artifact == null) {
+                        Result.failure(ModelSupplyException("SUPPLY_CURRENT_CHANGED", "advertised artifact is no longer selected"))
+                    } else {
+                        awaitInferenceService()
+                            ?.ensureLayerModelLoaded(
+                                layerRange = range,
+                                contextSize = contextSize,
+                                extractHidden = wantHidden,
+                                expectedModelSha256 = sha256,
+                                expectedSourceModelId = currentModelId(),
+                                expectedSourceModelSha256 = currentModelSha(),
+                                expectedEmbeddingWidth = embeddingWidth,
+                                expectedArtifactModelId = layerArtifactCapability(artifact, null).modelId,
+                                expectedSupplyManifestSha256 = snapshot.first.orEmpty(),
+                            )
+                            ?: Result.failure(IllegalStateException("inference_service_unavailable"))
+                    }
                 },
                 resolveLayerModelIdentity = { range, requested ->
+                    val snapshot = verifiedLayerArtifacts.get()
                     val choice = chooseLayerArtifact(
-                        candidates = verifiedLayerArtifacts.get().map { it.toCandidate() },
-                        masterModelId = modelId,
-                        masterSourceSha256 = modelSha256,
+                        candidates = if (currentSupply()?.manifestSha256 == snapshot.first) snapshot.second.map { it.toCandidate() } else emptyList(),
+                        masterModelId = currentModelId(),
+                        masterSourceSha256 = currentModelSha(),
                         startLayer = range.getOrElse(0) { -1 },
                         endLayerExclusive = range.getOrElse(1) { -1 },
                         offeredArtifactSha256 = (requested["sha256"] as? String).orEmpty(),
@@ -595,7 +653,7 @@ class TaskWorkerService : Service() {
                         } == true,
                     )
                     when (choice) {
-                        is LayerArtifactChoice.Selected -> verifiedLayerArtifacts.get()
+                        is LayerArtifactChoice.Selected -> snapshot.second
                             .firstOrNull { it.document.uri.toString() == choice.artifact.reference }
                             ?.let { layerArtifactCapability(it, null).modelIdentity() }
                         is LayerArtifactChoice.ManualRequired -> {

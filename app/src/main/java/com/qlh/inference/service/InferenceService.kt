@@ -111,6 +111,7 @@ class InferenceService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     @Volatile
     private var loadedLayerArtifactSha256: String = ""
+    private var loadedLayerArtifactModelId: String = ""
     @Volatile
     private var loadedLayerSourceSha256: String = ""
 
@@ -301,11 +302,19 @@ class InferenceService : Service() {
         expectedSourceModelId: String = "",
         expectedSourceModelSha256: String = "",
         expectedEmbeddingWidth: Int = 0,
+        expectedArtifactModelId: String = "",
+        expectedSupplyManifestSha256: String? = null,
     ): Result<Unit> = inferenceModes.worker({ settings.getInferenceMode() }) {
-        loadLayerModel(
-            layerRange, contextSize, extractHidden, expectedModelSha256,
-            expectedSourceModelId, expectedSourceModelSha256, expectedEmbeddingWidth,
-        )
+        if (expectedSupplyManifestSha256 != null &&
+            modelManager.currentSupply()?.manifestSha256.orEmpty() != expectedSupplyManifestSha256
+        ) {
+            Result.failure(ModelSupplyException("SUPPLY_CURRENT_CHANGED", "advertised operation is no longer current"))
+        } else {
+            loadLayerModel(
+                layerRange, contextSize, extractHidden, expectedModelSha256,
+                expectedSourceModelId, expectedSourceModelSha256, expectedEmbeddingWidth, expectedArtifactModelId,
+            )
+        }
     }
 
     private suspend fun loadLayerModel(
@@ -316,6 +325,7 @@ class InferenceService : Service() {
         expectedSourceModelId: String,
         expectedSourceModelSha256: String,
         expectedEmbeddingWidth: Int,
+        expectedArtifactModelId: String,
     ): Result<Unit> {
         val eng = engine ?: return Result.failure(IllegalStateException("Service 未初始化"))
         if (layerRange.size != 2 || layerRange[1] <= layerRange[0] || layerRange[0] < 0) {
@@ -327,11 +337,13 @@ class InferenceService : Service() {
         if (eng.isLoaded && eng.loadedLayerRange == layerRange &&
             eng.loadedExtractHidden == extractHidden && eng.loadedGpuLayers == gpuLayers &&
             expectedDigest.isNotBlank() && loadedLayerArtifactSha256 == expectedDigest &&
+            (expectedArtifactModelId.isBlank() || loadedLayerArtifactModelId == expectedArtifactModelId) &&
             expectedSourceDigest.isNotBlank() && loadedLayerSourceSha256 == expectedSourceDigest
         ) {
             return validateLayerModel(eng, layerRange, expectedEmbeddingWidth)
         }
         if (eng.isLoaded) eng.unloadModel().getOrElse { return Result.failure(it) }
+        loadedLayerArtifactModelId = ""
         loadedLayerArtifactSha256 = ""
         loadedLayerSourceSha256 = ""
 
@@ -342,6 +354,7 @@ class InferenceService : Service() {
                 expectedSourceModelSha256 = expectedSourceModelSha256,
                 expectedArtifactSha256 = expectedModelSha256,
                 preferFd = preferFd,
+                expectedArtifactModelId = expectedArtifactModelId,
             ).getOrElse { return Result.failure(it) }
             val loaded = eng.loadModel(
                 handle = artifact.handle,
@@ -353,6 +366,7 @@ class InferenceService : Service() {
             if (loaded.isFailure) return loaded
             val validation = validateLayerModel(eng, layerRange, expectedEmbeddingWidth)
             if (validation.isSuccess) {
+                loadedLayerArtifactModelId = expectedArtifactModelId
                 loadedLayerArtifactSha256 = artifact.artifactSha256.lowercase()
                 loadedLayerSourceSha256 = artifact.sourceModelSha256.lowercase()
             }
@@ -363,6 +377,7 @@ class InferenceService : Service() {
         if (first.isSuccess) return first
         Log.w(TAG, "layer artifact fd load failed; retrying cached copy")
         if (eng.isLoaded) eng.unloadModel().getOrElse { return Result.failure(it) }
+        loadedLayerArtifactModelId = ""
         loadedLayerArtifactSha256 = ""
         loadedLayerSourceSha256 = ""
         return load(preferFd = false)
@@ -399,6 +414,7 @@ class InferenceService : Service() {
 
     internal suspend fun unloadModelLocked(): Result<Unit> {
         val eng = engine ?: return Result.failure(IllegalStateException("Service 未初始化"))
+        loadedLayerArtifactModelId = ""
         loadedLayerArtifactSha256 = ""
         loadedLayerSourceSha256 = ""
         return eng.unloadModel()
