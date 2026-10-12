@@ -7,6 +7,7 @@ import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -192,6 +193,114 @@ class AndroidFullWorkerStageExecutorTest {
         }
     }
 
+    @Test
+    fun `layer-only worker rejects stale full offers without disturbing its artifact`() = runBlocking {
+        val artifactIdentity = model + mapOf(
+            "model_id" to "tail-2-4.gguf",
+            "revision" to "local",
+            "sha256" to "b".repeat(64),
+        )
+        var fullLoads = 0
+        var layerLoads = 0
+        var generated = 0
+        var forwarded = 0
+        var layerSha = ""
+        val executor = AndroidFullWorkerStageExecutor(
+            expectedModelIdentity = { model },
+            allowLayerIdentityAlias = { true },
+            ensureModelLoaded = {
+                fullLoads++
+                Result.success(Unit)
+            },
+            generate = { _, _, _, _ ->
+                generated++
+                Result.success("must not run")
+            },
+            layerForward = {
+                forwarded++
+                Result.success(LayerForwardResult(tokenArgmax = 7, hiddenOut = null))
+            },
+            ensureModelLoadedForLayer = { _, _, _, _, sha256 ->
+                layerLoads++
+                layerSha = sha256
+                Result.success(Unit)
+            },
+            resolveLayerModelIdentity = { range, _ ->
+                artifactIdentity.takeIf { range == listOf(2, 4) }
+            },
+        )
+
+        val layerOffer = layerForwardOffer(4).let { envelope ->
+            envelope.copy(payload = envelope.payload + ("model_identity" to artifactIdentity))
+        }
+        assertEquals(7, executor.execute(layerOffer).output["token_argmax"])
+        assertEquals(1, layerLoads)
+
+        val fullOffer = fullInferenceOffer(model)
+        for (identity in listOf(model, artifactIdentity)) {
+            try {
+                executor.execute(fullOffer.copy(
+                    payload = fullOffer.payload + ("model_identity" to identity),
+                ))
+                fail("layer-only worker must reject full inference")
+            } catch (error: AndroidFullWorkerStageException) {
+                assertEquals("unsupported_stage_type", error.code)
+            }
+        }
+        assertEquals(0, fullLoads)
+        assertEquals(1, layerLoads)
+        assertEquals(0, generated)
+        assertEquals(1, forwarded)
+
+        assertEquals(7, executor.execute(layerOffer).output["token_argmax"])
+        assertEquals(2, layerLoads)
+        assertEquals("b".repeat(64), layerSha)
+        assertEquals(2, forwarded)
+        assertEquals(0, fullLoads)
+        assertEquals(0, generated)
+    }
+
+    @Test
+    fun `full-capable worker loads only its full identity not a cropped artifact`() = runBlocking {
+        val artifactIdentity = model + mapOf(
+            "model_id" to "tail-2-4.gguf",
+            "revision" to "local",
+            "sha256" to "b".repeat(64),
+        )
+        var fullLoads = 0
+        var generated = 0
+        val executor = AndroidFullWorkerStageExecutor(
+            expectedModelIdentity = { model },
+            allowLayerIdentityAlias = { false },
+            ensureModelLoaded = {
+                fullLoads++
+                Result.success(Unit)
+            },
+            generate = { _, _, _, _ ->
+                generated++
+                Result.success("full result")
+            },
+            resolveLayerModelIdentity = { range, _ ->
+                artifactIdentity.takeIf { range == listOf(2, 4) }
+            },
+        )
+        val fullOffer = fullInferenceOffer(model)
+        try {
+            executor.execute(fullOffer.copy(
+                payload = fullOffer.payload + ("model_identity" to artifactIdentity),
+            ))
+            fail("a cropped artifact cannot authorize full inference")
+        } catch (error: AndroidFullWorkerStageException) {
+            assertEquals("model_identity_mismatch", error.code)
+        }
+        assertEquals(0, fullLoads)
+        assertEquals(0, generated)
+
+        assertEquals("full result", executor.execute(fullOffer).output["content"])
+        assertEquals(1, fullLoads)
+        assertEquals(1, generated)
+    }
+
     private fun layerExecutor(nEmbd: Int) = AndroidFullWorkerStageExecutor(
         expectedModelIdentity = { model },
         ensureModelLoaded = { Result.success(Unit) },
@@ -202,6 +311,26 @@ class AndroidFullWorkerStageExecutorTest {
         ensureModelLoadedForLayer = { _, _, _, _, _ -> Result.success(Unit) },
         resolveLayerModelIdentity = { _, _ -> model },
     )
+
+    private fun fullInferenceOffer(identity: Map<String, String>): TaskWorkerEnvelope =
+        TaskWorkerProtocol.buildStageOffer(
+            identity = TaskWorkerAttemptIdentity(
+                workflowId = "wf_android_stale_full",
+                stageId = "stage_1",
+                attemptId = "att_android_stale_full",
+                leaseId = "lease_android_stale_full",
+                leaseEpoch = 1,
+            ),
+            requestId = "request_android_stale_full",
+            stageType = "full_inference",
+            providerId = "remote_android_worker_01",
+            leaseExpiresAtMs = 2_000,
+            rootInput = mapOf("message" to "hello"),
+            dependencies = emptyMap(),
+            modelIdentity = identity,
+            messageId = "msg_android_stale_full",
+            sentAtMs = 1_000,
+        )
 
     private fun layerForwardOffer(nEmbd: Int): TaskWorkerEnvelope {
         val inputBytes = ByteBuffer.allocate(nEmbd * 4).order(ByteOrder.LITTLE_ENDIAN)

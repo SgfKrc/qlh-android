@@ -21,6 +21,7 @@ import com.qlh.inference.network.ApiClient
 import com.qlh.inference.network.AndroidPresenceSnapshot
 import com.qlh.inference.network.AndroidPresenceState
 import com.qlh.inference.network.GgufModelInfo
+import com.qlh.inference.network.CurrentModelStatus
 import com.qlh.inference.network.httpBaseUrl
 import com.qlh.inference.network.ClientErrorReport
 import com.qlh.inference.network.BootstrapRequest
@@ -28,6 +29,8 @@ import com.qlh.inference.network.ChatRepository
 import com.qlh.inference.service.InferenceService
 import com.qlh.inference.service.AndroidPresenceService
 import com.qlh.inference.service.ModelManager
+import com.qlh.inference.service.ModelDirectoryGrantState
+import com.qlh.inference.service.LayerArtifactCandidate
 import com.qlh.inference.service.toCandidate
 import com.qlh.inference.service.unambiguousLayerArtifactCandidates
 import com.qlh.inference.status.AndroidRuntimeStatus
@@ -85,6 +88,7 @@ data class MainUiState(
 
     // 模型管理
     val modelTreeUri: String = "",
+    val modelDirectoryGrant: ModelDirectoryGrantState = ModelDirectoryGrantState(),
     val selectedModelUri: String = "",
     val modelStorageMode: String = SettingsDataStore.DEFAULT_MODEL_STORAGE_MODE,
     val availableModels: List<ModelManager.ModelDocument> = emptyList(),
@@ -125,6 +129,57 @@ data class MainUiState(
 // ================================================================
 // ViewModel
 // ================================================================
+
+internal data class StandaloneLayerIdentity(val modelId: String, val sourceSha256: String)
+
+internal fun reconcileRemoteModelMessage(
+    message: String?,
+    grant: ModelDirectoryGrantState,
+): String? = if (
+    grant.canDownload &&
+    (message?.contains("授权已失效") == true || message?.contains("授权失效") == true)
+) null else message
+
+internal fun coordinatorSourceModelId(status: CurrentModelStatus?): String =
+    status?.descriptor?.sourceModelId?.takeIf { it.isNotBlank() }
+        ?: status?.descriptor?.modelId?.takeIf { it.isNotBlank() }
+        ?: status?.modelId.orEmpty()
+
+private fun canUseStandaloneLayerIdentity(coordinatorModel: CurrentModelStatus?): Boolean =
+    coordinatorModel?.loaded != true && coordinatorModel?.pipelinePrepared != true &&
+        coordinatorModel?.descriptor == null && coordinatorModel?.modelId.isNullOrBlank()
+
+/** Only a uniquely selected, digest-verified crop can supply identity before a master descriptor exists. */
+internal fun standaloneLayerIdentity(
+    coordinatorModel: CurrentModelStatus?,
+    selectedModelUri: String,
+    selectedModelName: String,
+    selectedModelSizeBytes: Long,
+    selectedSha256: String,
+    verifiedArtifacts: List<LayerArtifactCandidate>,
+): StandaloneLayerIdentity? {
+    if (!canUseStandaloneLayerIdentity(coordinatorModel)) return null
+    val artifact = verifiedArtifacts.filter { it.reference == selectedModelUri }
+        .singleOrNull() ?: return null
+    val descriptor = artifact.descriptor
+    if (verifiedArtifacts.count {
+        it.descriptor.startLayer == descriptor.startLayer &&
+            it.descriptor.endLayerExclusive == descriptor.endLayerExclusive
+    } != 1) return null
+    val sha256 = Regex("[0-9a-fA-F]{64}")
+    val sourceModelId = descriptor.sourceModelId.orEmpty()
+    if (selectedModelUri.isBlank() || selectedModelUri != artifact.reference ||
+        !selectedModelName.endsWith(".gguf", ignoreCase = true) ||
+        selectedModelName != descriptor.artifactName || selectedModelSizeBytes <= 0L ||
+        !sha256.matches(selectedSha256) ||
+        !descriptor.artifactSha256.equals(selectedSha256, ignoreCase = true) ||
+        !sha256.matches(descriptor.sourceModelSha256) ||
+        !Regex("[A-Za-z0-9_.:-]{1,128}").matches(sourceModelId) ||
+        descriptor.hiddenSize == null || descriptor.hiddenSize <= 0 ||
+        !sha256.matches(descriptor.tokenizerSha256.orEmpty())
+    ) return null
+    return StandaloneLayerIdentity(sourceModelId, descriptor.sourceModelSha256.lowercase())
+}
 
 @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
 class MainViewModel(application: Application) : AndroidViewModel(application) {
@@ -180,6 +235,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 val topP = settings.getTopP()
                 val contextSize = settings.getContextSize()
                 val modelTreeUri = settings.getModelTreeUri()
+                val modelDirectoryGrant = modelManager.modelDirectoryGrantState(modelTreeUri)
                 val selectedModelUri = settings.getSelectedModelUri()
                 val storageMode = settings.getModelStorageMode()
                 val themeMode = settings.getThemeMode()
@@ -199,6 +255,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     topP = topP,
                     contextSize = contextSize,
                     modelTreeUri = modelTreeUri,
+                    modelDirectoryGrant = modelDirectoryGrant,
                     selectedModelUri = selectedModelUri,
                     modelStorageMode = storageMode,
                     themeMode = themeMode,
@@ -287,7 +344,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
         viewModelScope.launch {
             settings.modelTreeUri.collect { uri ->
-                _uiState.value = _uiState.value.copy(modelTreeUri = uri)
+                val grant = modelManager.modelDirectoryGrantState(uri)
+                _uiState.value = _uiState.value.copy(
+                    modelTreeUri = uri,
+                    modelDirectoryGrant = grant,
+                    remoteModelMessage = reconcileRemoteModelMessage(
+                        _uiState.value.remoteModelMessage,
+                        grant,
+                    ),
+                )
             }
         }
         viewModelScope.launch {
@@ -1243,9 +1308,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         //   `source_model_id` 同口径）为准；顶层 `model_id` 是**注册表 id**，两者不同名时
         //   用它过滤会把工件整片丢掉（真机表现为扫描 ok 但 ranges=[]）。仅在 descriptor
         //   缺失该字段时回退顶层 id（兼容旧服务端）。
-        val coordinatorModelId = coordinatorModel?.descriptor?.modelId
-            ?.takeIf { it.isNotBlank() }
-            ?: coordinatorModel?.modelId.orEmpty()
+        val coordinatorModelId = coordinatorSourceModelId(coordinatorModel)
         // ★ 2026-10-11（Y700 反复重选无效排查）：跨段校验必须用主节点报告的**源模型**摘要。
         //   主节点现在同时给出 `model_sha256`（**该段工件**的 sha，每段不同）与
         //   `source_model_sha256`（源模型 sha，三段共享）。此前只用前者 ⇒ 非主节点段
@@ -1257,40 +1320,55 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 ?.trim()?.lowercase().orEmpty()
         val hasCoordinatorIdentity = coordinatorModelId.isNotBlank() &&
             coordinatorSha256.matches(Regex("[a-f0-9]{64}"))
-        val layerArtifacts = if (hasCoordinatorIdentity) {
-            modelManager.listLayerArtifacts(
+        val noCoordinatorDescriptor = canUseStandaloneLayerIdentity(coordinatorModel)
+        val verifiedStandaloneArtifacts = if (noCoordinatorDescriptor && selected != null &&
+            selected.name.endsWith(".gguf", ignoreCase = true) && selected.sizeBytes > 0L &&
+            selectedSha256.matches(Regex("[a-fA-F0-9]{64}"))
+        ) {
+            modelManager.listLayerArtifacts(verifyArtifactDigest = true).getOrNull().orEmpty()
+        } else emptyList()
+        val layerArtifacts = when {
+            hasCoordinatorIdentity -> modelManager.listLayerArtifacts(
                 expectedModelSha256 = coordinatorSha256,
                 verifyArtifactDigest = false,
             ).getOrNull().orEmpty().filter {
                 it.sourceModelId == null || it.sourceModelId == coordinatorModelId
             }
-        } else emptyList()
-        val selectedIsCrop = selectedSha256.isNotBlank() && (
-            layerArtifacts.any { it.artifactSha256.equals(selectedSha256, ignoreCase = true) } ||
-                (!hasCoordinatorIdentity && modelManager.listLayerArtifacts(
-                    verifyArtifactDigest = false,
-                ).getOrNull().orEmpty().any {
+            noCoordinatorDescriptor -> verifiedStandaloneArtifacts.filter {
+                it.document.uri.toString() == selected?.uri?.toString() &&
                     it.artifactSha256.equals(selectedSha256, ignoreCase = true)
-                })
-            )
-        val hasFullModelIdentity = selectedModelId.isNotBlank() &&
+            }
+            else -> emptyList()
+        }
+        val selectedIsCrop = selectedSha256.isNotBlank() && layerArtifacts.any {
+            it.artifactSha256.equals(selectedSha256, ignoreCase = true)
+        }
+        val hasFullModelIdentity = hasCoordinatorIdentity && selectedModelId.isNotBlank() &&
             selectedSha256.matches(Regex("[a-fA-F0-9]{64}")) && !selectedIsCrop &&
             coordinatorModel?.pipelinePrepared != true &&
-            (!hasCoordinatorIdentity || selectedSha256.equals(coordinatorSha256, ignoreCase = true))
+            selectedSha256.equals(coordinatorSha256, ignoreCase = true)
         val publishableLayers = unambiguousLayerArtifactCandidates(
             layerArtifacts.map { it.toCandidate() },
         )
         val hasAmbiguousLayers = publishableLayers.size != layerArtifacts.size
+        val standaloneIdentity = if (noCoordinatorDescriptor) standaloneLayerIdentity(
+            coordinatorModel = coordinatorModel,
+            selectedModelUri = selected?.uri?.toString().orEmpty(),
+            selectedModelName = selected?.name.orEmpty(),
+            selectedModelSizeBytes = selected?.sizeBytes ?: 0L,
+            selectedSha256 = selectedSha256,
+            verifiedArtifacts = verifiedStandaloneArtifacts.map { it.toCandidate() },
+        ) else null
         val layerOnlyIdentity = !hasFullModelIdentity &&
-            hasCoordinatorIdentity && publishableLayers.isNotEmpty()
+            (hasCoordinatorIdentity && publishableLayers.isNotEmpty() || standaloneIdentity != null)
         val modelId = when {
             hasFullModelIdentity -> selectedModelId
-            layerOnlyIdentity -> coordinatorModelId
+            layerOnlyIdentity -> standaloneIdentity?.modelId ?: coordinatorModelId
             else -> ""
         }
         val modelSha256 = when {
             hasFullModelIdentity -> selectedSha256
-            layerOnlyIdentity -> coordinatorSha256
+            layerOnlyIdentity -> standaloneIdentity?.sourceSha256 ?: coordinatorSha256
             else -> ""
         }
         val resourceAdmitted = hasFullModelIdentity || layerOnlyIdentity
@@ -1299,7 +1377,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         // the distinction between full-model and layer-only admission.
         val resourceReason = when {
             resourceAdmitted -> ""
-            layerArtifacts.isNotEmpty() -> "layer_artifact_ambiguous"
+            layerArtifacts.isNotEmpty() && (hasCoordinatorIdentity || hasAmbiguousLayers) ->
+                "layer_artifact_ambiguous"
             hasCoordinatorIdentity -> "master_model_artifact_not_found"
             else -> "model_identity_not_verified"
         }
@@ -1533,15 +1612,33 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     // ==================== 模型管理 ====================
 
+    fun refreshModelDirectoryAuthorization() {
+        val current = _uiState.value
+        val grant = modelManager.modelDirectoryGrantState(current.modelTreeUri)
+        _uiState.value = current.copy(
+            modelDirectoryGrant = grant,
+            remoteModelMessage = reconcileRemoteModelMessage(
+                current.remoteModelMessage,
+                grant,
+            ),
+        )
+    }
+
     fun selectModelDirectory(treeUri: Uri) {
         viewModelScope.launch {
-            _uiState.value = _uiState.value.copy(isScanningModels = true, modelMessage = null)
+            _uiState.value = _uiState.value.copy(
+                isScanningModels = true,
+                modelMessage = null,
+                remoteModelMessage = null,
+            )
             unloadRunningModel()
             val result = modelManager.selectModelDirectory(treeUri)
             result.onSuccess { models ->
                 val selected = modelManager.getSelectedModel()
+                val grant = modelManager.modelDirectoryGrantState(treeUri.toString())
                 _uiState.value = _uiState.value.copy(
                     availableModels = models,
+                    modelDirectoryGrant = grant,
                     selectedModelUri = selected?.uri?.toString().orEmpty(),
                     selectedModelName = selected?.name.orEmpty(),
                     selectedModelSizeBytes = selected?.sizeBytes ?: 0L,
@@ -1555,7 +1652,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 ensureAndroidTaskWorker()
                 refreshRuntimeStatus()
             }.onFailure { e ->
+                val grant = modelManager.modelDirectoryGrantState(_uiState.value.modelTreeUri)
                 _uiState.value = _uiState.value.copy(
+                    modelDirectoryGrant = grant,
                     isScanningModels = false,
                     modelMessage = "目录授权失败: ${e.message}"
                 )
@@ -1569,8 +1668,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             val result = modelManager.listModels()
             result.onSuccess { models ->
                 val selected = modelManager.getSelectedModel()
+                val grant = modelManager.modelDirectoryGrantState(_uiState.value.modelTreeUri)
                 _uiState.value = _uiState.value.copy(
                     availableModels = models,
+                    modelDirectoryGrant = grant,
                     selectedModelName = selected?.name.orEmpty(),
                     selectedModelSizeBytes = selected?.sizeBytes ?: 0L,
                     selectedModelUri = selected?.uri?.toString().orEmpty(),
@@ -1581,11 +1682,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         } else "已扫描到 ${models.size} 个模型"
                     } else {
                         null
-                    }
+                    },
+                    remoteModelMessage = reconcileRemoteModelMessage(
+                        _uiState.value.remoteModelMessage,
+                        grant,
+                    ),
                 )
             }.onFailure { e ->
+                val grant = modelManager.modelDirectoryGrantState(_uiState.value.modelTreeUri)
                 _uiState.value = _uiState.value.copy(
                     availableModels = emptyList(),
+                    modelDirectoryGrant = grant,
                     isScanningModels = false,
                     modelMessage = "扫描失败: ${e.message}"
                 )
@@ -1692,7 +1799,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 throw error
             } catch (error: Exception) {
                 QlhLogger.e("MainViewModel", "remote model download failed", error)
+                val grant = modelManager.modelDirectoryGrantState(_uiState.value.modelTreeUri)
                 _uiState.value = _uiState.value.copy(
+                    modelDirectoryGrant = grant,
                     remoteModelMessage = "模型下载失败: ${error.message ?: error.javaClass.simpleName}",
                 )
             } finally {

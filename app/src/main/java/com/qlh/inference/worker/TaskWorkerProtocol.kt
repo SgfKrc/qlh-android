@@ -662,6 +662,10 @@ object TaskWorkerProtocol {
                     setOf("source_model_sha256")
                 } else {
                     emptySet()
+                } + if (artifact.containsKey("layer_weight_bytes")) {
+                    setOf("layer_weight_bytes")
+                } else {
+                    emptySet()
                 }
                 val modelPreflightFields = setOf(
                     "source_model_id", "hidden_size", "tokenizer_sha256",
@@ -686,6 +690,10 @@ object TaskWorkerProtocol {
                     field,
                 )
                 val range = capabilityLayerRange(artifact["layer_range"], "$field.layer_range")
+                if (artifact.containsKey("layer_weight_bytes")) {
+                    validateLayerWeightBytes(artifact["layer_weight_bytes"], range.second - range.first,
+                        "$field.layer_weight_bytes")
+                }
                 if (!artifactRanges.add(range)) {
                     fail(
                         "capabilities.layer_artifacts must not contain duplicate ranges",
@@ -1242,6 +1250,22 @@ object TaskWorkerProtocol {
             return null
         }
         return number.toInt()
+    }
+
+    private fun validateLayerWeightBytes(value: Any?, expectedSize: Int?, field: String) {
+        val sizes = value as? List<*>
+        if (sizes == null || sizes.isEmpty() || (expectedSize != null && sizes.size != expectedSize)) {
+            fail("layer_weight_bytes must match the segment span", "invalid_capabilities", field)
+        }
+        sizes.forEachIndexed { index, size ->
+            val number = size as? Number
+            val exact = number?.toLong()
+            if (number == null || number is Double || number is Float ||
+                exact == null || exact <= 0L || number.toString() != exact.toString()) {
+                fail("layer_weight_bytes entries must be positive integers", "invalid_capabilities",
+                    "$field[$index]")
+            }
+        }
     }
 
     private fun objectValue(container: Map<String, Any?>, key: String): Map<String, Any?> {

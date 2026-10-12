@@ -349,6 +349,7 @@ data class ServerModelsResponse(
 /** Runtime status deliberately excludes server filesystem paths. */
 data class CurrentModelDescriptor(
     @SerializedName("model_sha256") val modelSha256: String = "",
+    @SerializedName("source_model_id") val sourceModelId: String = "",
     // ★ 2026-10-11（Y700 反复重选无效排查）：主节点报告的**源模型**摘要（三段共享）。
     //   裁层工件的跨段校验必须用它 —— 每段的 `artifact_sha256` 天然不同（head/tail 各异），
     //   只有 `source_model_sha256` 在三段间相同；服务端此前把它过滤掉了

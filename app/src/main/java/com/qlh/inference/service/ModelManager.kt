@@ -18,6 +18,7 @@ import com.qlh.inference.network.GgufModelInfo
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
@@ -31,7 +32,34 @@ import java.io.FileOutputStream
 import java.io.IOException
 import java.security.MessageDigest
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.TimeUnit
+
+internal suspend fun verifyExpectedArtifactDigest(
+    expectedSha256: String,
+    readDigest: suspend (refresh: Boolean) -> String,
+): Boolean {
+    for (refresh in listOf(false, true)) {
+        try {
+            if (readDigest(refresh).equals(expectedSha256, ignoreCase = true)) return true
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            // A fresh, full-byte pass below is the only recovery path.
+        }
+    }
+    return false
+}
+
+data class ModelDirectoryGrantState(
+    val selected: Boolean = false,
+    val readGranted: Boolean = false,
+    val writeGranted: Boolean = false,
+) {
+    val canScan: Boolean get() = selected && readGranted
+    val canDownload: Boolean get() = canScan && writeGranted
+}
 
 /**
  * GGUF 模型文件管理器。
@@ -59,6 +87,7 @@ class ModelManager(private val context: Context) {
         private val verifiedModelDigests = VerifiedModelDigestCache(
             clockMs = { android.os.SystemClock.elapsedRealtime() },
         )
+        private val verifiedModelDigestEpochs = ConcurrentHashMap<String, AtomicLong>()
     }
 
     private val settings = SettingsDataStore(context)
@@ -453,16 +482,15 @@ class ModelManager(private val context: Context) {
                             name = { it.name },
                             verifyArtifactDigest = verifyArtifactDigest,
                             verify = { candidate ->
-                                try {
-                                    verifiedSha256(candidate.uri, storageScope) { reused ->
+                                verifyExpectedArtifactDigest(parsed.artifactSha256) { refresh ->
+                                    if (refresh) delay(100L)
+                                    verifiedSha256(
+                                        candidate.uri,
+                                        storageScope,
+                                        forceRefresh = refresh,
+                                    ) { reused ->
                                         if (reused) digestReused++ else digestStreamed++
-                                    }.equals(
-                                        parsed.artifactSha256, ignoreCase = true,
-                                    )
-                                } catch (cancelled: CancellationException) {
-                                    throw cancelled
-                                } catch (_: Exception) {
-                                    false
+                                    }
                                 }
                             },
                         )
@@ -574,24 +602,24 @@ class ModelManager(private val context: Context) {
     private suspend fun verifiedSha256(
         uri: Uri,
         storageScope: String,
+        forceRefresh: Boolean = false,
         onLookup: (Boolean) -> Unit = {},
-    ): String = verifiedModelDigests.digest(
-        "$storageScope|$uri", { fileFingerprint(uri) }, onLookup,
-    ) {
-        computeSha256(uri)
+    ): String {
+        val documentIdentity = "$storageScope|$uri"
+        val epoch = verifiedModelDigestEpochs.computeIfAbsent(documentIdentity) { AtomicLong() }
+        if (forceRefresh) epoch.incrementAndGet()
+        val version = fileVersionToken(uri) ?: "unversioned"
+        return verifiedModelDigests.digest(
+            "$documentIdentity|$version|${epoch.get()}",
+            { fileFingerprint(uri) },
+            onLookup,
+        ) {
+            computeSha256(uri)
+        }
     }
 
     private fun fileFingerprint(uri: Uri): ModelFileFingerprint? = runCatching {
-        val stat = if (uri.scheme == "file") {
-            val file = File(uri.path.orEmpty())
-            if (file.isFile && file.canRead()) Os.stat(file.canonicalPath) else null
-        } else if (uri.scheme == "content" &&
-            uri.authority == "com.android.externalstorage.documents"
-        ) {
-            context.contentResolver.openFileDescriptor(uri, "r")?.use { descriptor ->
-                Os.fstat(descriptor.fileDescriptor)
-            }
-        } else null
+        val stat = statDigestFile(uri)
         stat?.takeIf {
             OsConstants.S_ISREG(it.st_mode) && it.st_ino > 0L &&
                 it.st_size >= 0L && it.st_ctime > 0L
@@ -604,6 +632,55 @@ class ModelManager(private val context: Context) {
                 changedSeconds = valid.st_ctime,
             )
         }
+    }.getOrNull()
+
+    private fun fileVersionToken(uri: Uri): String? = runCatching {
+        statDigestFile(uri)?.takeIf {
+            OsConstants.S_ISREG(it.st_mode) && it.st_ino > 0L && it.st_size >= 0L
+        }?.let(::statVersionToken)
+    }.getOrNull()
+
+    private fun statDigestFile(uri: Uri): android.system.StructStat? = when {
+        uri.scheme == "file" -> {
+            val file = File(uri.path.orEmpty())
+            if (file.isFile && file.canRead()) Os.stat(file.canonicalPath) else null
+        }
+        uri.scheme == "content" &&
+            uri.authority == "com.android.externalstorage.documents" -> {
+            context.contentResolver.openFileDescriptor(uri, "r")?.use { descriptor ->
+                Os.fstat(descriptor.fileDescriptor)
+            }
+        }
+        else -> null
+    }
+
+    private fun statVersionToken(stat: android.system.StructStat): String = listOf(
+        stat.st_dev,
+        stat.st_ino,
+        stat.st_size,
+        stat.st_mtim.tv_sec,
+        stat.st_mtim.tv_nsec,
+        stat.st_ctim.tv_sec,
+        stat.st_ctim.tv_nsec,
+    ).joinToString(":")
+
+    private fun openDigestDescriptor(uri: Uri): ParcelFileDescriptor {
+        if (uri.scheme == "file") {
+            val file = File(uri.path.orEmpty())
+            if (!file.isFile || !file.canRead()) {
+                throw IOException("model artifact is not readable: ${file.name}")
+            }
+            return ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
+        }
+        return context.contentResolver.openFileDescriptor(uri, "r")
+            ?: throw IOException("cannot open model artifact for SHA-256 verification")
+    }
+
+    private fun descriptorVersionToken(descriptor: ParcelFileDescriptor): String? = runCatching {
+        val stat = Os.fstat(descriptor.fileDescriptor)
+        stat.takeIf {
+            OsConstants.S_ISREG(it.st_mode) && it.st_ino > 0L && it.st_size >= 0L
+        }?.let(::statVersionToken)
     }.getOrNull()
 
     private suspend fun openModelHandle(uri: Uri, preferFd: Boolean): Result<ModelOpenHandle> {
@@ -698,10 +775,24 @@ class ModelManager(private val context: Context) {
         }
     }
 
-    suspend fun hasModelDirectoryPermission(): Boolean {
-        val treeUri = getSavedTreeUri() ?: return false
-        return hasPersistedPermission(treeUri)
+    suspend fun modelDirectoryGrantState(): ModelDirectoryGrantState =
+        modelDirectoryGrantState(settings.getModelTreeUri())
+
+    fun modelDirectoryGrantState(treeUri: String): ModelDirectoryGrantState {
+        if (treeUri.isBlank()) return ModelDirectoryGrantState()
+        val selectedUri = runCatching { Uri.parse(treeUri) }.getOrNull()
+            ?: return ModelDirectoryGrantState(selected = true)
+        val matching = context.contentResolver.persistedUriPermissions.filter {
+            sameSafTree(it.uri, selectedUri)
+        }
+        return ModelDirectoryGrantState(
+            selected = true,
+            readGranted = matching.any { it.isReadPermission },
+            writeGranted = matching.any { it.isWritePermission },
+        )
     }
+
+    suspend fun hasModelDirectoryPermission(): Boolean = modelDirectoryGrantState().canScan
 
     /**
      * Inspect the fixed Gemma4 native model/mmproj pair without opening either file.
@@ -901,10 +992,15 @@ class ModelManager(private val context: Context) {
         return value.takeIf { it.isNotBlank() }?.let(Uri::parse)
     }
 
-    private fun hasPersistedPermission(uri: Uri): Boolean {
-        return context.contentResolver.persistedUriPermissions.any {
-            it.uri == uri && it.isReadPermission
-        }
+    private fun hasPersistedPermission(uri: Uri): Boolean =
+        modelDirectoryGrantState(uri.toString()).canScan
+
+    private fun sameSafTree(left: Uri, right: Uri): Boolean {
+        if (left == right) return true
+        if (left.scheme != right.scheme || left.authority != right.authority) return false
+        val leftId = runCatching { DocumentsContract.getTreeDocumentId(left) }.getOrNull()
+        val rightId = runCatching { DocumentsContract.getTreeDocumentId(right) }.getOrNull()
+        return leftId != null && leftId == rightId
     }
 
     private fun queryContentModel(uri: Uri): ModelDocument? {
@@ -971,7 +1067,7 @@ class ModelManager(private val context: Context) {
         validateRemoteModel(model)
         val treeUri = getSavedTreeUri()
             ?: throw IOException("请先选择模型存储目录")
-        if (!hasPersistedPermission(treeUri)) {
+        if (!modelDirectoryGrantState(treeUri.toString()).canDownload) {
             throw IOException("模型目录授权已失效，请重新选择目录")
         }
 
@@ -1180,20 +1276,24 @@ class ModelManager(private val context: Context) {
 
     private suspend fun computeSha256(uri: Uri): String {
         val digest = MessageDigest.getInstance("SHA-256")
-        val input = if (uri.scheme == "file") {
-            File(uri.path.orEmpty()).inputStream()
-        } else {
-            context.contentResolver.openInputStream(uri)
-        }
-        input?.use { stream ->
+        val descriptor = openDigestDescriptor(uri)
+        val input = ParcelFileDescriptor.AutoCloseInputStream(descriptor)
+        try {
+            val before = descriptorVersionToken(descriptor)
             val buffer = ByteArray(1024 * 1024)
             while (true) {
                 currentCoroutineContext().ensureActive()
-                val count = stream.read(buffer)
+                val count = input.read(buffer)
                 if (count < 0) break
                 digest.update(buffer, 0, count)
             }
-        } ?: throw IOException("无法读取模型文件进行 SHA-256 校验")
+            val after = descriptorVersionToken(descriptor)
+            if (before != null && before != after) {
+                throw IOException("model artifact changed during SHA-256 verification")
+            }
+        } finally {
+            input.close()
+        }
         return digest.digest().joinToString("") { "%02x".format(it) }
     }
 

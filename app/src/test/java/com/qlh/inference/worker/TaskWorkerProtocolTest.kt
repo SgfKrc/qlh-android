@@ -378,6 +378,54 @@ class TaskWorkerProtocolTest {
     }
 
     @Test
+    fun `hello accepts exact local layer sizes and legacy omissions`() {
+        val sizes = List(12) { (it + 1).toLong() }
+        val artifact = validArtifact() + ("layer_weight_bytes" to sizes)
+        val capabilities = artifactCapabilities(artifact)
+        val hello = TaskWorkerProtocol.buildHello(
+            nodeId = "android_worker_01",
+            capabilities = capabilities,
+            messageId = "msg_layer_bytes_01",
+            sentAtMs = 1_700_000_000_000,
+        )
+        TaskWorkerProtocol.validate(TaskWorkerProtocol.decode(TaskWorkerProtocol.encode(hello)))
+        val withTopLevel = capabilities + ("layer_weight_bytes" to sizes)
+        expectProtocolError("invalid_fields") {
+            TaskWorkerProtocol.validate(TaskWorkerProtocol.buildHello(
+                nodeId = "android_worker_01", capabilities = withTopLevel,
+                messageId = "msg_layer_bytes_top_01", sentAtMs = 1_700_000_000_000,
+            ))
+        }
+        TaskWorkerProtocol.validate(TaskWorkerProtocol.buildHello(
+            nodeId = "android_worker_01", capabilities = artifactCapabilities(),
+            messageId = "msg_layer_bytes_legacy_01", sentAtMs = 1_700_000_000_000,
+        ))
+        listOf(
+            emptyList<Long>(), listOf(1L), List(12) { 0L },
+            List(12) { -1L }, List(12) { 1.5 }, List(12) { "1" },
+            List(12) { true },
+        ).forEachIndexed { index, invalid ->
+            expectProtocolError("invalid_capabilities") {
+                TaskWorkerProtocol.validate(TaskWorkerProtocol.buildHello(
+                    nodeId = "android_worker_01",
+                    capabilities = artifactCapabilities(validArtifact() +
+                        ("layer_weight_bytes" to invalid)),
+                    messageId = "msg_layer_bytes_bad_$index",
+                    sentAtMs = 1_700_000_000_000,
+                ))
+            }
+        }
+        expectProtocolError("invalid_fields") {
+            TaskWorkerProtocol.validate(TaskWorkerProtocol.buildHello(
+                nodeId = "android_worker_01",
+                capabilities = artifactCapabilities(validArtifact() + ("unknown_key" to 1)),
+                messageId = "msg_layer_bytes_unknown_01",
+                sentAtMs = 1_700_000_000_000,
+            ))
+        }
+    }
+
+    @Test
     fun `hello rejects artifact without matching advertised model identity`() {
         val capabilities = artifactCapabilities().toMutableMap()
         capabilities["models"] = emptyList<Map<String, Any?>>()

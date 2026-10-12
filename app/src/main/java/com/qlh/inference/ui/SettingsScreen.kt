@@ -7,6 +7,7 @@ import android.content.Intent
 import android.net.Uri
 import com.qlh.inference.BuildConfig
 import com.qlh.inference.data.SettingsDataStore
+import com.qlh.inference.service.ModelDirectoryGrantState
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.border
@@ -181,6 +182,7 @@ fun SettingsScreen(
     showThinking: Boolean,
     themeMode: String,
     modelTreeUri: String,
+    modelDirectoryGrant: ModelDirectoryGrantState = ModelDirectoryGrantState(),
     selectedModelUri: String,
     modelStorageMode: String,
     availableModels: List<ModelManager.ModelDocument>,
@@ -342,6 +344,7 @@ fun SettingsScreen(
                 SettingsGroup(title = "模型管理", icon = Icons.Default.FolderOpen) {
                     ModelManagementPanel(
                         modelTreeUri = modelTreeUri,
+                        modelDirectoryGrant = modelDirectoryGrant,
                         selectedModelUri = selectedModelUri,
                         modelStorageMode = modelStorageMode,
                         availableModels = availableModels,
@@ -359,6 +362,7 @@ fun SettingsScreen(
                 SettingsGroup(title = "主节点模型", icon = Icons.Default.CloudDownload) {
                     RemoteModelPanel(
                         modelTreeUri = modelTreeUri,
+                        modelDirectoryGrant = modelDirectoryGrant,
                         models = remoteModels,
                         loading = remoteModelsLoading,
                         activeModelName = remoteDownloadModelName,
@@ -1835,6 +1839,7 @@ private fun ParamLabel(label: String, value: String) {
 @Composable
 private fun RemoteModelPanel(
     modelTreeUri: String,
+    modelDirectoryGrant: ModelDirectoryGrantState,
     models: List<GgufModelInfo>,
     loading: Boolean,
     activeModelName: String?,
@@ -1873,9 +1878,14 @@ private fun RemoteModelPanel(
             }
         }
 
-        if (modelTreeUri.isBlank()) {
+        if (!modelDirectoryGrant.canDownload) {
             Text(
-                text = "请先在模型管理中选择存储目录。",
+                text = when {
+                    modelTreeUri.isBlank() -> "请先在模型管理中选择存储目录。"
+                    modelDirectoryGrant.canScan ->
+                        "当前 SAF 目录只有读取授权；下载需要重新选择目录并授予写入权限。"
+                    else -> "已保存的 SAF 目录授权已失效，请重新选择目录。"
+                },
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.error,
             )
@@ -1950,7 +1960,7 @@ private fun RemoteModelPanel(
                             }
                             OutlinedButton(
                                 onClick = { onDownload(model) },
-                                enabled = modelTreeUri.isNotBlank() && !busy && !loading,
+                                enabled = modelDirectoryGrant.canDownload && !busy && !loading,
                                 modifier = Modifier.testTag("remote_model_download_${model.filename}"),
                                 colors = androidx.compose.material3.ButtonDefaults.outlinedButtonColors(
                                     contentColor = qlhBrandGold(),
@@ -1984,6 +1994,7 @@ private fun RemoteModelPanel(
 @Composable
 private fun ModelManagementPanel(
     modelTreeUri: String,
+    modelDirectoryGrant: ModelDirectoryGrantState,
     selectedModelUri: String,
     modelStorageMode: String,
     availableModels: List<ModelManager.ModelDocument>,
@@ -2003,9 +2014,7 @@ private fun ModelManagementPanel(
         Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
             StatusRow(
                 label = "存储位置",
-                value = if (modelTreeUri.isBlank()) {
-                    "默认 Download/QLH/models（无授权时可能不可读）"
-                } else "SAF 外部目录（授权失效需重新选择）"
+                value = modelDirectoryStatusLabel(modelTreeUri, modelDirectoryGrant),
             )
             StatusRow(
                 label = "当前模型",
@@ -2191,6 +2200,16 @@ private fun ModelRow(
             )
         }
     }
+}
+
+internal fun modelDirectoryStatusLabel(
+    modelTreeUri: String,
+    grant: ModelDirectoryGrantState,
+): String = when {
+    modelTreeUri.isBlank() -> "默认 Download/QLH/models（无授权时可能不可读）"
+    grant.canDownload -> "SAF 外部目录（读写授权有效）"
+    grant.canScan -> "SAF 外部目录（仅有读取授权）"
+    else -> "SAF 外部目录（授权已失效）"
 }
 
 private fun storageModeLabel(mode: String): String = when (mode) {

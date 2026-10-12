@@ -259,6 +259,32 @@ class AndroidWorkerCapabilitiesTest {
     }
 
     @Test
+    fun `layer sizes are local optional and fail closed when malformed`() {
+        val sizes = listOf(18L, 36L)
+        val artifact = AndroidWorkerCapabilities.LayerArtifactCapability(
+            startLayer = 24, endLayerExclusive = 26, segmentMode = "middle",
+            modelId = "mid24-26.gguf", artifactSha256 = "a".repeat(64),
+            layerWeightBytes = sizes,
+        )
+        assertEquals(sizes, artifact.toMap()["layer_weight_bytes"])
+        val advertised = AndroidWorkerCapabilities.build(
+            fullInferenceAvailable = false, layerArtifacts = listOf(artifact),
+        )
+        TaskWorkerProtocol.validate(TaskWorkerProtocol.buildHello(
+            nodeId = "android_layer_bytes_01", capabilities = advertised,
+            messageId = "msg_android_layer_bytes_01", sentAtMs = 1_700_000_000_000,
+        ))
+        assertFalse(artifact.copy(layerWeightBytes = null).toMap().containsKey("layer_weight_bytes"))
+        listOf(emptyList(), listOf(18L), listOf(18L, 0L)).forEach { invalid ->
+            try {
+                artifact.copy(layerWeightBytes = invalid)
+                org.junit.Assert.fail("invalid local layer sizes were accepted")
+            } catch (_: IllegalArgumentException) {
+            }
+        }
+    }
+
+    @Test
     fun `homogeneous artifacts emit legacy global mode`() {
         val capabilities = AndroidWorkerCapabilities.build(
             resourceAdmitted = true,

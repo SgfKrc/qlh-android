@@ -10,6 +10,7 @@ import com.qlh.inference.network.ClusterNode
 import com.qlh.inference.network.ClusterStatus
 import com.qlh.inference.network.ClusterTask
 import com.qlh.inference.network.CurrentModelStatus
+import com.qlh.inference.network.CurrentModelDescriptor
 import com.qlh.inference.network.AuditAttemptSummary
 import com.qlh.inference.network.AuditData
 import com.qlh.inference.network.AuditReviewTicketsResponse
@@ -24,6 +25,10 @@ import com.qlh.inference.network.LocalModelAssetsSummary
 import com.qlh.inference.network.MasterModelFleetData
 import com.qlh.inference.network.ServerModelSummary
 import com.qlh.inference.network.ServerModelsResponse
+import com.qlh.inference.service.LayerArtifactCandidate
+import com.qlh.inference.service.LayerArtifactDescriptor
+import com.qlh.inference.service.ModelDirectoryGrantState
+import com.qlh.inference.ui.modelDirectoryStatusLabel
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -36,6 +41,80 @@ import org.junit.Test
  * MainViewModel 纯逻辑与 UI 状态默认值测试（JVM，无需设备）。
  */
 class MainViewModelLogicTest {
+
+    @Test
+    fun `SAF status reports the persisted grant instead of the saved URI alone`() {
+        val selected = "content://com.android.externalstorage.documents/tree/primary%3ADownload"
+        assertEquals(
+            "默认 Download/QLH/models（无授权时可能不可读）",
+            modelDirectoryStatusLabel("", ModelDirectoryGrantState()),
+        )
+        assertEquals(
+            "SAF 外部目录（授权已失效）",
+            modelDirectoryStatusLabel(selected, ModelDirectoryGrantState(selected = true)),
+        )
+        assertEquals(
+            "SAF 外部目录（仅有读取授权）",
+            modelDirectoryStatusLabel(
+                selected,
+                ModelDirectoryGrantState(selected = true, readGranted = true),
+            ),
+        )
+        assertEquals(
+            "SAF 外部目录（读写授权有效）",
+            modelDirectoryStatusLabel(
+                selected,
+                ModelDirectoryGrantState(
+                    selected = true,
+                    readGranted = true,
+                    writeGranted = true,
+                ),
+            ),
+        )
+    }
+
+    @Test
+    fun `successful SAF grant clears only stale authorization failure`() {
+        val granted = ModelDirectoryGrantState(
+            selected = true,
+            readGranted = true,
+            writeGranted = true,
+        )
+        assertNull(reconcileRemoteModelMessage("模型下载失败: 模型目录授权已失效", granted))
+        assertEquals(
+            "模型下载失败: checksum mismatch",
+            reconcileRemoteModelMessage("模型下载失败: checksum mismatch", granted),
+        )
+        assertEquals(
+            "模型下载失败: 模型目录授权已失效",
+            reconcileRemoteModelMessage(
+                "模型下载失败: 模型目录授权已失效",
+                ModelDirectoryGrantState(selected = true, readGranted = true),
+            ),
+        )
+    }
+
+    @Test
+    fun `coordinator source identity wins over registry alias`() {
+        val status = CurrentModelStatus(
+            modelId = "top-level-alias",
+            descriptor = CurrentModelDescriptor(
+                sourceModelId = "qwen3-5-9b",
+                modelId = "descriptor-alias",
+            ),
+        )
+        assertEquals("qwen3-5-9b", coordinatorSourceModelId(status))
+        assertEquals(
+            "descriptor-alias",
+            coordinatorSourceModelId(
+                status.copy(descriptor = status.descriptor?.copy(sourceModelId = "")),
+            ),
+        )
+        assertEquals(
+            "top-level-alias",
+            coordinatorSourceModelId(status.copy(descriptor = null)),
+        )
+    }
 
     // ---- networkTypeFromTransports ----
 
@@ -314,6 +393,135 @@ class MainViewModelLogicTest {
             assertEquals(readyPresence[key], readyWorker[key])
         }
         assertCapabilityFieldsAreConsistent(readyWorker)
+    }
+
+    // ---- prepare-only 冷启动工件身份 ----
+
+    private val cropSourceSha = "a".repeat(64)
+    private val cropArtifactSha = "b".repeat(64)
+    private val cropUri = "content://models/segment.gguf"
+
+    private fun cropCandidate(): LayerArtifactCandidate = LayerArtifactCandidate(
+        descriptor = LayerArtifactDescriptor(
+            artifactName = "segment.gguf",
+            startLayer = 4,
+            endLayerExclusive = 16,
+            artifactSha256 = cropArtifactSha,
+            sourceModelSha256 = cropSourceSha,
+            sourceModelId = "qwen3-5-2b",
+            hiddenSize = 2048,
+            tokenizerSha256 = "e".repeat(64),
+            architecture = "qwen35",
+            mode = "middle",
+        ),
+        reference = cropUri,
+        manifestName = "segment.manifest.json",
+        root = LayerArtifactCandidate.Root.SAF,
+    )
+
+    private fun cropIdentity(
+        coordinatorModel: CurrentModelStatus? = null,
+        selectedUri: String = cropUri,
+        selectedName: String = "segment.gguf",
+        selectedSizeBytes: Long = 1024L,
+        selectedSha256: String = cropArtifactSha,
+        verifiedArtifacts: List<LayerArtifactCandidate> = listOf(cropCandidate()),
+    ): StandaloneLayerIdentity? = standaloneLayerIdentity(
+        coordinatorModel = coordinatorModel,
+        selectedModelUri = selectedUri,
+        selectedModelName = selectedName,
+        selectedModelSizeBytes = selectedSizeBytes,
+        selectedSha256 = selectedSha256,
+        verifiedArtifacts = verifiedArtifacts,
+    )
+
+    @Test
+    fun `unloaded master without descriptor can advertise selected verified crop source identity`() {
+        val expected = StandaloneLayerIdentity("qwen3-5-2b", cropSourceSha)
+        assertEquals(expected, cropIdentity())
+        assertEquals(expected, cropIdentity(coordinatorModel = CurrentModelStatus(loaded = false)))
+        assertFalse(expected.sourceSha256 == cropArtifactSha)
+    }
+
+    @Test
+    fun `standalone crop requires explicit matching gguf selection and artifact bytes`() {
+        assertNull(cropIdentity(selectedUri = ""))
+        assertNull(cropIdentity(selectedUri = "content://models/other.gguf"))
+        assertNull(cropIdentity(selectedName = "other.gguf"))
+        assertNull(cropIdentity(selectedName = "segment.bin"))
+        assertNull(cropIdentity(selectedSizeBytes = 0L))
+        assertNull(cropIdentity(selectedSha256 = ""))
+        assertNull(cropIdentity(selectedSha256 = "c".repeat(64)))
+        assertNull(cropIdentity(verifiedArtifacts = emptyList()))
+    }
+
+    @Test
+    fun `standalone crop rejects incomplete or invalid manifest preflight identity`() {
+        val candidate = cropCandidate()
+        val invalid = listOf(
+            candidate.copy(descriptor = candidate.descriptor.copy(sourceModelId = null)),
+            candidate.copy(descriptor = candidate.descriptor.copy(sourceModelId = "bad/id")),
+            candidate.copy(descriptor = candidate.descriptor.copy(sourceModelSha256 = "")),
+            candidate.copy(descriptor = candidate.descriptor.copy(hiddenSize = null)),
+            candidate.copy(descriptor = candidate.descriptor.copy(hiddenSize = 0)),
+            candidate.copy(descriptor = candidate.descriptor.copy(tokenizerSha256 = null)),
+            candidate.copy(descriptor = candidate.descriptor.copy(tokenizerSha256 = "invalid")),
+            candidate.copy(descriptor = candidate.descriptor.copy(artifactSha256 = "invalid")),
+        )
+        invalid.forEach { assertNull(cropIdentity(verifiedArtifacts = listOf(it))) }
+    }
+
+    @Test
+    fun `standalone crop accepts selected artifact alongside other distinct crop`() {
+        val selected = cropCandidate().copy(
+            descriptor = cropCandidate().descriptor.copy(startLayer = 24, endLayerExclusive = 32),
+        )
+        val other = cropCandidate().copy(
+            descriptor = cropCandidate().descriptor.copy(
+                artifactName = "other.gguf",
+                artifactSha256 = "c".repeat(64),
+                startLayer = 20,
+                endLayerExclusive = 24,
+            ),
+            reference = "content://models/other.gguf",
+        )
+        assertEquals(
+            StandaloneLayerIdentity("qwen3-5-2b", cropSourceSha),
+            cropIdentity(verifiedArtifacts = listOf(other, selected)),
+        )
+    }
+
+    @Test
+    fun `standalone crop rejects duplicate selected reference and conflicting interval`() {
+        val candidate = cropCandidate()
+        val sameFileOtherManifest = candidate.copy(
+            descriptor = candidate.descriptor.copy(sourceModelId = "other-source"),
+        )
+        val sameFileOtherRange = candidate.copy(
+            descriptor = candidate.descriptor.copy(startLayer = 16, endLayerExclusive = 24),
+        )
+        val otherFile = candidate.copy(
+            descriptor = candidate.descriptor.copy(artifactName = "other.gguf"),
+            reference = "content://models/other.gguf",
+        )
+        assertNull(cropIdentity(verifiedArtifacts = listOf(candidate, sameFileOtherManifest)))
+        assertNull(cropIdentity(verifiedArtifacts = listOf(candidate, sameFileOtherRange)))
+        assertNull(cropIdentity(verifiedArtifacts = listOf(candidate, otherFile)))
+    }
+
+    @Test
+    fun `master identity or active status never falls back to selected crop identity`() {
+        val descriptor = CurrentModelDescriptor(
+            modelId = "other-model",
+            sourceModelSha256 = "c".repeat(64),
+        )
+        listOf(
+            CurrentModelStatus(loaded = true),
+            CurrentModelStatus(pipelinePrepared = true),
+            CurrentModelStatus(modelId = "registry-id"),
+            CurrentModelStatus(descriptor = descriptor),
+            CurrentModelStatus(descriptor = CurrentModelDescriptor()),
+        ).forEach { assertNull(cropIdentity(coordinatorModel = it)) }
     }
 
     // ---- MainUiState 默认值 ----

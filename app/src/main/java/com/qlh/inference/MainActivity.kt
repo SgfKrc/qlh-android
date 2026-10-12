@@ -109,6 +109,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        viewModel.refreshModelDirectoryAuthorization()
         viewModel.refreshAppInstallPermission()
         // ★ 2026-10-08（goal ①-B）：电池优化豁免状态随 resume 刷新 —— 用户从系统对话框回来后
         //   设置页要立刻反映"已豁免"，否则"状态可见"就只是静态快照。
@@ -216,6 +217,7 @@ fun MainApp(
                 onShowThinkingChange = { /* no-op for now */ },
                 onThemeModeChange = { viewModel.setThemeMode(it) },
                 modelTreeUri = uiState.modelTreeUri,
+                modelDirectoryGrant = uiState.modelDirectoryGrant,
                 selectedModelUri = uiState.selectedModelUri,
                 modelStorageMode = uiState.modelStorageMode,
                 availableModels = uiState.availableModels,

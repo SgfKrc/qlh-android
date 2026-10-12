@@ -72,6 +72,60 @@ class ModelStorageScanTest {
     }
 
     @Test
+    fun `new GGUF among sibling artifacts refreshes stale cache against actual bytes`() = runBlocking {
+        data class DigestCandidate(
+            val parent: String,
+            val name: String,
+            val cachedDigest: String,
+            val actualDigest: String,
+        )
+
+        val oldDigest = "a".repeat(64)
+        val newDigest = "b".repeat(64)
+        val candidates = listOf(
+            DigestCandidate("models", "q35-9b-c.gguf", oldDigest, oldDigest),
+            DigestCandidate("other", "q35-9b-local-tail24-32.gguf", "wrong", "wrong"),
+            DigestCandidate(
+                "models",
+                "q35-9b-local-tail24-32.gguf",
+                cachedDigest = oldDigest,
+                actualDigest = newDigest,
+            ),
+            DigestCandidate("models", "q35-9b-local-tail24-32.gguf.bak", "wrong", "wrong"),
+        )
+        val reads = mutableListOf<String>()
+
+        suspend fun pair(expectedDigest: String): Pair<DigestCandidate, Boolean>? =
+            pairLayerArtifactVerified(
+                manifestParentId = "models",
+                artifactName = "q35-9b-local-tail24-32.gguf",
+                candidates = candidates,
+                parentId = { it.parent },
+                name = { it.name },
+                verifyArtifactDigest = true,
+                verify = { candidate ->
+                    verifyExpectedArtifactDigest(expectedDigest) { refresh ->
+                        reads += if (refresh) "stream:${candidate.name}" else "cache:${candidate.name}"
+                        if (refresh) candidate.actualDigest else candidate.cachedDigest
+                    }
+                },
+            )
+
+        assertEquals(candidates[2] to true, pair(newDigest))
+        assertEquals(
+            listOf(
+                "cache:q35-9b-local-tail24-32.gguf",
+                "stream:q35-9b-local-tail24-32.gguf",
+            ),
+            reads,
+        )
+
+        reads.clear()
+        assertEquals(candidates[2] to false, pair("c".repeat(64)))
+        assertEquals(2, reads.size)
+    }
+
+    @Test
     fun scansVisibleArtifactsAndManifestsIndependently() {
         val directory = temporaryFolder.newFolder("models")
         directory.resolve("a.GGUF").writeText("artifact")

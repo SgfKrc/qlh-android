@@ -987,13 +987,15 @@ class ApiClientContractTest {
     fun `current model endpoint keeps prepared pipeline separate from full model`() {
         route("/api/models/current") { request, reply ->
             assertEquals("GET", request.method)
-            reply(200, """{"loaded":false,"pipeline_prepared":true,"segment_materialized":true,"model_id":"qwen-1_8b"}""")
+            reply(200, """{"loaded":false,"pipeline_prepared":true,"segment_materialized":true,"model_id":"registry-alias","descriptor":{"model_id":"registry-alias","source_model_id":"qwen-1_8b","source_model_sha256":"${"a".repeat(64)}"}}""")
         }
 
         val prepared = runBlocking { client.getCurrentModel() }.getOrThrow()
         assertFalse(prepared.loaded)
         assertTrue(prepared.pipelinePrepared)
-        assertEquals("qwen-1_8b", prepared.modelId)
+        assertEquals("registry-alias", prepared.modelId)
+        assertEquals("qwen-1_8b", prepared.descriptor?.sourceModelId)
+        assertEquals("registry-alias", prepared.descriptor?.modelId)
 
         route("/api/models/current") { _, reply ->
             reply(200, """{"loaded":true,"model_id":"qwen-1_8b"}""")

@@ -26,6 +26,7 @@ object AndroidWorkerCapabilities {
         val sourceModelId: String? = null,
         val hiddenSize: Int? = null,
         val tokenizerSha256: String? = null,
+        val layerWeightBytes: List<Long>? = null,
     ) {
         init {
             require(startLayer >= 0 && endLayerExclusive > startLayer) {
@@ -56,6 +57,11 @@ object AndroidWorkerCapabilities {
                     "layer artifact tokenizer digest must be a 64-char hex digest"
                 }
             }
+            require(layerWeightBytes == null ||
+                (layerWeightBytes.size == endLayerExclusive - startLayer &&
+                    layerWeightBytes.all { it > 0L })) {
+                "layer artifact weight bytes must match the segment span and be positive"
+            }
         }
 
         fun toMap(): Map<String, Any> = linkedMapOf<String, Any>(
@@ -70,6 +76,7 @@ object AndroidWorkerCapabilities {
                 output["hidden_size"] = requireNotNull(hiddenSize)
                 output["tokenizer_sha256"] = requireNotNull(tokenizerSha256).lowercase()
             }
+            layerWeightBytes?.let { output["layer_weight_bytes"] = it }
         }
 
         fun modelIdentity(): Map<String, Any?> = mapOf(

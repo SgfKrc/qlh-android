@@ -139,12 +139,15 @@ class AndroidFullWorkerStageExecutor(
         }
         val payload = offer.payload
         val stageType = payload["stage_type"] as? String
-        if (!AndroidWorkerCapabilities.isSupportedStageType(stageType)) {
+        val layerOnly = allowLayerIdentityAlias()
+        val supportedStageTypes = if (layerOnly) listOf("layer_forward") else
+            AndroidWorkerCapabilities.SUPPORTED_STAGE_TYPES
+        if (stageType !in supportedStageTypes) {
             throw AndroidFullWorkerStageException(
                 "unsupported_stage_type",
                 "Android Full Worker accepts only supported stage types " +
                     "(got [${stageType ?: "null"}]; " +
-                    "supported: [${AndroidWorkerCapabilities.describeSupportedStageTypes()}])",
+                    "supported: [${supportedStageTypes.joinToString(", ")}])",
             )
         }
         val advertised = expectedModelIdentity()
@@ -171,7 +174,7 @@ class AndroidFullWorkerStageExecutor(
             stageType == "layer_forward" -> exactLayerIdentityMatches ||
                 (advertised != null && requested != null &&
                     sameIdentity(advertised, requestedIdentity)) ||
-                (allowLayerIdentityAlias() && advertised != null && requested != null &&
+                (layerOnly && advertised != null && requested != null &&
                     sameLayerIdentity(advertised, requestedIdentity))
             else -> advertised != null && requested != null &&
                 sameIdentity(advertised, requestedIdentity)
@@ -198,7 +201,10 @@ class AndroidFullWorkerStageExecutor(
         try {
             return when (stageType) {
                 "layer_forward" -> executeLayerForward(payload, advertisedIdentity)
-                else -> executeFullInference(payload, advertisedIdentity)
+                "full_inference" -> executeFullInference(payload, advertisedIdentity)
+                else -> throw AndroidFullWorkerStageException(
+                    "unsupported_stage_type", "Stage type is not executable",
+                )
             }
         } finally {
             if (runningIdentity == attemptIdentity) runningIdentity = null

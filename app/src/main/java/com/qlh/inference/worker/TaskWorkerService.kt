@@ -29,6 +29,7 @@ import com.qlh.inference.system.AndroidDeviceInfoProvider
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import java.util.concurrent.atomic.AtomicBoolean
@@ -263,7 +264,8 @@ class TaskWorkerService : Service() {
         // the stage path unusable.
         val verifiedLayerArtifacts = AtomicReference<List<ModelManager.LayerArtifact>>(emptyList())
         val verifiedInventory = AtomicReference<LayerArtifactInventory?>(null)
-        val layerArtifactCapability = { artifact: ModelManager.LayerArtifact ->
+        val layerArtifactCapability = { artifact: ModelManager.LayerArtifact,
+                                        scan: GgufLayerWeightReader.ScanResult? ->
             val hasModelPreflightContract =
                 artifact.sourceModelId != null &&
                     artifact.hiddenSize != null &&
@@ -283,6 +285,7 @@ class TaskWorkerService : Service() {
                 tokenizerSha256 = artifact.tokenizerSha256.takeIf {
                     hasModelPreflightContract
                 },
+                layerWeightBytes = scan?.layerWeightBytes,
             )
         }
         var inferenceStartAccepted = true
@@ -318,10 +321,34 @@ class TaskWorkerService : Service() {
                 it.sourceModelSha256.equals(modelSha256, ignoreCase = true) &&
                     (it.sourceModelId == null || it.sourceModelId == modelId)
             }
-            val candidates = eligibleArtifacts.map { it.toCandidate() }
+            val scansByArtifact = mutableMapOf<ModelManager.LayerArtifact, GgufLayerWeightReader.ScanResult?>()
+            val checkedArtifacts = eligibleArtifacts.filter { artifact ->
+                val scan = try {
+                    contentResolver.openInputStream(artifact.document.uri)?.use { input ->
+                        GgufLayerWeightReader.scan(
+                            input, artifact.endLayerExclusive - artifact.startLayer,
+                        )
+                    }
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (error: Exception) {
+                    QlhLogger.w("TaskWorkerService", "layer tensor scan failed: ${error.message}")
+                    null
+                }
+                scansByArtifact[artifact] = scan
+                GgufLayerWeightReader.matchesTokenizerSha256(artifact.tokenizerSha256, scan)
+                    .also { matches ->
+                        if (!matches) {
+                            QlhLogger.w("TaskWorkerService", "layer artifact tokenizer mismatch: " +
+                                "manifest=${artifact.manifest.name} " +
+                                "range=[${artifact.startLayer},${artifact.endLayerExclusive})")
+                        }
+                    }
+            }
+            val candidates = checkedArtifacts.map { it.toCandidate() }
             val allowedReferences = unambiguousLayerArtifactCandidates(candidates)
                 .map { it.reference }.toSet()
-            val layerArtifacts = eligibleArtifacts
+            val layerArtifacts = checkedArtifacts
                 .filter { it.document.uri.toString() in allowedReferences }
             verifiedLayerArtifacts.set(layerArtifacts.toList())
             QlhLogger.i(
@@ -338,7 +365,9 @@ class TaskWorkerService : Service() {
             } else resourceReason
             val layerRanges = layerArtifacts
                 .map { listOf(it.startLayer, it.endLayerExclusive) }
-            val advertisedLayerArtifacts = layerArtifacts.map(layerArtifactCapability)
+            val advertisedLayerArtifacts = layerArtifacts.map {
+                layerArtifactCapability(it, scansByArtifact[it])
+            }
             val layerForwardInfo = QlhApplication.instance.inferenceService
                 ?.engine
                 ?.layerForwardInfo()
@@ -401,6 +430,7 @@ class TaskWorkerService : Service() {
                     "ranges=${capabilities["layer_ranges"]} model=${modelId.ifBlank { "<none>" }} " +
                     "sha=${modelSha256.take(12)} profile=$runtimeProfile " +
                     "budget=${layerBudget?.maxLayers} " +
+                    "layer_byte_counts=${advertisedLayerArtifacts.map { it.layerWeightBytes?.size ?: 0 }} " +
                 "admitted=$verifiedAdmission full=$fullInferenceAvailable",
             )
             capabilities
@@ -523,7 +553,7 @@ class TaskWorkerService : Service() {
                     when (choice) {
                         is LayerArtifactChoice.Selected -> verifiedLayerArtifacts.get()
                             .firstOrNull { it.document.uri.toString() == choice.artifact.reference }
-                            ?.let { layerArtifactCapability(it).modelIdentity() }
+                            ?.let { layerArtifactCapability(it, null).modelIdentity() }
                         is LayerArtifactChoice.ManualRequired -> {
                             QlhLogger.w("TaskWorkerService", "${choice.reason}: ${choice.prompt}")
                             null
