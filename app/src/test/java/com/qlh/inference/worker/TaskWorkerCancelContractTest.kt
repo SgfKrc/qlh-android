@@ -1,6 +1,8 @@
 package com.qlh.inference.worker
 
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.async
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
@@ -217,6 +219,43 @@ class TaskWorkerCancelContractTest {
         } finally {
             handler.release.set(true)
             client.stopAndJoin()
+        }
+    }
+
+    @Test
+    fun `stopAndJoin waits for atomic native execution even after lifecycle stop`() = runBlocking {
+        for (lifecycleStopFirst in listOf(false, true)) {
+            val transport = RecordingTransport()
+            val handler = AtomicLayerHandler()
+            val client = TaskWorkerClient(
+                host = "127.0.0.1", port = 18825, nodeId = "android_worker_01",
+                capabilities = { workerCapabilities() },
+                transportFactory = { _, _ -> transport }, stageHandler = handler,
+            )
+            try {
+                client.start()
+                awaitTrue { transport.messageTypes().contains(TaskWorkerProtocol.HELLO) }
+                transport.push(TaskWorkerProtocol.buildHelloAck(
+                    coordinatorNodeId = "master_12345678", accepted = true,
+                    selectedVersion = TaskWorkerProtocol.VERSION, reasonCode = "",
+                    messageId = "msg_ack_stopjoin1", sentAtMs = System.currentTimeMillis(),
+                ))
+                awaitTrue { client.snapshot.value.connection == TaskWorkerConnectionState.READY }
+                transport.push(offerEnvelope())
+                awaitTrue { handler.started.isCompleted }
+                if (lifecycleStopFirst) client.stop()
+                val stopped = async(Dispatchers.Default) { client.stopAndJoin() }
+                awaitTrue { client.snapshot.value.connection == TaskWorkerConnectionState.STOPPED }
+                assertTrue("stop must reach the native abort callback", handler.cancelRequested)
+                assertTrue("native execution still runs after coroutine cancellation", handler.inFlight)
+                assertFalse("stopAndJoin must wait before model release", stopped.isCompleted)
+                handler.release.set(true)
+                withTimeout(5_000) { stopped.await() }
+                assertFalse(handler.inFlight)
+            } finally {
+                handler.release.set(true)
+                client.stopAndJoin()
+            }
         }
     }
 

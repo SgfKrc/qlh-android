@@ -720,6 +720,7 @@ class TaskWorkerClient(
 
     /** Non-blocking stop used by Android Service lifecycle callbacks. */
     fun stop() {
+        machine.snapshot().activeAttempt.identity?.let { stageHandler?.requestCancel(it) }
         machine.stop()
         publish()
         executionJob?.cancel()
@@ -737,15 +738,21 @@ class TaskWorkerClient(
         }
     }
 
-    suspend fun stopAndJoin() {
+    suspend fun stopAndJoin() = withContext(NonCancellable) {
+        machine.snapshot().activeAttempt.identity?.let { stageHandler?.requestCancel(it) }
         machine.stop()
         publish()
         executionJob?.cancel()
+        heartbeatJob?.cancel()
+        loopJob?.cancel()
         runCatching { transport?.close() }
+        // Cancelling a Job does not interrupt JNI. Join the owning scope, including
+        // execution and cancellation-convergence jobs, before releasing the model.
+        scope.coroutineContext[Job]?.cancelAndJoin()
         transport = null
-        loopJob?.cancelAndJoin()
+        executionJob = null
+        heartbeatJob = null
         loopJob = null
-        scope.cancel()
     }
 
     private suspend fun runLoop() {

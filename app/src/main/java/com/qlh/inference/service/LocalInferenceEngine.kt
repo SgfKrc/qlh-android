@@ -4,6 +4,9 @@ import android.content.Context
 import android.os.Build
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
@@ -33,6 +36,18 @@ import java.io.File
  *       onToken: (String) -> Unit): String               → 返回完整文本
  */
 class LocalInferenceEngine(private val context: Context) {
+
+    // Native model pointers and retained handles must outlive every native call.
+    private val modelMutex = Mutex()
+    private var closed = false
+
+    private suspend fun <T> withModelContext(action: suspend CoroutineScope.() -> T): T =
+        withContext(Dispatchers.IO) {
+            modelMutex.withLock {
+                check(!closed) { "推理引擎已停止" }
+                action()
+            }
+        }
 
     companion object {
         private const val TAG = "LocalInference"
@@ -177,10 +192,10 @@ class LocalInferenceEngine(private val context: Context) {
         extractHidden: Boolean = false,
         gpuLayers: Int = 0,
         layerRange: List<Int>? = null,
-    ): Result<Unit> = withContext(Dispatchers.IO) {
+    ): Result<Unit> = withModelContext {
         val libResult = ensureNativeLibraryLoaded()
         if (libResult.isFailure) {
-            return@withContext Result.failure(libResult.exceptionOrNull()!!)
+            return@withModelContext Result.failure(libResult.exceptionOrNull()!!)
         }
 
         // 卸载旧模型
@@ -190,12 +205,12 @@ class LocalInferenceEngine(private val context: Context) {
 
         val file = File(modelPath)
         if (!file.exists()) {
-            return@withContext Result.failure(
+            return@withModelContext Result.failure(
                 IllegalStateException("模型文件不存在: $modelPath")
             )
         }
         if (!file.canRead()) {
-            return@withContext Result.failure(
+            return@withModelContext Result.failure(
                 IllegalStateException("模型文件不可读: $modelPath")
             )
         }
@@ -203,7 +218,7 @@ class LocalInferenceEngine(private val context: Context) {
         try {
             val ptr = nativeLoadModel(modelPath, contextSize, extractHidden, gpuLayers)
             if (ptr == 0L) {
-                return@withContext Result.failure(
+                return@withModelContext Result.failure(
                     IllegalStateException("模型加载失败（native 返回空指针）: $modelPath")
                 )
             }
@@ -232,11 +247,11 @@ class LocalInferenceEngine(private val context: Context) {
         extractHidden: Boolean = false,
         gpuLayers: Int = 0,
         layerRange: List<Int>? = null,
-    ): Result<Unit> = withContext(Dispatchers.IO) {
+    ): Result<Unit> = withModelContext {
         val libResult = ensureNativeLibraryLoaded()
         if (libResult.isFailure) {
             handle.close()
-            return@withContext Result.failure(libResult.exceptionOrNull()!!)
+            return@withModelContext Result.failure(libResult.exceptionOrNull()!!)
         }
 
         if (modelPtr != 0L) {
@@ -248,13 +263,13 @@ class LocalInferenceEngine(private val context: Context) {
             val file = File(modelPath)
             if (!file.exists()) {
                 handle.close()
-                return@withContext Result.failure(
+                return@withModelContext Result.failure(
                     IllegalStateException("模型文件不存在: $modelPath")
                 )
             }
             if (!file.canRead()) {
                 handle.close()
-                return@withContext Result.failure(
+                return@withModelContext Result.failure(
                     IllegalStateException("模型文件不可读: $modelPath")
                 )
             }
@@ -264,7 +279,7 @@ class LocalInferenceEngine(private val context: Context) {
             val ptr = nativeLoadModel(modelPath, contextSize, extractHidden, gpuLayers)
             if (ptr == 0L) {
                 handle.close()
-                return@withContext Result.failure(
+                return@withModelContext Result.failure(
                     IllegalStateException("模型加载失败（native 返回空指针）: ${handle.displayName}")
                 )
             }
@@ -290,7 +305,7 @@ class LocalInferenceEngine(private val context: Context) {
     /**
      * 卸载当前模型，释放内存。
      */
-    suspend fun unloadModel(): Result<Unit> = withContext(Dispatchers.IO) {
+    suspend fun unloadModel(): Result<Unit> = withModelContext {
         try {
             unloadModelInternal()
             Result.success(Unit)
@@ -301,10 +316,10 @@ class LocalInferenceEngine(private val context: Context) {
 
     /** Load the user-owned Gemma4 mmproj beside the already loaded text model. */
     suspend fun loadMultimodalProjector(handle: ModelManager.ModelOpenHandle): Result<Unit> =
-        withContext(Dispatchers.IO) {
+        withModelContext {
             if (!isLoaded) {
                 handle.close()
-                return@withContext Result.failure(IllegalStateException("模型未加载"))
+                return@withModelContext Result.failure(IllegalStateException("模型未加载"))
             }
             try {
                 val previousHandle = multimodalOpenHandle
@@ -334,12 +349,12 @@ class LocalInferenceEngine(private val context: Context) {
         maxTokens: Int = 1024,
         temperature: Float = 0.7f,
         topP: Float = 0.9f,
-    ): Result<String> = withContext(Dispatchers.IO) {
+    ): Result<String> = withModelContext {
         if (!isLoaded || !multimodalLoaded) {
-            return@withContext Result.failure(IllegalStateException("mmproj 未加载"))
+            return@withModelContext Result.failure(IllegalStateException("mmproj 未加载"))
         }
         if (imageBytes.isEmpty()) {
-            return@withContext Result.failure(IllegalArgumentException("至少需要一张图片"))
+            return@withModelContext Result.failure(IllegalArgumentException("至少需要一张图片"))
         }
         try {
             val markedPrompt = if (prompt.contains("<__media__>")) {
@@ -370,6 +385,7 @@ class LocalInferenceEngine(private val context: Context) {
                 Log.i(TAG, "模型已卸载: $loadedModelPath")
             } catch (e: Exception) {
                 Log.w(TAG, "模型卸载异常: ${e.message}")
+                throw e
             }
             modelPtr = 0
             loadedModelPath = ""
@@ -404,17 +420,19 @@ class LocalInferenceEngine(private val context: Context) {
         temperature: Float = 0.7f,
         topP: Float = 0.9f
     ): Flow<String> = callbackFlow {
-        if (!isLoaded) {
-            throw IllegalStateException("模型未加载，请先调用 loadModel()")
-        }
+        modelMutex.withLock {
+            check(!closed) { "推理引擎已停止" }
+            if (!isLoaded) {
+                throw IllegalStateException("模型未加载，请先调用 loadModel()")
+            }
 
-        // nativeGenerate 在 JNI 线程中回调，通过 trySend 发送到 Flow
-        nativeGenerate(
-            modelPtr, prompt, maxTokens, temperature, topP
-        ) { token ->
-            trySend(token)
+            // nativeGenerate 在 JNI 线程中回调，通过 trySend 发送到 Flow
+            nativeGenerate(
+                modelPtr, prompt, maxTokens, temperature, topP
+            ) { token ->
+                trySend(token)
+            }
         }
-
         close()
         awaitClose {}
     }.flowOn(Dispatchers.IO)
@@ -427,9 +445,9 @@ class LocalInferenceEngine(private val context: Context) {
         maxTokens: Int = 1024,
         temperature: Float = 0.7f,
         topP: Float = 0.9f
-    ): Result<String> = withContext(Dispatchers.IO) {
+    ): Result<String> = withModelContext {
         if (!isLoaded) {
-            return@withContext Result.failure(IllegalStateException("模型未加载"))
+            return@withModelContext Result.failure(IllegalStateException("模型未加载"))
         }
         try {
             val fullText = nativeGenerate(
@@ -449,9 +467,9 @@ class LocalInferenceEngine(private val context: Context) {
     /**
      * 获取模型信息（从 GGUF 元数据）。
      */
-    suspend fun getModelInfo(): Result<Map<String, String>> = withContext(Dispatchers.IO) {
+    suspend fun getModelInfo(): Result<Map<String, String>> = withModelContext {
         if (!isLoaded) {
-            return@withContext Result.failure(IllegalStateException("模型未加载"))
+            return@withModelContext Result.failure(IllegalStateException("模型未加载"))
         }
         try {
             val info = nativeGetModelInfo(modelPtr)
@@ -461,10 +479,10 @@ class LocalInferenceEngine(private val context: Context) {
         }
     }
 
-    suspend fun getBackendInfo(): Result<Map<String, String>> = withContext(Dispatchers.IO) {
+    suspend fun getBackendInfo(): Result<Map<String, String>> = withModelContext {
         val libResult = ensureNativeLibraryLoaded()
         if (libResult.isFailure) {
-            return@withContext Result.failure(libResult.exceptionOrNull()!!)
+            return@withModelContext Result.failure(libResult.exceptionOrNull()!!)
         }
         try {
             Result.success(nativeGetBackendInfo())
@@ -474,10 +492,10 @@ class LocalInferenceEngine(private val context: Context) {
     }
 
     /** Query the compiled multimodal bridge; text-only builds must report false. */
-    suspend fun getMultimodalCapability(): Result<Map<String, String>> = withContext(Dispatchers.IO) {
+    suspend fun getMultimodalCapability(): Result<Map<String, String>> = withModelContext {
         val libResult = ensureNativeLibraryLoaded()
         if (libResult.isFailure) {
-            return@withContext Result.failure(libResult.exceptionOrNull()!!)
+            return@withModelContext Result.failure(libResult.exceptionOrNull()!!)
         }
         try {
             Result.success(nativeGetMultimodalCapability(modelPtr))
@@ -486,9 +504,9 @@ class LocalInferenceEngine(private val context: Context) {
         }
     }
 
-    suspend fun getLastGenerationStats(): Result<Map<String, String>> = withContext(Dispatchers.IO) {
+    suspend fun getLastGenerationStats(): Result<Map<String, String>> = withModelContext {
         if (!isLoaded) {
-            return@withContext Result.success(emptyMap())
+            return@withModelContext Result.success(emptyMap())
         }
         try {
             Result.success(nativeGetLastGenerationStats(modelPtr))
@@ -541,23 +559,23 @@ class LocalInferenceEngine(private val context: Context) {
         // ★ P3 多序列：显式 seq/pos（长度必须等于 nTokens）；都给时走 Seq 版 JNI 入口
         seqIds: IntArray? = null,
         positions: IntArray? = null,
-    ): Result<LayerForwardOutput> = withContext(Dispatchers.IO) {
+    ): Result<LayerForwardOutput> = withModelContext {
         if (!isLoaded) {
-            return@withContext Result.failure(IllegalStateException("model_not_loaded"))
+            return@withModelContext Result.failure(IllegalStateException("model_not_loaded"))
         }
         // ★ 2026-10-07（DIST-NEXT-1）：取消已经到达 ⇒ 直接失败，不做任何计算。
         //   （标志必须在这里清掉，否则会污染下一次前向。）
         if (layerForwardAbortRequested) {
             clearLayerForwardAbort()
-            return@withContext Result.failure(IllegalStateException("layer_forward_aborted"))
+            return@withModelContext Result.failure(IllegalStateException("layer_forward_aborted"))
         }
         if (nTokens <= 0) {
-            return@withContext Result.failure(IllegalArgumentException("nTokens must be positive"))
+            return@withModelContext Result.failure(IllegalArgumentException("nTokens must be positive"))
         }
         if ((seqIds != null && seqIds.size != nTokens) ||
             (positions != null && positions.size != nTokens)
         ) {
-            return@withContext Result.failure(
+            return@withModelContext Result.failure(
                 IllegalArgumentException("seqIds and positions must each have nTokens entries when provided")
             )
         }
@@ -586,19 +604,19 @@ class LocalInferenceEngine(private val context: Context) {
                 when (token) {
                     // -2 = native 侧报告「load 时未开启 extract_hidden_states」。
                     // 如实转成失败：中间段拿不到 hidden 就必须停，不能悄悄降级。
-                    -2 -> return@withContext Result.failure(
+                    -2 -> return@withModelContext Result.failure(
                         IllegalStateException("extract_hidden_not_enabled")
                     )
                     // -3 = keep-head（层输出）通道不可用：该架构没登记 `t_layer_inp[n_layer]` 槽位
                     //（未登记者会在 decode 时 GGML_ASSERT；这里只在拿到 -3 时兜底）。
                     // 同样 fail-closed —— 绝不退回 embeddings 通道（那会多一次归一化）。
-                    -3 -> return@withContext Result.failure(
+                    -3 -> return@withModelContext Result.failure(
                         IllegalStateException("keep_head_layer_out_unavailable")
                     )
                     // -4 = 层段前向被取消标志中止（`llama_set_abort_callback` 触发）。
                     // 这是**取消**而不是执行失败：调用方（worker 客户端）据该码走取消
                     // 终态，绝不回 `stage_error`。
-                    -4 -> return@withContext Result.failure(
+                    -4 -> return@withModelContext Result.failure(
                         IllegalStateException("layer_forward_aborted")
                     )
                     else -> Result.success(LayerForwardOutput(token, if (token >= 0) out else null))
@@ -611,7 +629,7 @@ class LocalInferenceEngine(private val context: Context) {
                 }
                 // -4 = 同上：被取消标志中止 ⇒ 按取消（而非执行失败）上报。
                 if (token == -4) {
-                    return@withContext Result.failure(
+                    return@withModelContext Result.failure(
                         IllegalStateException("layer_forward_aborted")
                     )
                 }
@@ -630,9 +648,9 @@ class LocalInferenceEngine(private val context: Context) {
      * 与 [getBackendInfo] 同一模式 —— 能力由 native 侧**上报**，调用方据此决定
      * 是否把本节点纳入层流水线，而不是靠 `if engine_type` 猜。
      */
-    suspend fun layerForwardInfo(): Result<Map<String, String>> = withContext(Dispatchers.IO) {
+    suspend fun layerForwardInfo(): Result<Map<String, String>> = withModelContext {
         if (!isLoaded) {
-            return@withContext Result.failure(IllegalStateException("model_not_loaded"))
+            return@withModelContext Result.failure(IllegalStateException("model_not_loaded"))
         }
         try {
             Result.success(nativeLayerForwardInfo(modelPtr))
@@ -659,7 +677,10 @@ class LocalInferenceEngine(private val context: Context) {
      */
     suspend fun shutdown() {
         withContext(Dispatchers.IO) {
-            unloadModelInternal()
+            modelMutex.withLock {
+                closed = true
+                unloadModelInternal()
+            }
         }
     }
 

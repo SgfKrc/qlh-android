@@ -17,6 +17,7 @@ import androidx.core.app.NotificationCompat
 import com.qlh.inference.MainActivity
 import com.qlh.inference.QlhApplication
 import com.qlh.inference.R
+import com.qlh.inference.data.SettingsDataStore
 import com.qlh.inference.model.Gemma4NativeAssets
 import com.qlh.inference.status.AndroidRuntimeStatus
 import com.qlh.inference.status.BackendStatus
@@ -29,10 +30,15 @@ import com.qlh.inference.status.ModelRuntimeStatus
 import com.qlh.inference.system.AndroidDeviceInfoProvider
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 
 /**
  * 本地推理引擎前台 Service。
@@ -77,6 +83,8 @@ class InferenceService : Service() {
     val isReady: Boolean get() = engine?.isLoaded == true
 
     // ---- 内部状态 ----
+
+    private val settings by lazy { SettingsDataStore(applicationContext) }
 
     private var wakeLock: PowerManager.WakeLock? = null
 
@@ -166,6 +174,8 @@ class InferenceService : Service() {
     override fun onDestroy() {
         Log.i(TAG, "Service onDestroy — 释放资源")
 
+        scope.cancel()
+        engine?.requestLayerForwardAbort()
         // 卸载模型
         engine?.let {
             kotlinx.coroutines.runBlocking {
@@ -179,7 +189,6 @@ class InferenceService : Service() {
         }
         releaseWakeLock()
         releaseWifiLock()
-        scope.cancel()
         super.onDestroy()
     }
 
@@ -197,6 +206,20 @@ class InferenceService : Service() {
     suspend fun ensureModelLoaded(
         contextSize: Int = 2048,
         extractHidden: Boolean = false,
+    ): Result<Unit> = inferenceModes.local(
+        readMode = { settings.getInferenceMode() },
+        releaseWorkerModel = { unloadModelLocked() },
+    ) { loadSelectedModel(contextSize, extractHidden) }
+
+    /** Full-model stages are cluster work, and must never use the explicit local entry point. */
+    internal suspend fun ensureWorkerModelLoaded(contextSize: Int): Result<Unit> =
+        inferenceModes.worker({ settings.getInferenceMode() }) {
+            loadSelectedModel(contextSize, extractHidden = false)
+        }
+
+    private suspend fun loadSelectedModel(
+        contextSize: Int,
+        extractHidden: Boolean,
     ): Result<Unit> {
         val eng = engine ?: return Result.failure(IllegalStateException("Service 未初始化"))
         val gpuLayers = preferredGpuLayers(eng)
@@ -220,7 +243,7 @@ class InferenceService : Service() {
                     "${eng.loadedModelSourceUri}(hidden=${eng.loadedExtractHidden}) -> " +
                     "$selectedUri(hidden=$extractHidden)",
             )
-            eng.unloadModel()
+            eng.unloadModel().getOrElse { return Result.failure(it) }
         }
 
         if (!modelManager.isModelReady()) {
@@ -278,6 +301,21 @@ class InferenceService : Service() {
         expectedSourceModelId: String = "",
         expectedSourceModelSha256: String = "",
         expectedEmbeddingWidth: Int = 0,
+    ): Result<Unit> = inferenceModes.worker({ settings.getInferenceMode() }) {
+        loadLayerModel(
+            layerRange, contextSize, extractHidden, expectedModelSha256,
+            expectedSourceModelId, expectedSourceModelSha256, expectedEmbeddingWidth,
+        )
+    }
+
+    private suspend fun loadLayerModel(
+        layerRange: List<Int>,
+        contextSize: Int,
+        extractHidden: Boolean,
+        expectedModelSha256: String,
+        expectedSourceModelId: String,
+        expectedSourceModelSha256: String,
+        expectedEmbeddingWidth: Int,
     ): Result<Unit> {
         val eng = engine ?: return Result.failure(IllegalStateException("Service 未初始化"))
         if (layerRange.size != 2 || layerRange[1] <= layerRange[0] || layerRange[0] < 0) {
@@ -293,7 +331,7 @@ class InferenceService : Service() {
         ) {
             return validateLayerModel(eng, layerRange, expectedEmbeddingWidth)
         }
-        if (eng.isLoaded) eng.unloadModel()
+        if (eng.isLoaded) eng.unloadModel().getOrElse { return Result.failure(it) }
         loadedLayerArtifactSha256 = ""
         loadedLayerSourceSha256 = ""
 
@@ -324,7 +362,7 @@ class InferenceService : Service() {
         val first = load(preferFd = true)
         if (first.isSuccess) return first
         Log.w(TAG, "layer artifact fd load failed; retrying cached copy")
-        if (eng.isLoaded) eng.unloadModel()
+        if (eng.isLoaded) eng.unloadModel().getOrElse { return Result.failure(it) }
         loadedLayerArtifactSha256 = ""
         loadedLayerSourceSha256 = ""
         return load(preferFd = false)
@@ -357,7 +395,9 @@ class InferenceService : Service() {
         ) -1 else 0
     }
 
-    suspend fun unloadModel(): Result<Unit> {
+    suspend fun unloadModel(): Result<Unit> = inferenceModes.exclusive { unloadModelLocked() }
+
+    internal suspend fun unloadModelLocked(): Result<Unit> {
         val eng = engine ?: return Result.failure(IllegalStateException("Service 未初始化"))
         loadedLayerArtifactSha256 = ""
         loadedLayerSourceSha256 = ""
@@ -365,7 +405,12 @@ class InferenceService : Service() {
     }
 
     /** Load the fixed Gemma4 model/mmproj pair before accepting local image input. */
-    suspend fun ensureMultimodalReady(): Result<Unit> {
+    suspend fun ensureMultimodalReady(): Result<Unit> = inferenceModes.local(
+        readMode = { settings.getInferenceMode() },
+        releaseWorkerModel = { unloadModelLocked() },
+    ) { loadMultimodalModel() }
+
+    private suspend fun loadMultimodalModel(): Result<Unit> {
         val eng = engine ?: return Result.failure(IllegalStateException("Service 未初始化"))
         val assets = modelManager.inspectGemma4NativeAssets()
         if (!assets.sizeVerified) {
@@ -379,7 +424,7 @@ class InferenceService : Service() {
                 )
             )
         }
-        val loadResult = ensureModelLoaded(modelContextSize)
+        val loadResult = loadSelectedModel(modelContextSize, extractHidden = false)
         if (loadResult.isFailure) return loadResult
         if (eng.multimodalLoaded) return Result.success(Unit)
 
@@ -403,6 +448,17 @@ class InferenceService : Service() {
         maxTokens: Int = 1024,
         temperature: Float = 0.7f,
         topP: Float = 0.9f,
+    ): Result<String> = inferenceModes.local(
+        readMode = { settings.getInferenceMode() },
+        releaseWorkerModel = { unloadModelLocked() },
+    ) { generateMultimodalLocked(prompt, imageBytes, maxTokens, temperature, topP) }
+
+    private suspend fun generateMultimodalLocked(
+        prompt: String,
+        imageBytes: List<ByteArray>,
+        maxTokens: Int,
+        temperature: Float,
+        topP: Float,
     ): Result<String> {
         if (imageBytes.isEmpty() || imageBytes.size > 4) {
             return Result.failure(IllegalArgumentException("图片数量必须在 1-4 张之间"))
@@ -412,7 +468,7 @@ class InferenceService : Service() {
         ) {
             return Result.failure(IllegalArgumentException("图片总大小超过本地多模态限制"))
         }
-        val ready = ensureMultimodalReady()
+        val ready = loadMultimodalModel()
         if (ready.isFailure) return Result.failure(ready.exceptionOrNull()!!)
         // ★ DIST-NEXT-5b：多模态推理同样按任务持有 WakeLock。
         beginForegroundWork()
@@ -543,15 +599,21 @@ class InferenceService : Service() {
         maxTokens: Int = 1024,
         temperature: Float = 0.7f,
         topP: Float = 0.9f
-    ): Flow<String> {
-        val eng = engine
-            ?: throw IllegalStateException("推理引擎未初始化")
-
-        if (!eng.isLoaded) {
-            throw IllegalStateException("模型未加载，请先调用 ensureModelLoaded()")
-        }
-
-        return eng.generateStream(prompt, maxTokens, temperature, topP)
+    ): Flow<String> = flow {
+        inferenceModes.local(
+            readMode = { settings.getInferenceMode() },
+            releaseWorkerModel = { unloadModelLocked() },
+        ) {
+            val eng = engine ?: return@local Result.failure(IllegalStateException("推理引擎未初始化"))
+            if (!eng.isLoaded) return@local Result.failure(IllegalStateException("模型未加载"))
+            beginForegroundWork()
+            try {
+                eng.generateStream(prompt, maxTokens, temperature, topP).collect { emit(it) }
+                Result.success(Unit)
+            } finally {
+                endForegroundWork()
+            }
+        }.getOrThrow()
     }
 
     /**
@@ -562,6 +624,19 @@ class InferenceService : Service() {
         maxTokens: Int = 1024,
         temperature: Float = 0.7f,
         topP: Float = 0.9f
+    ): Result<String> = inferenceModes.local(
+        readMode = { settings.getInferenceMode() },
+        releaseWorkerModel = { unloadModelLocked() },
+    ) { generateLocked(prompt, maxTokens, temperature, topP) }
+
+    internal suspend fun generateWorker(
+        prompt: String, maxTokens: Int, temperature: Float, topP: Float,
+    ): Result<String> = inferenceModes.worker({ settings.getInferenceMode() }) {
+        generateLocked(prompt, maxTokens, temperature, topP)
+    }
+
+    private suspend fun generateLocked(
+        prompt: String, maxTokens: Int, temperature: Float, topP: Float,
     ): Result<String> {
         val eng = engine ?: return Result.failure(IllegalStateException("引擎未初始化"))
         if (!eng.isLoaded) {
@@ -721,3 +796,86 @@ private fun Map<String, String>.int(key: String): Int = this[key]?.toIntOrNull()
 private fun Map<String, String>.long(key: String): Long = this[key]?.toLongOrNull() ?: 0L
 
 private fun Map<String, String>.double(key: String): Double = this[key]?.toDoubleOrNull() ?: 0.0
+
+/** Process-wide ownership barrier shared by UI switches and recreated services. */
+internal class InferenceModeCoordinator {
+    private val mutex = Mutex()
+    private var workerOwner: Any? = null
+    private var stopWorker: (suspend () -> Unit)? = null
+
+    suspend fun <T> exclusive(action: suspend () -> T): T = mutex.withLock { action() }
+
+    // These two methods are called while holding exclusive ownership.
+    fun registerWorker(owner: Any, stop: suspend () -> Unit) {
+        check(workerOwner == null)
+        workerOwner = owner
+        stopWorker = stop
+    }
+
+    suspend fun stopWorkerLocked() {
+        stopWorker?.invoke()
+        stopWorker = null
+        workerOwner = null
+    }
+
+    /** Called inside exclusive ownership before any recreated worker opens its connection. */
+    suspend fun prepareWorkerLocked(
+        readMode: suspend () -> String,
+        releaseModel: suspend () -> Result<Unit>,
+    ): Boolean {
+        if (readMode() != SettingsDataStore.MODE_DISTRIBUTED) return false
+        withContext(NonCancellable) {
+            stopWorkerLocked()
+            releaseModel().getOrThrow()
+        }
+        return true
+    }
+
+    suspend fun retireWorker(owner: Any) = exclusive {
+        if (workerOwner === owner) withContext(NonCancellable) { stopWorkerLocked() }
+    }
+
+    suspend fun switchMode(
+        mode: String,
+        persistMode: suspend (String) -> Unit,
+        releaseModel: suspend () -> Result<Unit>,
+    ) = exclusive {
+        // Publish only after the old native work and its model have been released.
+        withContext(NonCancellable) {
+            stopWorkerLocked()
+            releaseModel().getOrThrow()
+            persistMode(mode)
+        }
+    }
+
+    suspend fun <T> local(
+        readMode: suspend () -> String,
+        releaseWorkerModel: suspend () -> Result<Unit>,
+        action: suspend () -> Result<T>,
+    ): Result<T> = exclusive {
+        if (readMode() == SettingsDataStore.MODE_DISTRIBUTED) {
+            return@exclusive Result.failure(
+                IllegalStateException("请先切换到本地模式，再加载或运行本地模型"),
+            )
+        }
+        if (workerOwner != null) {
+            withContext(NonCancellable) {
+                stopWorkerLocked()
+                releaseWorkerModel().getOrThrow()
+            }
+        }
+        action()
+    }
+
+    suspend fun <T> worker(
+        readMode: suspend () -> String,
+        action: suspend () -> Result<T>,
+    ): Result<T> = exclusive {
+        if (readMode() != SettingsDataStore.MODE_DISTRIBUTED || workerOwner == null) {
+            return@exclusive Result.failure(IllegalStateException("task_worker_disabled_by_mode"))
+        }
+        action()
+    }
+}
+
+internal val inferenceModes = InferenceModeCoordinator()

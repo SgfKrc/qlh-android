@@ -18,6 +18,7 @@ import com.qlh.inference.R
 import com.qlh.inference.data.SettingsDataStore
 import com.qlh.inference.logging.QlhLogger
 import com.qlh.inference.service.InferenceService
+import com.qlh.inference.service.inferenceModes
 import com.qlh.inference.service.ModelManager
 import com.qlh.inference.service.LayerArtifactChoice
 import com.qlh.inference.service.LayerArtifactDiagnostic
@@ -30,6 +31,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import java.util.concurrent.atomic.AtomicBoolean
@@ -38,6 +42,9 @@ import java.util.concurrent.atomic.AtomicReference
 /** Foreground lifecycle shell for the Android Full Worker client. */
 class TaskWorkerService : Service() {
     private val binder = LocalBinder()
+    private val lifecycleLock = Any()
+    private var destroyed = false
+    @Volatile
     private var client: TaskWorkerClient? = null
     private var activeWorkerKey: TaskWorkerStartKey? = null
     private var activeInferenceStartAccepted = false
@@ -52,7 +59,7 @@ class TaskWorkerService : Service() {
                 .onFailure { failure ->
                     QlhLogger.e("TaskWorkerService", "could not clear worker startup", failure)
                 }
-            stopWorker()
+            inferenceModes.exclusive { stopWorker() }
             stopSelf(command.startId)
         },
     )
@@ -68,6 +75,19 @@ class TaskWorkerService : Service() {
     override fun onCreate() {
         super.onCreate()
         startForegroundNotification()
+        scope.launch {
+            settings.inferenceMode.distinctUntilChanged().collect { mode ->
+                if (mode != SettingsDataStore.MODE_DISTRIBUTED) {
+                    inferenceModes.exclusive {
+                        if (settings.getInferenceMode() != SettingsDataStore.MODE_DISTRIBUTED) {
+                            settings.clearTaskWorkerStartupConfig()
+                            stopWorker()
+                            stopSelf()
+                        }
+                    }
+                }
+            }
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -80,7 +100,17 @@ class TaskWorkerService : Service() {
         return if (BuildConfig.IS_LITE) START_NOT_STICKY else START_STICKY
     }
 
-    private suspend fun handleStartCommand(intent: Intent?, startId: Int) {
+    private suspend fun handleStartCommand(intent: Intent?, startId: Int) = inferenceModes.exclusive {
+        handleStartCommandLocked(intent, startId)
+    }
+
+    private suspend fun handleStartCommandLocked(intent: Intent?, startId: Int) {
+        if (settings.getInferenceMode() != SettingsDataStore.MODE_DISTRIBUTED) {
+            settings.clearTaskWorkerStartupConfig()
+            stopWorker()
+            stopSelf(startId)
+            return
+        }
         val action = intent?.action
         val persistedRaw = settings.getTaskWorkerStartupConfig()
         val persisted = TaskWorkerStartupConfig.fromJson(persistedRaw)
@@ -206,7 +236,14 @@ class TaskWorkerService : Service() {
 
     override fun onDestroy() {
         commandQueue.close()
-        stopWorker()
+        val old = synchronized(lifecycleLock) {
+            destroyed = true
+            client.also { it?.stop() }
+        }
+        if (old != null) {
+            // Keep ownership registered until even non-cancellable JNI work has exited.
+            scope.launch(NonCancellable) { inferenceModes.retireWorker(old) }
+        }
         scope.cancel()
         super.onDestroy()
     }
@@ -235,6 +272,14 @@ class TaskWorkerService : Service() {
             QlhLogger.i("TaskWorkerService", "worker_start_reused=true")
             return
         }
+        // A recreated service must release any previous local full model before hello/capabilities.
+        if (!inferenceModes.prepareWorkerLocked(
+                readMode = { settings.getInferenceMode() },
+                releaseModel = {
+                    QlhApplication.instance.inferenceService?.unloadModelLocked()
+                        ?: Result.success(Unit)
+                },
+            )) return
         // ★ 2026-10-07（DIST-NEXT-5）：参数来自 `TaskWorkerStartupConfig`（可持久化）
         //   而不是直接读 intent —— 系统重建路径因此与首次启动走**同一条**代码。
         //   校验已由 `config.usable` 完成（调用点判定）。
@@ -435,8 +480,7 @@ class TaskWorkerService : Service() {
             )
             capabilities
         }
-        stopWorker()
-        client = TaskWorkerClient(
+        val worker = TaskWorkerClient(
             host = host,
             port = port,
             nodeId = nodeId,
@@ -454,7 +498,7 @@ class TaskWorkerService : Service() {
                 expectedModelIdentity = expectedModelIdentity,
                 allowLayerIdentityAlias = { !fullInferenceAvailable },
                 ensureModelLoaded = { contextSize ->
-                    awaitInferenceService()?.ensureModelLoaded(contextSize)
+                    awaitInferenceService()?.ensureWorkerModelLoaded(contextSize)
                         ?: Result.failure(IllegalStateException("inference_service_unavailable"))
                 },
                 generate = { prompt, maxTokens, temperature, topP ->
@@ -466,7 +510,7 @@ class TaskWorkerService : Service() {
                         //   （空闲即释放，不再固定 30 分钟硬撑）。
                         service.beginForegroundWork()
                         try {
-                            service.generate(prompt, maxTokens, temperature, topP)
+                            service.generateWorker(prompt, maxTokens, temperature, topP)
                         } finally {
                             service.endForegroundWork()
                         }
@@ -561,11 +605,24 @@ class TaskWorkerService : Service() {
                     }
                 },
             ),
-        ).also { it.start() }
-        activeWorkerKey = TaskWorkerStartKey(
-            config, modelTreeUri, selectedModelUri, clusterSecret, treePermissionGranted,
         )
-        activeInferenceStartAccepted = inferenceStartAccepted
+        synchronized(lifecycleLock) {
+            if (destroyed) throw CancellationException("task worker service destroyed")
+            inferenceModes.registerWorker(worker) {
+                worker.stopAndJoin()
+                if (client === worker) {
+                    client = null
+                    activeWorkerKey = null
+                    activeInferenceStartAccepted = false
+                }
+            }
+            client = worker
+            activeWorkerKey = TaskWorkerStartKey(
+                config, modelTreeUri, selectedModelUri, clusterSecret, treePermissionGranted,
+            )
+            activeInferenceStartAccepted = inferenceStartAccepted
+            worker.start()
+        }
     }
 
     /**
@@ -593,12 +650,11 @@ class TaskWorkerService : Service() {
         return null
     }
 
-    private fun stopWorker() {
+    private suspend fun stopWorker() {
+        inferenceModes.stopWorkerLocked()
         activeWorkerKey = null
         activeInferenceStartAccepted = false
-        val old = client ?: return
         client = null
-        old.stop()
     }
 
     @SuppressLint("ForegroundServiceType")

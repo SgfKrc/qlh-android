@@ -27,6 +27,7 @@ import com.qlh.inference.network.ClientErrorReport
 import com.qlh.inference.network.BootstrapRequest
 import com.qlh.inference.network.ChatRepository
 import com.qlh.inference.service.InferenceService
+import com.qlh.inference.service.inferenceModes
 import com.qlh.inference.service.AndroidPresenceService
 import com.qlh.inference.service.ModelManager
 import com.qlh.inference.service.ModelDirectoryGrantState
@@ -55,6 +56,8 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 // ================================================================
 // UI 状态
@@ -195,6 +198,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val uiState: StateFlow<MainUiState> = _uiState.asStateFlow()
 
     private var lastAutoRegisterKey: String = ""
+    private val modeSwitchMutex = Mutex()
 
     private fun apiClient(state: MainUiState = _uiState.value): ApiClient =
         ApiClient(httpBaseUrl(state.serverHost, state.serverPort), authStore = authStore)
@@ -1414,6 +1418,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     "能力=${deviceInfo["capabilities"]}）",
             )
         }
+        if (settings.getInferenceMode() != SettingsDataStore.MODE_DISTRIBUTED) return
         runCatching {
             ContextCompat.startForegroundService(
                 getApplication(),
@@ -1565,11 +1570,26 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         if (BuildConfig.IS_LITE && mode != SettingsDataStore.MODE_FALLBACK) return
         val normalized = SettingsDataStore.normalizeInferenceMode(mode)
         viewModelScope.launch {
-            settings.setInferenceMode(normalized)
-            _uiState.value = _uiState.value.copy(inferenceMode = normalized)
-            autoRegisterAndroidNode(force = true)
-            ensureAndroidTaskWorker()
-            refreshRuntimeStatus()
+            modeSwitchMutex.withLock {
+                try {
+                    inferenceModes.switchMode(
+                        mode = normalized,
+                        persistMode = { settings.setInferenceMode(it) },
+                        releaseModel = {
+                            QlhApplication.instance.inferenceService?.unloadModelLocked()
+                                ?: Result.success(Unit)
+                        },
+                    )
+                    _uiState.value = _uiState.value.copy(inferenceMode = normalized, modelMessage = null)
+                    autoRegisterAndroidNode(force = true)
+                    ensureAndroidTaskWorker()
+                    refreshRuntimeStatus()
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (error: Exception) {
+                    _uiState.value = _uiState.value.copy(modelMessage = "模式切换失败: ${error.message}")
+                }
+            }
         }
     }
 
