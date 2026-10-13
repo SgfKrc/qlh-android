@@ -117,6 +117,17 @@ class GgufLayerWeightReaderTest {
     }
 
     @Test
+    fun `whole model or overflow block index cannot masquerade as a cropped artifact`() {
+        val full = (0..3).map { Tensor("blk.$it.attn_q.weight", listOf(32), 2) }
+        assertNull(GgufLayerWeightReader.scan(ByteArrayInputStream(gguf(full)), 2))
+        assertEquals(4, GgufLayerWeightReader.scan(ByteArrayInputStream(gguf(full)), 4)?.layerWeightBytes?.size)
+        assertNull(GgufLayerWeightReader.scan(ByteArrayInputStream(gguf(listOf(
+            Tensor("blk.0.attn_q.weight", listOf(32), 2),
+            Tensor("blk.9999999999999999999999.attn_q.weight", listOf(32), 2),
+        ))), 1))
+    }
+
+    @Test
     fun `tokenizer scan stops before model weight payload`() {
         val header = gguf(listOf(Tensor("blk.0.attn_q.weight", listOf(32), 2)))
         val guarded = object : ByteArrayInputStream(header + ByteArray(8192)) {

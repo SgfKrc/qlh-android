@@ -453,7 +453,14 @@ object TaskWorkerProtocol {
             } else {
                 emptySet()
             }
-        requireExact(envelope.payload.keys, allowedFields, "payload")
+        val optionalPrepare = if (envelope.messageType == STAGE_OFFER && envelope.payload.containsKey("prepare_identity")) setOf("prepare_identity") else emptySet()
+        requireExact(envelope.payload.keys, allowedFields + optionalPrepare, "payload")
+        if (optionalPrepare.isNotEmpty()) {
+            val prepare = envelope.payload["prepare_identity"] as? Map<*, *>
+                ?: fail("prepare_identity must be an object", "invalid_prepare_identity", "payload.prepare_identity")
+            try { WorkerPrepareIdentity.validateStageTuple(prepare) }
+            catch (error: WorkerPrepareException) { fail(error.message.orEmpty(), "invalid_prepare_identity", "payload.prepare_identity") }
+        }
 
         when (envelope.messageType) {
             HELLO -> validateHello(envelope.payload)

@@ -412,6 +412,48 @@ class ModelManager(private val context: Context) {
         }
     }
 
+    /** Resolve the exact prepare identity before a native reuse/load; inventory alone is insufficient. */
+    internal suspend fun verifyWorkerPrepare(identity: com.qlh.inference.worker.WorkerPrepareIdentity) = withContext(Dispatchers.IO) {
+        val manifest = currentSupply()
+        val expectedManifest = identity.text("manifest_sha256")
+        if (expectedManifest.isNotEmpty()) {
+            com.qlh.inference.worker.checkPrepare(manifest != null, "prepare_manifest_missing", "no selected supply")
+            identity.verifyManifest(manifest!!)
+        } else {
+            com.qlh.inference.worker.checkPrepare(manifest == null, "prepare_manifest_mismatch", "supply cannot be treated as legacy SAF")
+        }
+        val artifacts = listLayerArtifacts(identity.text("source_model_sha256"), verifyArtifactDigest = true).getOrThrow()
+        val matching = artifacts.filter { artifact ->
+            identity.range == listOf(artifact.startLayer, artifact.endLayerExclusive) &&
+                artifact.artifactSha256 == identity.text("artifact_sha256") &&
+                artifact.sourceModelSha256 == identity.text("source_model_sha256") &&
+                artifact.sourceModelId == identity.text("source_model_id") &&
+                artifact.tokenizerSha256 == identity.text("tokenizer_sha256") &&
+                artifact.hiddenSize == identity.hiddenSize && artifact.mode == identity.mode &&
+                com.qlh.inference.worker.AndroidWorkerCapabilities.artifactModelId(artifact.document.name, artifact.artifactSha256) ==
+                    identity.stageIdentity["model_id"]
+        }
+        com.qlh.inference.worker.checkPrepare(matching.isNotEmpty(), "prepare_artifact_identity_mismatch", "no verified exact artifact")
+        val artifact = matching.first()
+        val native = com.google.gson.JsonParser.parseString(readDocument(artifact.manifest.uri)
+            ?: throw IOException("prepare native manifest missing")).asJsonObject
+        com.qlh.inference.worker.checkPrepare(native["n_layer"]?.asInt == identity.totalLayers,
+            "prepare_manifest_mismatch", "source total layers differ")
+        if (manifest != null) {
+            val expectedReference = Uri.fromFile(File(ModelSupplyCurrent(suppliedSegmentsDir).directory(manifest), manifest.weight.path)).toString()
+            com.qlh.inference.worker.checkPrepare(artifact.document.uri.toString() == expectedReference,
+                "prepare_manifest_mismatch", "exact selected supply required")
+        }
+        val scan = context.contentResolver.openInputStream(artifact.document.uri)?.use {
+            com.qlh.inference.worker.GgufLayerWeightReader.scan(it, identity.range[1] - identity.range[0])
+        }
+        com.qlh.inference.worker.checkPrepare(scan != null &&
+            com.qlh.inference.worker.GgufLayerWeightReader.matchesTokenizerSha256(identity.text("tokenizer_sha256"), scan),
+            "prepare_gguf_shape_mismatch", "proper decoder segment and tokenizer required before native load")
+        com.qlh.inference.worker.checkPrepare(currentSupply()?.manifestSha256.orEmpty() == expectedManifest,
+            "prepare_manifest_mismatch", "supply selection changed during verification")
+    }
+
     /**
      * Return manifests whose artifact files are present in the selected model root.
      *

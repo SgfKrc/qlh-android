@@ -111,7 +111,10 @@ class InferenceService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     @Volatile
     private var loadedLayerArtifactSha256: String = ""
+    @Volatile
     private var loadedLayerArtifactModelId: String = ""
+    @Volatile
+    private var loadedLayerContextSize: Int = 0
     @Volatile
     private var loadedLayerSourceSha256: String = ""
 
@@ -294,7 +297,7 @@ class InferenceService : Service() {
     }
 
     /** Load the exact crop GGUF requested by an Android layer worker offer. */
-    suspend fun ensureLayerModelLoaded(
+    internal suspend fun ensureLayerModelLoaded(
         layerRange: List<Int>,
         contextSize: Int = 2048,
         extractHidden: Boolean = false,
@@ -304,12 +307,16 @@ class InferenceService : Service() {
         expectedEmbeddingWidth: Int = 0,
         expectedArtifactModelId: String = "",
         expectedSupplyManifestSha256: String? = null,
+        prepareIdentity: com.qlh.inference.worker.WorkerPrepareIdentity? = null,
     ): Result<Unit> = inferenceModes.worker({ settings.getInferenceMode() }) {
         if (expectedSupplyManifestSha256 != null &&
             modelManager.currentSupply()?.manifestSha256.orEmpty() != expectedSupplyManifestSha256
         ) {
             Result.failure(ModelSupplyException("SUPPLY_CURRENT_CHANGED", "advertised operation is no longer current"))
         } else {
+            if (prepareIdentity != null) {
+                modelManager.verifyWorkerPrepare(prepareIdentity)
+            }
             loadLayerModel(
                 layerRange, contextSize, extractHidden, expectedModelSha256,
                 expectedSourceModelId, expectedSourceModelSha256, expectedEmbeddingWidth, expectedArtifactModelId,
@@ -336,13 +343,14 @@ class InferenceService : Service() {
         val expectedSourceDigest = expectedSourceModelSha256.trim().lowercase()
         if (eng.isLoaded && eng.loadedLayerRange == layerRange &&
             eng.loadedExtractHidden == extractHidden && eng.loadedGpuLayers == gpuLayers &&
-            expectedDigest.isNotBlank() && loadedLayerArtifactSha256 == expectedDigest &&
+            loadedLayerContextSize == contextSize && expectedDigest.isNotBlank() && loadedLayerArtifactSha256 == expectedDigest &&
             (expectedArtifactModelId.isBlank() || loadedLayerArtifactModelId == expectedArtifactModelId) &&
             expectedSourceDigest.isNotBlank() && loadedLayerSourceSha256 == expectedSourceDigest
         ) {
             return validateLayerModel(eng, layerRange, expectedEmbeddingWidth)
         }
         if (eng.isLoaded) eng.unloadModel().getOrElse { return Result.failure(it) }
+        loadedLayerContextSize = 0
         loadedLayerArtifactModelId = ""
         loadedLayerArtifactSha256 = ""
         loadedLayerSourceSha256 = ""
@@ -366,6 +374,7 @@ class InferenceService : Service() {
             if (loaded.isFailure) return loaded
             val validation = validateLayerModel(eng, layerRange, expectedEmbeddingWidth)
             if (validation.isSuccess) {
+                loadedLayerContextSize = contextSize
                 loadedLayerArtifactModelId = expectedArtifactModelId
                 loadedLayerArtifactSha256 = artifact.artifactSha256.lowercase()
                 loadedLayerSourceSha256 = artifact.sourceModelSha256.lowercase()
@@ -377,6 +386,7 @@ class InferenceService : Service() {
         if (first.isSuccess) return first
         Log.w(TAG, "layer artifact fd load failed; retrying cached copy")
         if (eng.isLoaded) eng.unloadModel().getOrElse { return Result.failure(it) }
+        loadedLayerContextSize = 0
         loadedLayerArtifactModelId = ""
         loadedLayerArtifactSha256 = ""
         loadedLayerSourceSha256 = ""
@@ -410,10 +420,24 @@ class InferenceService : Service() {
         ) -1 else 0
     }
 
+    /** Read-only check: controlled stages cannot trigger another lazy load. */
+    internal fun isPreparedLayerLoaded(identity: com.qlh.inference.worker.WorkerPrepareIdentity): Boolean {
+        val eng = engine ?: return false
+        return eng.isLoaded && eng.loadedLayerRange == identity.range &&
+            eng.loadedExtractHidden == (identity.mode != "tail") && loadedLayerContextSize == 4096 &&
+            loadedLayerArtifactSha256 == identity.text("artifact_sha256") &&
+            loadedLayerArtifactModelId == identity.stageIdentity["model_id"] &&
+            loadedLayerSourceSha256 == identity.text("source_model_sha256")
+    }
+
+    /** Controller joins all owning jobs before calling this, including during a mode-lock retirement. */
+    internal suspend fun retirePreparedLayer(): Result<Unit> = unloadModelLocked()
+
     suspend fun unloadModel(): Result<Unit> = inferenceModes.exclusive { unloadModelLocked() }
 
     internal suspend fun unloadModelLocked(): Result<Unit> {
         val eng = engine ?: return Result.failure(IllegalStateException("Service 未初始化"))
+        loadedLayerContextSize = 0
         loadedLayerArtifactModelId = ""
         loadedLayerArtifactSha256 = ""
         loadedLayerSourceSha256 = ""

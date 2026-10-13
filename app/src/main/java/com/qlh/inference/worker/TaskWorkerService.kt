@@ -25,10 +25,7 @@ import com.qlh.inference.service.ModelSupplyManifest
 import com.qlh.inference.service.ModelSupplyCurrent
 import com.qlh.inference.service.ModelSupplyException
 import com.qlh.inference.network.canonicalHost
-import com.qlh.inference.service.LayerArtifactChoice
-import com.qlh.inference.service.LayerArtifactDiagnostic
 import com.qlh.inference.service.LayerArtifactInventory
-import com.qlh.inference.service.chooseLayerArtifact
 import com.qlh.inference.service.toCandidate
 import com.qlh.inference.service.unambiguousLayerArtifactCandidates
 import com.qlh.inference.system.AndroidDeviceInfoProvider
@@ -526,6 +523,29 @@ class TaskWorkerService : Service() {
             bindingSha256 = supplyBinding,
             participationCurrent = { participationCurrent() },
         )
+        val prepare = WorkerPrepareController(nodeId, object : WorkerPrepareRuntime {
+            override suspend fun load(identity: WorkerPrepareIdentity) {
+                val service = awaitInferenceService() ?: throw IllegalStateException("inference_service_unavailable")
+                service.beginForegroundWork()
+                try {
+                    service.ensureLayerModelLoaded(
+                        layerRange = identity.range, contextSize = 4096, extractHidden = identity.mode != "tail",
+                        expectedModelSha256 = identity.text("artifact_sha256"),
+                        expectedSourceModelId = identity.text("source_model_id"),
+                        expectedSourceModelSha256 = identity.text("source_model_sha256"),
+                        expectedEmbeddingWidth = identity.hiddenSize,
+                        expectedArtifactModelId = identity.stageIdentity["model_id"] as String,
+                        expectedSupplyManifestSha256 = identity.text("manifest_sha256"),
+                        prepareIdentity = identity,
+                    ).getOrThrow()
+                } finally { service.endForegroundWork() }
+            }
+            // No mode-lock acquisition here: stopAndJoin can be called while exclusive is held.
+            override suspend fun unload() { QlhApplication.instance.inferenceService?.retirePreparedLayer()?.getOrThrow() }
+            override fun loaded(identity: WorkerPrepareIdentity): Boolean =
+                QlhApplication.instance.inferenceService?.isPreparedLayerLoaded(identity) == true
+            override fun hasRuntime(): Boolean = QlhApplication.instance.inferenceService?.engine?.isLoaded == true
+        }, participationCurrent = { participationCurrent() })
         val worker = TaskWorkerClient(
             host = host,
             port = port,
@@ -541,6 +561,7 @@ class TaskWorkerService : Service() {
             ),
             capabilities = buildCapabilities,
             modelSupplyHandler = supply,
+            modelPrepareHandler = prepare,
             stageHandler = AndroidFullWorkerStageExecutor(
                 expectedModelIdentity = expectedModelIdentity,
                 allowLayerIdentityAlias = { !fullInferenceAvailable },
@@ -615,52 +636,18 @@ class TaskWorkerService : Service() {
                     QlhApplication.instance.inferenceService?.engine
                         ?.clearLayerForwardAbort()
                 },
-                ensureModelLoadedForLayer = { range, contextSize, embeddingWidth, wantHidden, sha256 ->
-                    val snapshot = verifiedLayerArtifacts.get()
-                    val artifact = snapshot.second.singleOrNull {
-                        range == listOf(it.startLayer, it.endLayerExclusive) && it.artifactSha256.equals(sha256, ignoreCase = true)
-                    }
-                    if (currentSupply()?.manifestSha256 != snapshot.first || artifact == null) {
-                        Result.failure(ModelSupplyException("SUPPLY_CURRENT_CHANGED", "advertised artifact is no longer selected"))
-                    } else {
-                        awaitInferenceService()
-                            ?.ensureLayerModelLoaded(
-                                layerRange = range,
-                                contextSize = contextSize,
-                                extractHidden = wantHidden,
-                                expectedModelSha256 = sha256,
-                                expectedSourceModelId = currentModelId(),
-                                expectedSourceModelSha256 = currentModelSha(),
-                                expectedEmbeddingWidth = embeddingWidth,
-                                expectedArtifactModelId = layerArtifactCapability(artifact, null).modelId,
-                                expectedSupplyManifestSha256 = snapshot.first.orEmpty(),
-                            )
-                            ?: Result.failure(IllegalStateException("inference_service_unavailable"))
-                    }
+                // Stages only inspect a committed native runtime. ensureLayerModelLoaded belongs to prepare.
+                ensureModelLoadedForLayer = { range, _, embeddingWidth, wantHidden, sha256 ->
+                    val committed = prepare.committedIdentity()
+                    if (committed == null || range != committed.range ||
+                        embeddingWidth != committed.hiddenSize || wantHidden != (committed.mode != "tail") ||
+                        sha256 != committed.text("artifact_sha256") ||
+                        QlhApplication.instance.inferenceService?.isPreparedLayerLoaded(committed) != true) {
+                        Result.failure(WorkerPrepareException("prepare_runtime_lost", "committed runtime differs"))
+                    } else Result.success(Unit)
                 },
                 resolveLayerModelIdentity = { range, requested ->
-                    val snapshot = verifiedLayerArtifacts.get()
-                    val choice = chooseLayerArtifact(
-                        candidates = if (currentSupply()?.manifestSha256 == snapshot.first) snapshot.second.map { it.toCandidate() } else emptyList(),
-                        masterModelId = currentModelId(),
-                        masterSourceSha256 = currentModelSha(),
-                        startLayer = range.getOrElse(0) { -1 },
-                        endLayerExclusive = range.getOrElse(1) { -1 },
-                        offeredArtifactSha256 = (requested["sha256"] as? String).orEmpty(),
-                        offeredArtifactModelId = (requested["model_id"] as? String).orEmpty(),
-                        storageUnavailable = verifiedInventory.get()?.failures?.any {
-                            it.errorCode == LayerArtifactDiagnostic.FALLBACK_UNAVAILABLE
-                        } == true,
-                    )
-                    when (choice) {
-                        is LayerArtifactChoice.Selected -> snapshot.second
-                            .firstOrNull { it.document.uri.toString() == choice.artifact.reference }
-                            ?.let { layerArtifactCapability(it, null).modelIdentity() }
-                        is LayerArtifactChoice.ManualRequired -> {
-                            QlhLogger.w("TaskWorkerService", "${choice.reason}: ${choice.prompt}")
-                            null
-                        }
-                    }
+                    prepare.committedIdentity()?.takeIf { it.range == range && it.stageIdentity == requested }?.stageIdentity
                 },
             ),
         )

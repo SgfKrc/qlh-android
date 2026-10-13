@@ -300,6 +300,7 @@ interface TaskWorkerTransport {
         receive()?.let { TaskWorkerInboundEvent.Envelope(it) }
             ?: TaskWorkerInboundEvent.Closed
     suspend fun sendModelSupply(data: com.google.gson.JsonObject) { throw TaskWorkerProtocolException("supply transport unavailable", "supply_transport_unavailable") }
+    suspend fun sendModelPrepare(data: com.google.gson.JsonObject) { throw TaskWorkerProtocolException("prepare transport unavailable", "prepare_transport_unavailable") }
     fun requireControlAuthority() = Unit
     suspend fun sendHeartbeat(nodeId: String, sentAtMs: Long) = Unit
     suspend fun close()
@@ -308,6 +309,7 @@ interface TaskWorkerTransport {
 sealed class TaskWorkerInboundEvent {
     data class Envelope(val value: TaskWorkerEnvelope) : TaskWorkerInboundEvent()
     data class ModelSupply(val data: com.google.gson.JsonObject) : TaskWorkerInboundEvent()
+    data class ModelPrepare(val data: com.google.gson.JsonObject) : TaskWorkerInboundEvent()
     data object HeartbeatAck : TaskWorkerInboundEvent()
     data object Closed : TaskWorkerInboundEvent()
 }
@@ -365,6 +367,8 @@ internal class SocketTaskWorkerTransport(
         }
     }
     override suspend fun sendModelSupply(data: com.google.gson.JsonObject) = sendOuter("model_supply", controlFence.decorate(data))
+
+    override suspend fun sendModelPrepare(data: com.google.gson.JsonObject) = sendOuter("model_prepare", controlFence.decorate(data))
 
     private suspend fun receiveOuter(): com.google.gson.JsonObject? = withContext(Dispatchers.IO) {
         val size = try {
@@ -512,10 +516,15 @@ internal class SocketTaskWorkerTransport(
                     }
                     return TaskWorkerInboundEvent.Envelope(decoded)
                 }
+                "model_prepare" -> {
+                    val data = objectValue.getAsJsonObject("data") ?: throw TaskWorkerProtocolException("prepare data missing", "invalid_frame")
+                    controlFence.admit(data)
+                    return TaskWorkerInboundEvent.ModelPrepare(data.deepCopy().apply { remove("control_certificate") })
+                }
                 "model_supply" -> {
                     val data = objectValue.getAsJsonObject("data") ?: throw TaskWorkerProtocolException("supply data missing", "invalid_frame")
                     controlFence.admit(data)
-                    return TaskWorkerInboundEvent.ModelSupply(data.deepCopy())
+                    return TaskWorkerInboundEvent.ModelSupply(data.deepCopy().apply { remove("control_certificate") })
                 }
                 "heartbeat_ack" -> return TaskWorkerInboundEvent.HeartbeatAck
                 "stage_chunk" -> {
@@ -578,6 +587,7 @@ internal class SocketTaskWorkerTransport(
 
     override suspend fun receive(): TaskWorkerEnvelope? = when (val event = receiveEvent()) {
         is TaskWorkerInboundEvent.Envelope -> event.value
+        is TaskWorkerInboundEvent.ModelPrepare -> throw TaskWorkerProtocolException("prepare before hello acknowledgement", "unexpected_message_type")
         is TaskWorkerInboundEvent.ModelSupply -> throw TaskWorkerProtocolException("supply before hello acknowledgement", "unexpected_message_type")
         TaskWorkerInboundEvent.Closed -> null
         TaskWorkerInboundEvent.HeartbeatAck -> throw TaskWorkerProtocolException(
@@ -658,6 +668,7 @@ class TaskWorkerClient(
         SocketTaskWorkerTransportFactory(registration = registration),
     private val stageHandler: TaskWorkerStageHandler? = null,
     private val modelSupplyHandler: TaskWorkerModelSupplyHandler? = null,
+    private val modelPrepareHandler: TaskWorkerModelPrepareHandler? = null,
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
     private val clockMs: () -> Long = { System.currentTimeMillis() },
 ) {
@@ -695,7 +706,14 @@ class TaskWorkerClient(
     }
 
     fun cancelActive(reasonCode: String = "user_cancelled"): Boolean {
-        val identity = machine.requestCancel(clockMs()) ?: return false
+        val identity = machine.requestCancel(clockMs()) ?: run {
+            if (modelPrepareHandler?.cancelPending() != true) return false
+            // Retiring the connection provides the same join/unload barrier as disconnect;
+            // the master sees lost preparation, never an invented cleanup ACK.
+            val current = transport
+            scope.launch { runCatching { current?.close() } }
+            return true
+        }
         val code = reasonCode.takeIf { it.matches(Regex("^[a-z][a-z0-9_]{0,63}$")) }
             ?: "worker_cancelled"
         // ★ 2026-10-07（DIST-NEXT-1）：本地取消同样走**唯一取消状态机** ——
@@ -737,6 +755,7 @@ class TaskWorkerClient(
 
     /** Non-blocking stop used by Android Service lifecycle callbacks. */
     fun stop() {
+        modelPrepareHandler?.cancelAll()
         modelSupplyHandler?.cancelAll()
         machine.snapshot().activeAttempt.identity?.let { stageHandler?.requestCancel(it) }
         machine.stop()
@@ -757,6 +776,7 @@ class TaskWorkerClient(
     }
 
     suspend fun stopAndJoin() = withContext(NonCancellable) {
+        modelPrepareHandler?.cancelAll()
         modelSupplyHandler?.cancelAll()
         machine.snapshot().activeAttempt.identity?.let { stageHandler?.requestCancel(it) }
         machine.stop()
@@ -768,6 +788,7 @@ class TaskWorkerClient(
         // Cancelling a Job does not interrupt JNI. Join the owning scope, including
         // execution and cancellation-convergence jobs, before releasing the model.
         scope.coroutineContext[Job]?.cancelAndJoin()
+        modelPrepareHandler?.retireAndJoin()
         transport = null
         executionJob = null
         heartbeatJob = null
@@ -842,7 +863,14 @@ class TaskWorkerClient(
                 machine.onDisconnected(clockMs(), errorCode(error), error.message ?: error.javaClass.simpleName)
                 publish()
             } finally {
+                modelPrepareHandler?.cancelAll()
                 modelSupplyHandler?.cancelAll()
+                withContext(NonCancellable) {
+                    machine.snapshot().activeAttempt.identity?.let { stageHandler?.requestCancel(it) }
+                    executionJob?.cancelAndJoin()
+                    executionJob = null
+                    modelPrepareHandler?.retireAndJoin()
+                }
                 runCatching { transport?.close() }
                 heartbeatJob?.cancel()
                 heartbeatJob = null
@@ -863,6 +891,18 @@ class TaskWorkerClient(
                 when (event) {
                     TaskWorkerInboundEvent.Closed -> throw EOFException("coordinator closed worker connection")
                     TaskWorkerInboundEvent.HeartbeatAck -> Unit
+                    is TaskWorkerInboundEvent.ModelPrepare -> {
+                        val handler = modelPrepareHandler ?: throw TaskWorkerProtocolException("prepare handler unavailable", "prepare_unavailable")
+                        handler.command(event.data, scope,
+                            reply = { data ->
+                                if (transport !== connection || machine.snapshot().connection != TaskWorkerConnectionState.READY) throw CancellationException("prepare connection retired")
+                                connection.requireControlAuthority()
+                                connection.sendModelPrepare(data)
+                            }, authorize = {
+                                if (transport !== connection || machine.snapshot().connection != TaskWorkerConnectionState.READY) throw CancellationException("prepare connection retired")
+                                connection.requireControlAuthority()
+                            })
+                    }
                     is TaskWorkerInboundEvent.ModelSupply -> {
                         modelSupplyHandler?.command(event.data, scope,
                             reply = { data ->
@@ -945,6 +985,13 @@ class TaskWorkerClient(
         //   以 `attempt_identity_mismatch` 拒掉，真机表现为 Stage 响应一直等到超时。
         val providerId = (payload["provider_id"] as? String)?.takeIf { it.isNotBlank() } ?: nodeId
         activeProviderId = providerId
+        modelPrepareHandler?.validateStage(envelope)?.let { code ->
+            stageChunks.discard(identity.attemptId)
+            connection.send(TaskWorkerProtocol.buildStageAccept(
+                identity, providerId, false, code, true, newMessageId("accept"), clockMs(),
+            ))
+            return
+        }
         val expires = (payload["lease_expires_at_ms"] as Number).toLong()
         if (!machine.offer(identity, expires, clockMs())) {
             // ★ 2026-10-07（真机 P0）：拒绝必须留痕。此前设备侧完全没有日志，现场只能从
@@ -1013,7 +1060,8 @@ class TaskWorkerClient(
         publish()
         executionJob = scope.launch {
             try {
-                val execution = handler.execute(effectiveOffer)
+                val execution = modelPrepareHandler?.executeStage(effectiveOffer) { handler.execute(effectiveOffer) }
+                    ?: handler.execute(effectiveOffer)
                 if (isAttemptCancelling(identity)) {
                     // ★ 2026-10-07（DIST-NEXT-1）：取消与结果竞态 —— 已进入取消的
                     //   attempt 不得再发 `stage_result`（否则主节点会把「已取消」

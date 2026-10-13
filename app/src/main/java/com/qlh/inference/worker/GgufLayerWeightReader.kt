@@ -83,8 +83,12 @@ internal object GgufLayerWeightReader {
                     throw IOException("invalid GGUF tensor")
                 }
                 val bytes = Math.multiplyExact(elements / type.first, type.second.toLong())
-                val index = blockName.find(name)?.groupValues?.get(1)?.toIntOrNull()
-                if (index != null && index in 0 until layerCount) {
+                val block = blockName.find(name)
+                val index = block?.groupValues?.get(1)?.toIntOrNull()
+                if (block != null && (index == null || index !in 0 until layerCount)) {
+                    throw IOException("GGUF contains decoder blocks outside the requested segment")
+                }
+                if (index != null) {
                     totals[index] = Math.addExact(totals[index], bytes)
                 }
             }
