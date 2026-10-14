@@ -20,6 +20,7 @@ import com.qlh.inference.R
 import com.qlh.inference.data.SettingsDataStore
 import com.qlh.inference.model.Gemma4NativeAssets
 import com.qlh.inference.status.AndroidRuntimeStatus
+import com.qlh.inference.status.androidRuntimeStatusInvalidation
 import com.qlh.inference.status.BackendStatus
 import com.qlh.inference.status.ContextRuntimeStatus
 import com.qlh.inference.status.GpuStatus
@@ -309,18 +310,20 @@ class InferenceService : Service() {
         expectedSupplyManifestSha256: String? = null,
         prepareIdentity: com.qlh.inference.worker.WorkerPrepareIdentity? = null,
     ): Result<Unit> = inferenceModes.worker({ settings.getInferenceMode() }) {
-        if (expectedSupplyManifestSha256 != null &&
-            modelManager.currentSupply()?.manifestSha256.orEmpty() != expectedSupplyManifestSha256
-        ) {
-            Result.failure(ModelSupplyException("SUPPLY_CURRENT_CHANGED", "advertised operation is no longer current"))
-        } else {
-            if (prepareIdentity != null) {
-                modelManager.verifyWorkerPrepare(prepareIdentity)
+        androidRuntimeStatusInvalidation.afterModelChange {
+            if (expectedSupplyManifestSha256 != null &&
+                modelManager.currentSupply()?.manifestSha256.orEmpty() != expectedSupplyManifestSha256
+            ) {
+                Result.failure(ModelSupplyException("SUPPLY_CURRENT_CHANGED", "advertised operation is no longer current"))
+            } else {
+                if (prepareIdentity != null) {
+                    modelManager.verifyWorkerPrepare(prepareIdentity)
+                }
+                loadLayerModel(
+                    layerRange, contextSize, extractHidden, expectedModelSha256,
+                    expectedSourceModelId, expectedSourceModelSha256, expectedEmbeddingWidth, expectedArtifactModelId,
+                )
             }
-            loadLayerModel(
-                layerRange, contextSize, extractHidden, expectedModelSha256,
-                expectedSourceModelId, expectedSourceModelSha256, expectedEmbeddingWidth, expectedArtifactModelId,
-            )
         }
     }
 
@@ -431,7 +434,8 @@ class InferenceService : Service() {
     }
 
     /** Controller joins all owning jobs before calling this, including during a mode-lock retirement. */
-    internal suspend fun retirePreparedLayer(): Result<Unit> = unloadModelLocked()
+    internal suspend fun retirePreparedLayer(): Result<Unit> =
+        androidRuntimeStatusInvalidation.afterModelChange { unloadModelLocked() }
 
     suspend fun unloadModel(): Result<Unit> = inferenceModes.exclusive { unloadModelLocked() }
 
@@ -595,6 +599,7 @@ class InferenceService : Service() {
                 loaded = eng?.isLoaded == true,
                 loadedPath = eng?.loadedModelPath.orEmpty(),
                 loadedSourceUri = eng?.loadedModelSourceUri.orEmpty(),
+                loadedLayerRange = eng?.loadedLayerRange.orEmpty(),
                 name = modelInfo["name"].orEmpty(),
                 backend = modelInfo["backend"].orEmpty(),
                 params = modelInfo["n_params"].orEmpty(),

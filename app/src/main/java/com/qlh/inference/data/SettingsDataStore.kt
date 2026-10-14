@@ -1,5 +1,6 @@
 package com.qlh.inference.data
 
+import com.qlh.inference.IntentMasterEndpoint
 import com.qlh.inference.network.httpBaseUrl
 import com.qlh.inference.network.canonicalHost
 
@@ -161,6 +162,19 @@ class SettingsDataStore internal constructor(
 
     // ==================== 流式读取 ====================
 
+    /** Use an explicitly saved API endpoint; the legacy default is not discovery evidence. */
+    val intentMasterEndpoint: Flow<IntentMasterEndpoint?> = dataStore.data.map { prefs ->
+        val host = prefs[KEY_SERVER_HOST]?.trim()?.takeIf { it.isNotBlank() }
+        val port = prefs[KEY_SERVER_PORT] ?: DEFAULT_PORT
+        if (host == null || port !in 1..65535) null else IntentMasterEndpoint(
+            host = host, port = port,
+            clusterId = prefs[KEY_CLUSTER_ID].orEmpty(),
+            secretEpoch = prefs[KEY_CLUSTER_SECRET_EPOCH] ?: 0,
+        )
+    }
+
+    suspend fun getIntentMasterEndpoint(): IntentMasterEndpoint? = intentMasterEndpoint.first()
+
     val serverHost: Flow<String> = dataStore.data.map { prefs ->
         prefs[KEY_SERVER_HOST] ?: DEFAULT_HOST
     }
@@ -272,6 +286,7 @@ class SettingsDataStore internal constructor(
     suspend fun getInferenceMode(): String = normalizeInferenceMode(
         dataStore.data.first()[KEY_INFERENCE_MODE] ?: DEFAULT_MODE,
     )
+    suspend fun getShowThinking(): Boolean = dataStore.data.first()[KEY_SHOW_THINKING] ?: false
     suspend fun getMaxTokens(): Int = dataStore.data.first()[KEY_MAX_TOKENS] ?: DEFAULT_MAX_TOKENS
     suspend fun getTemperature(): Float = dataStore.data.first()[KEY_TEMPERATURE] ?: DEFAULT_TEMPERATURE
     suspend fun getTopP(): Float = dataStore.data.first()[KEY_TOP_P] ?: DEFAULT_TOP_P
@@ -354,20 +369,30 @@ class SettingsDataStore internal constructor(
         nodeId: String,
         modelManifestUrl: String,
         clusterSecretEpoch: Int = 1,
-    ) {
-        if (clusterSecret.isNotBlank()) saveClusterSecret(clusterSecret)
+        stillCurrent: () -> Boolean = { true },
+        publicationLock: Any = this,
+    ): Boolean = credentialMigrationMutex.withLock {
+        var saved = false
         dataStore.edit {
-            if (serverHost.isNotBlank()) it[KEY_SERVER_HOST] = serverHost
-            it[KEY_SERVER_PORT] = serverPort
-            if (masterTcpHost.isNotBlank()) it[KEY_MASTER_TCP_HOST] = masterTcpHost
-            it[KEY_MASTER_TCP_PORT] = masterTcpPort
-            it[KEY_CLUSTER_ID] = clusterId
-            it.remove(KEY_CLUSTER_SECRET)
-            it[KEY_CLUSTER_SECRET_EPOCH] = clusterSecretEpoch.coerceAtLeast(1)
-            if (nodeId.isNotBlank()) it[KEY_ANDROID_NODE_ID] = nodeId
-            if (modelManifestUrl.isNotBlank()) it[KEY_MODEL_MANIFEST_URL] = modelManifestUrl
-            it[KEY_BOOTSTRAPPED] = true
+            // User selection invalidation shares this lock with the ViewModel. The guarded
+            // transform is the publication point; delayed network results cannot enter it.
+            synchronized(publicationLock) {
+                if (!stillCurrent()) return@synchronized
+                if (clusterSecret.isNotBlank()) credentialStore.save(clusterSecret)
+                if (serverHost.isNotBlank()) it[KEY_SERVER_HOST] = serverHost
+                it[KEY_SERVER_PORT] = serverPort
+                if (masterTcpHost.isNotBlank()) it[KEY_MASTER_TCP_HOST] = masterTcpHost
+                it[KEY_MASTER_TCP_PORT] = masterTcpPort
+                it[KEY_CLUSTER_ID] = clusterId
+                it.remove(KEY_CLUSTER_SECRET)
+                it[KEY_CLUSTER_SECRET_EPOCH] = clusterSecretEpoch.coerceAtLeast(1)
+                if (nodeId.isNotBlank()) it[KEY_ANDROID_NODE_ID] = nodeId
+                if (modelManifestUrl.isNotBlank()) it[KEY_MODEL_MANIFEST_URL] = modelManifestUrl
+                it[KEY_BOOTSTRAPPED] = true
+                saved = true
+            }
         }
+        saved
     }
 
     suspend fun clearBootstrapConfig() = credentialMigrationMutex.withLock {
@@ -393,6 +418,10 @@ class SettingsDataStore internal constructor(
 
     suspend fun setInferenceMode(mode: String) {
         dataStore.edit { it[KEY_INFERENCE_MODE] = mode }
+    }
+
+    suspend fun setShowThinking(enabled: Boolean) {
+        dataStore.edit { it[KEY_SHOW_THINKING] = enabled }
     }
 
     suspend fun setMaxTokens(tokens: Int) {

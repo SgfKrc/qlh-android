@@ -99,6 +99,7 @@ import com.qlh.inference.ModelFleetEntry
 import com.qlh.inference.ModelFleetSnapshot
 import com.qlh.inference.ModelFleetStatus
 import com.qlh.inference.ModelFleetUiState
+import com.qlh.inference.ModelIntentUiState
 import com.qlh.inference.ManagementUiState
 import com.qlh.inference.ManagedBindingSnapshot
 import com.qlh.inference.ManagedUserSnapshot
@@ -110,6 +111,7 @@ import com.qlh.inference.network.httpBaseUrl
 import com.qlh.inference.service.ModelManager
 import com.qlh.inference.system.WorkerBatteryPolicy
 import com.qlh.inference.status.AndroidRuntimeStatus
+import com.qlh.inference.status.ModelRuntimeStatus
 import com.qlh.inference.network.AndroidPresenceSnapshot
 import com.qlh.inference.network.AndroidPresenceState
 import com.qlh.inference.ui.components.QlhTopBar
@@ -243,6 +245,14 @@ fun SettingsScreen(
     onDownloadAppUpdate: () -> Unit = {},
     onOpenInstallPermissionSettings: () -> Unit = {},
     onInstallDownloadedUpdate: () -> Unit = {},
+    modelIntent: ModelIntentUiState = ModelIntentUiState(),
+    masterDiscoveryBusy: Boolean = false,
+    onDiscoverMaster: () -> Unit = {},
+    onRefreshModelIntent: () -> Unit = {},
+    onSelectMasterModel: (String, String) -> Unit = { _, _ -> },
+    onRetryModelIntent: () -> Unit = {},
+    onCancelModelIntent: () -> Unit = {},
+    onPreparedChat: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val isLite = BuildConfig.IS_LITE
@@ -252,6 +262,7 @@ fun SettingsScreen(
         onRefreshDiagnostics()
         onRefreshClusterOverview()
         onRefreshModelFleet()
+        onRefreshModelIntent()
         onRefreshAudit()
         onRefreshAuthControl()
     }
@@ -279,19 +290,31 @@ fun SettingsScreen(
                 error = runtimeStatusError,
                 onRefresh = onRefreshRuntimeStatus
             )
-            ConnectionGroup(
-                serverHost = serverHost,
-                serverPort = serverPort,
-                onServerHostChange = onServerHostChange,
-                onServerPortChange = onServerPortChange,
-                onConnectionTestSuccess = onConnectionTestSuccess
-            )
-
             InferenceModeGroup(
                 inferenceMode = inferenceMode,
                 isLite = isLite,
                 onInferenceModeChange = onInferenceModeChange
             )
+
+            if (inferenceMode != SettingsDataStore.MODE_LOCAL) {
+                ModelIntentPanel(
+                    state = modelIntent, discovering = masterDiscoveryBusy,
+                    onDiscoverMaster = onDiscoverMaster, onRefresh = onRefreshModelIntent,
+                    onSelectModel = onSelectMasterModel, onRetry = onRetryModelIntent,
+                    onCancel = onCancelModelIntent, onChat = onPreparedChat,
+                )
+            }
+
+            CollapsibleSettingsGroup(
+                title = "高级连接设置", summary = "手动调整已保存的主节点连接",
+                icon = Icons.Default.NetworkCheck, testTag = "master_connection_details",
+            ) {
+                ConnectionGroup(
+                    serverHost = serverHost, serverPort = serverPort,
+                    onServerHostChange = onServerHostChange, onServerPortChange = onServerPortChange,
+                    onConnectionTestSuccess = onConnectionTestSuccess,
+                )
+            }
 
             PresenceStatusGroup(presence)
 
@@ -345,7 +368,7 @@ fun SettingsScreen(
                 onThemeModeChange = onThemeModeChange
             )
 
-            if (!isLite) {
+            if (!isLite && inferenceMode == SettingsDataStore.MODE_LOCAL) {
                 SettingsGroup(title = "模型管理", icon = Icons.Default.FolderOpen) {
                     ModelManagementPanel(
                         modelTreeUri = modelTreeUri,
@@ -1826,8 +1849,8 @@ private fun InferenceParamsGroup(
 ) {
     SettingsGroup(title = "推理参数", icon = Icons.Default.Tune) {
         SettingRow(
-            title = "显示思考过程",
-            subtitle = "仅影响对话内容的展示，不改变模型执行模式",
+            title = "深度思考",
+            subtitle = "控制思考生成与展示；关闭后请求主节点禁用思考（需模型支持）",
             trailing = {
                 Switch(
                     checked = showThinking,
@@ -1850,7 +1873,7 @@ private fun InferenceParamsGroup(
                 it.toIntOrNull()?.let { v -> if (v in 1..8192) onMaxTokensChange(v) }
             },
             label = { Text("最大 Token 数") },
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier.fillMaxWidth().testTag("settings_max_tokens"),
             singleLine = true,
             shape = MaterialTheme.shapes.small,
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
@@ -2551,7 +2574,7 @@ private fun ModelStatusGroup(status: AndroidRuntimeStatus) {
     val mdl = status.model
     CollapsibleSettingsGroup(
         title = "模型状态",
-        summary = if (mdl.loaded) "已加载：${mdl.name.ifBlank { "当前模型" }}" else "尚未加载模型",
+        summary = modelRuntimeStatusLabel(mdl),
         icon = Icons.Default.Info,
         testTag = "settings_model_details"
     ) {
@@ -2563,6 +2586,7 @@ private fun ModelStatusGroup(status: AndroidRuntimeStatus) {
             }
             StatusRow("来源", mdl.selectedSource.ifBlank { "-" })
             if (mdl.loaded) {
+                StatusRow("加载范围", loadedModelScopeLabel(mdl))
                 StatusRow("模型名", mdl.name.ifBlank { "-" })
                 StatusRow("后端", mdl.backend.ifBlank { "-" })
                 StatusRow("参数量", mdl.params.ifBlank { "-" })
@@ -2577,6 +2601,21 @@ private fun ModelStatusGroup(status: AndroidRuntimeStatus) {
         }
     }
 }
+
+/** These labels describe this device's native slot, independently of master intent readiness. */
+internal fun loadedModelScopeLabel(model: ModelRuntimeStatus): String {
+    if (model.loadedLayerRange.isEmpty()) return "整模"
+    val range = model.loadedLayerRange
+    return if (range.size == 2 && range[0] >= 0 && range[1] > range[0]) {
+        "层段 [${range[0]},${range[1]})"
+    } else {
+        "层段"
+    }
+}
+
+internal fun modelRuntimeStatusLabel(model: ModelRuntimeStatus): String =
+    if (model.loaded) "已加载${loadedModelScopeLabel(model)}：${model.name.ifBlank { "当前模型" }}"
+    else "尚未加载模型"
 
 @Composable
 private fun ContextGroup(status: AndroidRuntimeStatus) {

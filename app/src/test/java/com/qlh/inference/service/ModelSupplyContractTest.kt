@@ -274,6 +274,7 @@ class ModelSupplyContractTest {
             val f = fixture(extraWeightBytes = 512 * 1024)
             val root = temp.newFolder("short-read-binding-$committed")
             val progress = mutableListOf<ModelSupplyProgress>()
+            val diagnostics = mutableListOf<ModelSupplyTransferDiagnostic>()
             var current = true
             var weightRead = 0
             val client = shortReadClient(f, afterRead = { path, position ->
@@ -284,7 +285,7 @@ class ModelSupplyContractTest {
             })
             val failure = runCatching {
                 ModelSupplyReceiver(root, "127.0.0.1", client = client).receive(f.manifest, 1, "secret",
-                    { current }, { progress += it }, { fail("stale chunk published") })
+                    { current }, { progress += it }, { fail("stale chunk published") }, diagnostics = { diagnostics += it })
             }.exceptionOrNull()
             assertTrue(failure is ModelSupplyException)
             assertEquals("SUPPLY_CANCELLED", (failure as ModelSupplyException).reasonCode)
@@ -293,6 +294,8 @@ class ModelSupplyContractTest {
             assertEquals(committed.toLong(), stage.resolve(f.manifest.weight.path + ".part").length())
             assertEquals(committed.toLong(), progress.last().downloadedBytes)
             assertEquals(weightRead.toLong(), progress.last().actualDownloadedBytes)
+            assertEquals(weightRead.toLong(), diagnostics.sumOf { it.actualNewBytes })
+            assertTrue(diagnostics.last().terminal)
             if (committed > 0) checkpoint(root, f, committed.toLong())
             else assertFalse(stage.resolve(ModelSupplyReceiver.RESUME_MARKER).exists())
             assertTrue(scanSuppliedSegmentRoots(root).isEmpty())
@@ -1126,4 +1129,56 @@ class ModelSupplyContractTest {
         assertTrue(scanSuppliedSegmentRoots(root).isEmpty())
         assertFalse(root.resolve(ModelSupplyCurrent.POINTER).exists())
     }
+
+    @Test fun `transfer diagnostics aggregate five second windows and only fresh bytes without identifiers`() = runBlocking {
+        val f = fixture(extraWeightBytes = 512 * 1024)
+        val root = temp.newFolder("transfer-timings")
+        val snapshots = mutableListOf<ModelSupplyTransferDiagnostic>()
+        var nanos = 0L
+        val client = shortReadClient(f, afterRead = { _, _ -> nanos += 100_000_000L })
+        val final = ModelSupplyReceiver(root, "127.0.0.1", client = client, nanoTime = { nanos }).receive(
+            f.manifest, 1, "sensitive-token-never-log", { nanos += 1_000_000L; true },
+            { nanos += 2_000_000L }, { it() }, diagnostics = { snapshots += it },
+        )
+        assertTrue("must aggregate across multiple windows", snapshots.size >= 3)
+        assertEquals(1, snapshots.count { it.terminal })
+        assertTrue(snapshots.last().terminal)
+        assertTrue(snapshots.filterNot { it.terminal }.all { it.elapsedNanos >= 5_000_000_000L })
+        val actual = f.manifest.files.sumOf { it.size }
+        assertEquals(actual, snapshots.sumOf { it.actualNewBytes })
+        assertEquals(actual, snapshots.last().actualTotalBytes)
+        assertTrue(snapshots.sumOf { it.readNanos } > 0)
+        assertTrue(snapshots.sumOf { it.liveCheckNanos } > 0)
+        assertTrue(snapshots.sumOf { it.progressNanos } > 0)
+        for (snapshot in snapshots) {
+            assertTrue(snapshot.readNanos + snapshot.liveCheckNanos + snapshot.writeHashNanos +
+                snapshot.checkpointNanos + snapshot.progressNanos <= snapshot.elapsedNanos)
+            assertTrue("log fields must be numeric only", Regex("transfer_perf(?: [a-z_]+=[0-9]+)+").matches(snapshot.logMessage()))
+            assertFalse(snapshot.logMessage().contains("sensitive-token"))
+            assertFalse(snapshot.logMessage().contains(f.manifest.operationId))
+            assertFalse(snapshot.logMessage().contains(f.manifest.weight.path))
+        }
+        f.files.forEach { (path, bytes) -> assertArrayEquals(bytes, final.resolve(path).readBytes()) }
+    }
+
+    @Test fun `diagnostic failure cannot replace IO failure or lose a durable short tail`() = runBlocking {
+        val prefixBytes = 256 * 1024 + 11
+        val f = fixture(extraWeightBytes = 512 * 1024)
+        val root = temp.newFolder("diagnostic-failure")
+        val snapshots = mutableListOf<ModelSupplyTransferDiagnostic>()
+        val progress = mutableListOf<ModelSupplyProgress>()
+        val failure = runCatching {
+            ModelSupplyReceiver(root, "127.0.0.1", client = shortReadClient(f, failAfter = prefixBytes))
+                .receive(f.manifest, 1, "secret", { true }, { progress += it }, { fail("failed transfer published") },
+                    diagnostics = { snapshots += it; throw IOException("logger unavailable") })
+        }.exceptionOrNull()
+        assertTrue(failure is IOException)
+        assertEquals("short-read disconnect", failure!!.message)
+        checkpoint(root, f, prefixBytes.toLong())
+        assertEquals(prefixBytes.toLong(), progress.last().actualDownloadedBytes)
+        assertEquals(prefixBytes.toLong(), snapshots.sumOf { it.actualNewBytes })
+        assertTrue(snapshots.last().terminal)
+        assertTrue(scanSuppliedSegmentRoots(root).isEmpty())
+    }
+
 }

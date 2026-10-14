@@ -1,10 +1,13 @@
 package com.qlh.inference.network
 
 import com.google.gson.Gson
+import com.google.gson.GsonBuilder
+import com.google.gson.ToNumberPolicy
 import com.google.gson.JsonParser
 import com.qlh.inference.security.AuthSessionStore
 import com.qlh.inference.security.StoredAuthSession
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.async
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -623,6 +626,131 @@ class ApiClientContractTest {
         assertEquals("/api/auth/manage/audit?limit=200", seen?.path)
     }
 
+    private fun productChatRepository(
+        saved: MutableList<com.qlh.inference.data.MessageEntity>,
+        localEngine: () -> com.qlh.inference.service.InferenceService?,
+    ): ChatRepository {
+        val sessions = object : com.qlh.inference.data.SessionDao {
+            override fun getAllSessions(): kotlinx.coroutines.flow.Flow<List<com.qlh.inference.data.SessionEntity>> =
+                kotlinx.coroutines.flow.flowOf(emptyList())
+            override suspend fun getById(sessionId: Long): com.qlh.inference.data.SessionEntity? = error("unexpected session lookup")
+            override suspend fun insert(session: com.qlh.inference.data.SessionEntity): Long = error("unexpected session insert")
+            override suspend fun update(session: com.qlh.inference.data.SessionEntity) = error("unexpected session update")
+            override suspend fun updateTitle(sessionId: Long, title: String, updatedAt: Long) = error("unexpected title update")
+            override suspend fun updateMessageCount(sessionId: Long, count: Int, updatedAt: Long) = Unit
+            override suspend fun deleteById(sessionId: Long) = error("unexpected session delete")
+        }
+        val messages = object : com.qlh.inference.data.MessageDao {
+            override fun getMessagesBySession(sessionId: Long): kotlinx.coroutines.flow.Flow<List<com.qlh.inference.data.MessageEntity>> =
+                kotlinx.coroutines.flow.flowOf(saved.filter { it.sessionId == sessionId })
+            override suspend fun getRecentMessages(sessionId: Long, limit: Int): List<com.qlh.inference.data.MessageEntity> = error("unexpected recent messages")
+            override suspend fun insert(message: com.qlh.inference.data.MessageEntity): Long {
+                saved.add(message)
+                return saved.size.toLong()
+            }
+            override suspend fun deleteBySession(sessionId: Long) = error("unexpected message delete")
+            override suspend fun deleteById(messageId: Long) = error("unexpected message delete")
+            override suspend fun getCount(sessionId: Long): Int = saved.count { it.sessionId == sessionId }
+        }
+        return ChatRepository(sessions, messages, { client }, localEngine)
+    }
+
+    @Test
+    fun `product chat repository requires distribution and preserves response model identity`() {
+        var seen: Request? = null
+        route("/api/chat") { req, reply ->
+            seen = req
+            reply(200, """{"content":"2","metrics":{"distributed_used":true,"fallback":false,"model_operation_id":"supply_response","model_config_id":"plan_response","model_generation":7}}""")
+        }
+        val saved = mutableListOf<com.qlh.inference.data.MessageEntity>()
+        val repository = productChatRepository(saved) { error("distributed chat cannot use local engine") }
+        val result = runBlocking { repository.sendMessage(1, "What is 1+1?", skipUserSave = true) }
+        assertTrue(result.isSuccess)
+        assertEquals("2", result.getOrNull())
+        val request = parseJson(seen!!.body)
+        assertEquals("distributed_required", request.get("routing_preference").asString)
+        assertFalse(request.get("enable_thinking").asBoolean)
+        assertFalse(request.get("show_thinking").asBoolean)
+        assertEquals(1, saved.size)
+        val metrics = parseJson(saved.single().metrics!!)
+        assertEquals("supply_response", metrics.get("model_operation_id").asString)
+        assertEquals("plan_response", metrics.get("model_config_id").asString)
+        assertEquals(7, metrics.get("model_generation").asLong)
+    }
+
+    @Test
+    fun `chat preserves native generation longs and fractional metrics`() = runBlocking {
+        for (generation in listOf(1791912357956122300L, 1791909775815263900L)) {
+            route("/api/chat") { req, reply ->
+                assertEquals("POST", req.method)
+                reply(200, """{"content":"2","metrics":{"model_generation":$generation,"tokens_per_second":12.75,"completion_tokens":32}}""")
+            }
+            val response = client.chat(ChatRequest("1+1=?", routingPreference = "distributed_required")).getOrThrow()
+            val metrics = response.metrics!!
+            assertTrue("native generation must stay a Long", metrics["model_generation"] is Long)
+            assertEquals(generation, metrics["model_generation"])
+            assertTrue("fractional TPS must stay a Double", metrics["tokens_per_second"] is Double)
+            assertEquals(12.75, metrics["tokens_per_second"] as Double, 0.0)
+            assertEquals(32L, metrics["completion_tokens"])
+        }
+    }
+
+    @Test
+    fun `product chat repository persists exact native generation decimal and fractional TPS`() {
+        val saved = mutableListOf<com.qlh.inference.data.MessageEntity>()
+        val repository = productChatRepository(saved) { error("distributed chat cannot use local engine") }
+        for (generation in listOf(1791912357956122300L, 1791909775815263900L)) {
+            route("/api/chat") { req, reply ->
+                assertEquals("distributed_required", parseJson(req.body)["routing_preference"].asString)
+                reply(200, """{"content":"2","metrics":{"distributed_used":true,"fallback":false,"model_operation_id":"supply_response","model_config_id":"plan_response","model_generation":$generation,"tokens_per_second":12.75}}""")
+            }
+            val result = runBlocking { repository.sendMessage(1, "What is 1+1?", skipUserSave = true) }
+            assertEquals("2", result.getOrThrow())
+            val assistant = saved.last()
+            assertEquals("assistant", assistant.role)
+            val metrics = parseJson(assistant.metrics!!)
+            val persistedGeneration = metrics["model_generation"].asJsonPrimitive
+            assertTrue("generation must remain a JSON number", persistedGeneration.isNumber)
+            assertEquals(generation.toString(), persistedGeneration.toString())
+            assertEquals(generation, persistedGeneration.asLong)
+            assertEquals("supply_response", metrics["model_operation_id"].asString)
+            assertEquals("plan_response", metrics["model_config_id"].asString)
+            assertTrue(metrics["tokens_per_second"].asJsonPrimitive.isNumber)
+            assertEquals(12.75, metrics["tokens_per_second"].asDouble, 0.0)
+        }
+        assertEquals(2, saved.size)
+    }
+
+    @Test
+    fun `chat respects an explicitly injected Gson number strategy`() = runBlocking {
+        val generation = 1791912357956122300L
+        client = ApiClient(
+            baseUrl = "http://127.0.0.1:${server.port}",
+            gson = GsonBuilder().setObjectToNumberStrategy(ToNumberPolicy.BIG_DECIMAL).create(),
+        )
+        route("/api/chat") { _, reply ->
+            reply(200, """{"content":"2","metrics":{"model_generation":$generation,"tokens_per_second":12.75}}""")
+        }
+        val metrics = client.chat(ChatRequest("1+1=?")).getOrThrow().metrics!!
+        assertEquals(java.math.BigDecimal(generation.toString()), metrics["model_generation"])
+        assertEquals(java.math.BigDecimal("12.75"), metrics["tokens_per_second"])
+    }
+
+    @Test
+    fun `product chat repository propagates distribution refusal without local fallback`() {
+        var seen: Request? = null
+        route("/api/chat") { req, reply ->
+            seen = req
+            reply(409, """{"detail":{"code":"distributed_unavailable","message":"No ready stage plan"}}""")
+        }
+        val saved = mutableListOf<com.qlh.inference.data.MessageEntity>()
+        val repository = productChatRepository(saved) { error("refused distributed chat cannot load local model") }
+        val result = runBlocking { repository.sendMessage(1, "What is 1+1?", skipUserSave = true) }
+        assertTrue(result.isFailure)
+        assertEquals("distributed_required", parseJson(seen!!.body).get("routing_preference").asString)
+        assertTrue(saved.isEmpty())
+    }
+
     // ---- chat ----
 
     @Test
@@ -643,6 +771,7 @@ class ApiClientContractTest {
         assertEquals(1024, json.get("max_new_tokens").asInt)
         assertEquals(0.7f, json.get("temperature").asFloat, 1e-6f)
         assertEquals(false, json.get("show_thinking").asBoolean)
+        assertEquals(false, json.get("enable_thinking").asBoolean)
         assertEquals("distributed_preferred", json.get("routing_preference").asString)
         assertTrue("默认请求不应带 allow_external", !json.has("allow_external"))
     }
@@ -1068,6 +1197,186 @@ class ApiClientContractTest {
         val unreachable = ApiClient(baseUrl = "http://127.0.0.1:1")
         val result = runBlocking { unreachable.chat(ChatRequest(message = "x")) }
         assertTrue(result.isFailure)
+    }
+
+    private fun intentOperationJson(status: String = "supplying", loaded: Boolean = false, id: String = "supply_abc"): String =
+        """{"operation_id":"$id","intent":{"model_id":"qwen","engine":"auto","quant_type":"","strategy":"auto","timeout_seconds":3600},"status":"$status","reason_code":null,"reason":null,"config_id":"cfg-1","generation":7,"loaded_ready":$loaded,"nodes":{"phone":{"status":"verifying","bytes_received":3456789123,"total_bytes":4567891234,"reason_code":"SUPPLY_HASH_MISMATCH","reason":"checksum failed","layer_range":[4,8]}},"plan":{"node_count":1},"updated_at":123.5}"""
+
+    @Test
+    fun `intent catalog is path free and includes master binding`() = runBlocking {
+        route("/api/models/intent/catalog") { request, reply ->
+            assertEquals("GET", request.method)
+            reply(200, """{"models":[{"model_id":"qwen","name":"Qwen","is_available":true,"available_formats":["gguf"],"path":"C:/private/model.gguf"}],"active_model_id":"qwen","binding":{"status":"connected","is_master":true,"master_host":"100.64.0.1","master_api_port":8000,"reason_code":null}}""")
+        }
+        val catalog = client.getModelIntentCatalog().getOrThrow()
+        assertEquals("connected", catalog.binding.status)
+        assertTrue(catalog.binding.isMaster)
+        assertEquals("qwen", catalog.activeModelId)
+        assertTrue(catalog.models.single().isAvailable)
+        assertFalse(Gson().toJson(catalog).contains("private"))
+    }
+
+    @Test
+    fun `intent current null succeeds but missing or invalid operation fails closed`() = runBlocking {
+        route("/api/models/intent/current") { _, reply -> reply(200, "null") }
+        val empty = client.getCurrentModelIntent()
+        assertTrue(empty.isSuccess)
+        assertEquals(null, empty.getOrThrow())
+        for (body in listOf("", "{}", "null trailing", intentOperationJson("unknown"))) {
+            route("/api/models/intent/current") { _, reply -> reply(200, body) }
+            assertTrue("accepted $body", client.getCurrentModelIntent().isFailure)
+        }
+    }
+
+    @Test
+    fun `intent post uses exact master owned supply and prepare request`() = runBlocking {
+        route("/api/models/intent") { request, reply ->
+            assertEquals("POST", request.method)
+            assertEquals(parseJson("""{"model_id":"qwen","engine":"auto","quant_type":"","strategy":"auto","timeout_seconds":3600}"""), parseJson(request.body))
+            reply(202, intentOperationJson())
+        }
+        val operation = client.submitModelIntent(ModelIntentRequest("qwen")).getOrThrow()
+        assertEquals("supply_abc", operation.operationId)
+        assertEquals(7L, operation.generation)
+        assertEquals("cfg-1", operation.configId)
+        assertFalse(operation.readyForChat)
+        assertEquals(3456789123L, operation.nodes.getValue("phone").bytesReceived)
+        assertEquals("SUPPLY_HASH_MISMATCH", operation.nodes.getValue("phone").reasonCode)
+        assertEquals(4, operation.nodes.getValue("phone").layerRange!!.asJsonArray[0].asInt)
+        assertEquals(1, operation.plan!!.asJsonObject["node_count"].asInt)
+    }
+
+    @Test
+    fun `intent get and delete address the same operation with proper methods`() = runBlocking {
+        var requests = 0
+        route("/api/models/intent/supply_abc") { request, reply ->
+            requests++
+            assertEquals(if (requests == 1) "GET" else "DELETE", request.method)
+            assertEquals("", request.body)
+            reply(200, intentOperationJson(if (requests == 1) "preparing" else "cancelled"))
+        }
+        assertEquals("preparing", client.getModelIntent("supply_abc").getOrThrow().status)
+        assertEquals("cancelled", client.cancelModelIntent("supply_abc").getOrThrow().status)
+        assertEquals(2, requests)
+    }
+
+    @Test
+    fun `intent invalid ids options mismatched response and null post fail closed`() = runBlocking {
+        for (id in listOf("", "../current", "supply_x/../current", "supply_x?secret=y", "other_x")) {
+            assertTrue(client.getModelIntent(id).isFailure)
+            assertTrue(client.cancelModelIntent(id).isFailure)
+        }
+        assertTrue(client.submitModelIntent(ModelIntentRequest("qwen", engine = "bad")).isFailure)
+        route("/api/models/intent/supply_abc") { _, reply -> reply(200, intentOperationJson(id = "supply_other")) }
+        assertTrue(client.getModelIntent("supply_abc").isFailure)
+        route("/api/models/intent") { _, reply -> reply(200, "null") }
+        assertTrue(client.submitModelIntent(ModelIntentRequest("qwen")).isFailure)
+    }
+
+    @Test
+    fun `intent only loaded ready enables chat and all contract states parse`() = runBlocking {
+        for (status in MODEL_INTENT_STATUSES) {
+            route("/api/models/intent/current") { _, reply -> reply(200, intentOperationJson(status, loaded = true)) }
+            val operation = client.getCurrentModelIntent().getOrThrow()!!
+            assertEquals(status == "ready", operation.readyForChat)
+        }
+        route("/api/models/intent/current") { _, reply -> reply(200, intentOperationJson("ready", loaded = false)) }
+        assertFalse(client.getCurrentModelIntent().getOrThrow()!!.readyForChat)
+    }
+
+    @Test
+    fun `intent HTTP failures retain named reasons and authenticated requests`() = runBlocking {
+        client = ApiClient("http://127.0.0.1:${server.port}", authStore = FakeAuthStore(storedSession()))
+        route("/api/models/intent/catalog") { request, reply ->
+            assertEquals("Bearer ${storedSession().accessToken}", request.headers["Authorization"])
+            reply(409, """{"detail":{"reason_code":"INTENT_NODES_UNAVAILABLE","reason":"No admitted workers"}}""")
+        }
+        val error = client.getModelIntentCatalog().exceptionOrNull()!!
+        assertTrue(error is ApiClientHttpException)
+        assertEquals("INTENT_NODES_UNAVAILABLE", com.qlh.inference.modelIntentError(error).code)
+        assertEquals("No admitted workers", com.qlh.inference.modelIntentError(error).reason)
+    }
+
+    @Test
+    fun `intent network request is cancellable instead of returning a failure result`() = runBlocking {
+        val entered = java.util.concurrent.CountDownLatch(1)
+        val release = java.util.concurrent.CountDownLatch(1)
+        route("/api/models/intent/current") { _, reply ->
+            entered.countDown()
+            release.await(5, java.util.concurrent.TimeUnit.SECONDS)
+            reply(200, "null")
+        }
+        val request = async { client.getCurrentModelIntent() }
+        try {
+            assertTrue(kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                entered.await(5, java.util.concurrent.TimeUnit.SECONDS)
+            })
+            request.cancel()
+            kotlinx.coroutines.withTimeout(1500) { request.join() }
+            assertTrue(request.isCancelled)
+        } finally { release.countDown() }
+    }
+
+    @Test
+    fun `discovery candidate verifies HTTP master before encrypted first connect`() = runBlocking {
+        val calls = mutableListOf<String>()
+        route("/api/bootstrap/info") { request, reply ->
+            calls += "info"
+            assertEquals("GET", request.method)
+            reply(200, """{"is_master":true}""")
+        }
+        route("/api/bootstrap/first-connect") { request, reply ->
+            calls += "encrypted-bootstrap"
+            assertEquals("POST", request.method)
+            assertTrue(parseJson(request.body).has("credential_public_key"))
+            reply(200, bootstrapResponseFor(request, "discovered-secret"))
+        }
+        val result = client.firstConnectVerifiedMaster(BootstrapRequest(nodeId = "android-discovery", hostname = "Phone"))
+        assertEquals("discovered-secret", result.getOrThrow().clusterSecret)
+        assertEquals(listOf("info", "encrypted-bootstrap"), calls)
+    }
+
+    @Test
+    fun `unverified or retired discovery candidate never attempts bootstrap`() = runBlocking {
+        var bootstrapCalls = 0
+        route("/api/bootstrap/first-connect") { _, reply -> bootstrapCalls++; reply(500, "{}") }
+        for (body in listOf("{}", """{"is_master":false}""")) {
+            route("/api/bootstrap/info") { _, reply -> reply(200, body) }
+            assertTrue(client.firstConnectVerifiedMaster(BootstrapRequest("android-discovery", hostname = "Phone")).isFailure)
+        }
+        route("/api/bootstrap/info") { _, reply -> reply(200, """{"is_master":true}""") }
+        assertTrue(client.firstConnectVerifiedMaster(BootstrapRequest("android-discovery", hostname = "Phone")) { false }.isFailure)
+        assertEquals(0, bootstrapCalls)
+    }
+
+    @Test
+    fun `short no thinking chat serializes explicit false and token limit`() = runBlocking {
+        route("/api/chat") { request, reply ->
+            assertEquals("POST", request.method)
+            val body = parseJson(request.body)
+            assertEquals("1+1=? 只回答数字。", body["message"].asString)
+            assertEquals(32, body["max_new_tokens"].asInt)
+            assertTrue(body.has("show_thinking"))
+            assertFalse(body["show_thinking"].asBoolean)
+            assertTrue(body.has("enable_thinking"))
+            assertFalse(body["enable_thinking"].asBoolean)
+            reply(200, """{"content":"2","metrics":{"distributed_used":true,"model_operation_id":"supply_abc","model_config_id":"cfg-1","model_generation":7}}""")
+        }
+        val response = client.chat(ChatRequest("1+1=? 只回答数字。", maxNewTokens = 32, showThinking = false)).getOrThrow()
+        assertEquals("2", response.content)
+        assertEquals("supply_abc", response.metrics?.get("model_operation_id"))
+    }
+
+
+    @Test
+    fun `thinking switch enables generation and display together`() = runBlocking {
+        route("/api/chat") { request, reply ->
+            val body = parseJson(request.body)
+            assertTrue(body["show_thinking"].asBoolean)
+            assertTrue(body["enable_thinking"].asBoolean)
+            reply(200, """{"content":"answer"}""")
+        }
+        assertTrue(client.chat(ChatRequest("question", showThinking = true)).isSuccess)
     }
 
 }

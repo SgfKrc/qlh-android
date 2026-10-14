@@ -111,6 +111,7 @@ class MainActivity : ComponentActivity() {
         super.onResume()
         viewModel.refreshModelDirectoryAuthorization()
         viewModel.refreshAppInstallPermission()
+        viewModel.refreshModelIntent()
         // ★ 2026-10-08（goal ①-B）：电池优化豁免状态随 resume 刷新 —— 用户从系统对话框回来后
         //   设置页要立刻反映"已豁免"，否则"状态可见"就只是静态快照。
         viewModel.refreshBatteryExemption()
@@ -187,7 +188,13 @@ fun MainApp(
                 onRetry = { viewModel.retryLastMessage() },
                 onClearError = { viewModel.clearError() },
                 modifier = Modifier.padding(innerPadding),
-                inferenceMode = uiState.inferenceMode
+                inferenceMode = uiState.inferenceMode,
+                modelIntent = uiState.modelIntent,
+                modelReady = modelIntentAllowsChat(uiState.inferenceMode, uiState.modelIntent),
+                masterDiscoveryBusy = uiState.masterDiscoveryBusy,
+                onOpenModelSettings = { viewModel.selectTab("settings") },
+                onRetryModelIntent = { viewModel.retryModelIntent() },
+                onCancelModelIntent = { viewModel.cancelModelIntent() },
             )
             "sessions" -> SessionListScreen(
                 sessions = uiState.sessions,
@@ -214,8 +221,16 @@ fun MainApp(
                 onTemperatureChange = { viewModel.setTemperature(it) },
                 onTopPChange = { viewModel.setTopP(it) },
                 onContextSizeChange = { viewModel.setContextSize(it) },
-                onShowThinkingChange = { /* no-op for now */ },
+                onShowThinkingChange = { viewModel.setShowThinking(it) },
                 onThemeModeChange = { viewModel.setThemeMode(it) },
+                modelIntent = uiState.modelIntent,
+                masterDiscoveryBusy = uiState.masterDiscoveryBusy,
+                onDiscoverMaster = { viewModel.onDiscoverMaster() },
+                onRefreshModelIntent = { viewModel.refreshModelIntent() },
+                onSelectMasterModel = { modelId, engine -> viewModel.selectMasterModel(modelId, engine) },
+                onRetryModelIntent = { viewModel.retryModelIntent() },
+                onCancelModelIntent = { viewModel.cancelModelIntent() },
+                onPreparedChat = { viewModel.openPreparedChat() },
                 modelTreeUri = uiState.modelTreeUri,
                 modelDirectoryGrant = uiState.modelDirectoryGrant,
                 selectedModelUri = uiState.selectedModelUri,

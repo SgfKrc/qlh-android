@@ -18,6 +18,10 @@ import com.qlh.inference.data.SessionEntity
 import com.qlh.inference.data.SettingsDataStore
 import com.qlh.inference.logging.QlhLogger
 import com.qlh.inference.network.ApiClient
+import com.qlh.inference.network.MasterDiscovery
+import com.qlh.inference.network.ModelIntentRequest
+import com.qlh.inference.network.canonicalHost
+import com.qlh.inference.network.validDiscoveryHost
 import com.qlh.inference.network.AndroidPresenceSnapshot
 import com.qlh.inference.network.AndroidPresenceState
 import com.qlh.inference.network.GgufModelInfo
@@ -35,6 +39,7 @@ import com.qlh.inference.service.LayerArtifactCandidate
 import com.qlh.inference.service.toCandidate
 import com.qlh.inference.service.unambiguousLayerArtifactCandidates
 import com.qlh.inference.status.AndroidRuntimeStatus
+import com.qlh.inference.status.androidRuntimeStatusInvalidation
 import com.qlh.inference.system.WorkerBatteryPolicy
 import com.qlh.inference.system.AndroidDeviceInfoProvider
 import com.qlh.inference.security.AuthTokenStore
@@ -113,6 +118,8 @@ data class MainUiState(
     val diagnostics: DiagnosticsUiState = DiagnosticsUiState(),
     val clusterOverview: ClusterOverviewUiState = ClusterOverviewUiState(),
     val modelFleet: ModelFleetUiState = ModelFleetUiState(),
+    val modelIntent: ModelIntentUiState = ModelIntentUiState(),
+    val masterDiscoveryBusy: Boolean = false,
     val audit: AuditUiState = AuditUiState(),
     val authControl: AuthControlUiState = AuthControlUiState(),
     val management: ManagementUiState = ManagementUiState(),
@@ -198,7 +205,36 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val uiState: StateFlow<MainUiState> = _uiState.asStateFlow()
 
     private var lastAutoRegisterKey: String = ""
+    private var runtimeStatusRefreshJob: Job? = null
     private val modeSwitchMutex = Mutex()
+    private val endpointChangeMutex = Mutex()
+    private val masterBindingPublicationLock = Any()
+    @Volatile private var modeSelectionSerial = 0L
+    @Volatile private var masterSelectionSerial = 0L
+    @Volatile private var modeSelectionPending = false
+    private var endpointSelectionPending = false
+    private var intentInitialized = false
+    private var intentEndpoint: IntentMasterEndpoint? = null
+    private var discoveryJob: Job? = null
+    private val modelIntentController = ModelIntentController(viewModelScope, { endpoint ->
+        ApiClient(httpBaseUrl(endpoint.host, endpoint.port), authStore = authStore)
+    })
+
+    private fun syncModelIntentContext() {
+        if (!intentInitialized) return
+        modelIntentController.updateContext(
+            _uiState.value.inferenceMode, intentEndpoint,
+            paused = modeSelectionPending || endpointSelectionPending || _uiState.value.masterDiscoveryBusy,
+        )
+    }
+
+    private fun retireMasterSelection() {
+        endpointSelectionPending = false
+        synchronized(masterBindingPublicationLock) { masterSelectionSerial++ }
+        discoveryJob?.cancel()
+        modelIntentController.suspendForSelection()
+        _uiState.value = _uiState.value.copy(masterDiscoveryBusy = false)
+    }
 
     private fun apiClient(state: MainUiState = _uiState.value): ApiClient =
         ApiClient(httpBaseUrl(state.serverHost, state.serverPort), authStore = authStore)
@@ -234,6 +270,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 val host = settings.getServerHost()
                 val port = settings.getServerPort()
                 val mode = if (BuildConfig.IS_LITE) SettingsDataStore.MODE_FALLBACK else settings.getInferenceMode()
+                val showThinking = settings.getShowThinking()
                 val maxTokens = settings.getMaxTokens()
                 val temp = settings.getTemperature()
                 val topP = settings.getTopP()
@@ -251,9 +288,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 _uiState.value = _uiState.value.copy(
                     currentSessionId = initialSessionId,
                     currentSessionTitle = initialSession?.title ?: "新对话",
-                    serverHost = host,
-                    serverPort = port,
-                    inferenceMode = mode,
+                    serverHost = if (masterSelectionSerial == 0L) host else _uiState.value.serverHost,
+                    serverPort = if (masterSelectionSerial == 0L) port else _uiState.value.serverPort,
+                    inferenceMode = if (modeSelectionSerial == 0L) mode else _uiState.value.inferenceMode,
+                    showThinking = showThinking,
                     maxTokens = maxTokens,
                     temperature = temp,
                     topP = topP,
@@ -271,7 +309,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     ),
                 )
                 QlhApplication.instance.inferenceService?.modelContextSize = contextSize
-                ensureAndroidBootstrap()
+                intentEndpoint = settings.getIntentMasterEndpoint()
+                intentInitialized = true
+                ensureAndroidBootstrap(allowDiscovery = true)
+                syncModelIntentContext()
                 autoRegisterAndroidNode()
                 ensureAndroidTaskWorker()
                 refreshModels(showMessage = false)
@@ -328,22 +369,35 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
         }
 
+        // Native layer preparation/retirement can happen without this device changing mode.
+        viewModelScope.launch {
+            androidRuntimeStatusInvalidation.revisions.collect { refreshRuntimeStatus() }
+        }
+
         // 监听设置变化
         viewModelScope.launch {
-            settings.serverHost.collect { host ->
-                _uiState.value = _uiState.value.copy(serverHost = host)
+            modelIntentController.state.collect { state ->
+                _uiState.value = _uiState.value.copy(modelIntent = state)
             }
         }
         viewModelScope.launch {
-            settings.serverPort.collect { port ->
-                _uiState.value = _uiState.value.copy(serverPort = port)
+            settings.intentMasterEndpoint.collect { endpoint ->
+                intentEndpoint = endpoint
+                if (endpoint != null && !endpointSelectionPending) {
+                    _uiState.value = _uiState.value.copy(serverHost = endpoint.host, serverPort = endpoint.port)
+                }
+                syncModelIntentContext()
             }
         }
         viewModelScope.launch {
             settings.inferenceMode.collect { mode ->
-                _uiState.value = _uiState.value.copy(
-                    inferenceMode = if (BuildConfig.IS_LITE) SettingsDataStore.MODE_FALLBACK else SettingsDataStore.normalizeInferenceMode(mode)
-                )
+                if (!modeSelectionPending) {
+                    _uiState.value = _uiState.value.copy(
+                        inferenceMode = if (BuildConfig.IS_LITE) SettingsDataStore.MODE_FALLBACK
+                            else SettingsDataStore.normalizeInferenceMode(mode),
+                    )
+                    syncModelIntentContext()
+                }
             }
         }
         viewModelScope.launch {
@@ -377,6 +431,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             settings.contextSize.collect { size ->
                 _uiState.value = _uiState.value.copy(contextSize = size)
+            }
+        }
+        viewModelScope.launch {
+            settings.showThinking.collect { enabled ->
+                _uiState.value = _uiState.value.copy(showThinking = enabled)
             }
         }
         viewModelScope.launch {
@@ -464,6 +523,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             try {
                 val state = ensureActiveSession()
+                if (!modelIntentAllowsChat(_uiState.value.inferenceMode, modelIntentController.state.value)) {
+                    _uiState.value = failMessageSubmission(_uiState.value, "请先在设置选择主节点模型，等待准备完成后聊天")
+                    return@launch
+                }
                 val validationError = validateChatImageSubmission(state.inferenceMode, imageDataUrls)
                 if (validationError != null) {
                     _uiState.value = failMessageSubmission(state, validationError)
@@ -508,6 +571,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             try {
                 val state = ensureActiveSession()
+                if (!modelIntentAllowsChat(_uiState.value.inferenceMode, modelIntentController.state.value)) {
+                    _uiState.value = failMessageSubmission(_uiState.value, "请先在设置选择主节点模型，等待准备完成后聊天")
+                    return@launch
+                }
                 val validationError = validateChatImageSubmission(state.inferenceMode, retryImages)
                 if (validationError != null) {
                     _uiState.value = failMessageSubmission(state, validationError)
@@ -678,7 +745,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun refreshRuntimeStatus() {
-        viewModelScope.launch {
+        runtimeStatusRefreshJob?.cancel()
+        runtimeStatusRefreshJob = viewModelScope.launch {
             _uiState.value = _uiState.value.copy(
                 runtimeStatusLoading = true,
                 runtimeStatusError = null
@@ -686,13 +754,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             try {
                 val state = _uiState.value
                 val service = QlhApplication.instance.inferenceService
-                val status = service?.getRuntimeStatus(state.inferenceMode, BuildConfig.IS_LITE)
-                    ?: createPassiveRuntimeStatus(state.inferenceMode)
+                val status = androidRuntimeStatusInvalidation.readSnapshot {
+                    service?.getRuntimeStatus(state.inferenceMode, BuildConfig.IS_LITE)
+                        ?: createPassiveRuntimeStatus(state.inferenceMode)
+                } ?: return@launch
                 _uiState.value = _uiState.value.copy(
                     runtimeStatus = status,
                     runtimeStatusLoading = false,
                     runtimeStatusError = null
                 )
+            } catch (cancelled: CancellationException) {
+                throw cancelled
             } catch (e: Exception) {
                 QlhLogger.e("MainViewModel", "refreshRuntimeStatus failed", e)
                 _uiState.value = _uiState.value.copy(
@@ -1138,63 +1210,119 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         )
     }
 
-    private suspend fun ensureAndroidBootstrap(force: Boolean = false) {
-        if (BuildConfig.IS_LITE) return
-        if (!force && settings.isBootstrapped() &&
-            settings.getClusterSecret().isNotBlank() &&
-            settings.getMasterTcpHost().isNotBlank()
-        ) return
-
-        val state = _uiState.value
-        val nodeId = settings.getOrCreateAndroidNodeId()
-        val hostname = listOf(
-            android.os.Build.MANUFACTURER,
-            android.os.Build.MODEL,
-        ).filter { it.isNotBlank() }
-            .joinToString(" ")
-            .ifBlank { nodeId }
-        val client = apiClient(state)
-        val result = client.firstConnectBootstrap(
-            BootstrapRequest(
-                nodeId = nodeId,
-                hostname = hostname,
-                appVariant = if (BuildConfig.IS_LITE) "lite" else "full",
-                appVersion = BuildConfig.VERSION_NAME,
-                capabilities = buildAndroidPresenceDeviceInfo(),
-            )
-        )
-
-        result.onSuccess { bootstrap ->
-            val response = bootstrap.response
-            val cluster = response.cluster
-            val android = response.android
-            val newHost = cluster.masterApiHost.ifBlank { state.serverHost }
-            val newPort = cluster.masterApiPort.takeIf { it in 1..65535 } ?: state.serverPort
-            settings.saveBootstrapConfig(
-                serverHost = newHost,
-                serverPort = newPort,
-                masterTcpHost = cluster.masterTcpHost,
-                masterTcpPort = cluster.masterTcpPort,
-                clusterId = cluster.clusterId,
-                clusterSecret = bootstrap.clusterSecret,
-                clusterSecretEpoch = cluster.clusterSecretEpoch,
-                nodeId = response.node.nodeId.ifBlank { nodeId },
-                modelManifestUrl = android.modelManifestUrl,
-            )
-            _uiState.value = _uiState.value.copy(
-                serverHost = newHost,
-                serverPort = newPort,
-            )
-            QlhLogger.i(
-                "MainViewModel",
-                "Android bootstrap completed: nodeId=${response.node.nodeId.ifBlank { nodeId }} host=$newHost:$newPort"
-            )
-        }.onFailure { e ->
-            QlhLogger.w(
-                "MainViewModel",
-                "Android bootstrap failed: ${e.message ?: e.javaClass.simpleName}"
-            )
+    /** Saved endpoint first, then bounded UDP discovery. A hint never changes settings by itself. */
+    private suspend fun ensureAndroidBootstrap(force: Boolean = false, allowDiscovery: Boolean = false) {
+        if (_uiState.value.inferenceMode == SettingsDataStore.MODE_LOCAL || modeSelectionPending ||
+            _uiState.value.masterDiscoveryBusy) return
+        val selection = masterSelectionSerial
+        val modeSelection = modeSelectionSerial
+        fun stillCurrent(): Boolean = selection == masterSelectionSerial && modeSelection == modeSelectionSerial &&
+            !modeSelectionPending && _uiState.value.inferenceMode != SettingsDataStore.MODE_LOCAL
+        _uiState.value = _uiState.value.copy(masterDiscoveryBusy = true)
+        syncModelIntentContext()
+        var connected = false
+        try {
+            val saved = settings.getIntentMasterEndpoint()
+            val placeholder = saved?.host == SettingsDataStore.DEFAULT_HOST && !settings.isBootstrapped()
+            if (saved != null && !placeholder && stillCurrent()) {
+                connected = connectMasterCandidate(saved, force, ::stillCurrent)
+            }
+            if (!connected && allowDiscovery && stillCurrent()) {
+                for (hint in MasterDiscovery().discover()) {
+                    if (!stillCurrent()) return
+                    connected = connectMasterCandidate(
+                        IntentMasterEndpoint(hint.masterApiHost, hint.masterApiPort), true, ::stillCurrent,
+                    )
+                    if (connected) break
+                }
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            QlhLogger.w("MainViewModel", "master discovery/connect failed: ${error.javaClass.simpleName}")
+        } finally {
+            if (stillCurrent()) {
+                val latestEndpoint = settings.getIntentMasterEndpoint()
+                if (stillCurrent()) {
+                    intentEndpoint = latestEndpoint
+                    _uiState.value = _uiState.value.copy(masterDiscoveryBusy = false)
+                    syncModelIntentContext()
+                    if (!connected) modelIntentController.discoveryFailed()
+                }
+            }
         }
+    }
+
+    private suspend fun connectMasterCandidate(
+        candidate: IntentMasterEndpoint,
+        force: Boolean,
+        stillCurrent: () -> Boolean,
+    ): Boolean {
+        if (!validDiscoveryHost(canonicalHost(candidate.host)) || candidate.port !in 1..65535 || !stillCurrent()) return false
+        // Discovery candidates receive no stored bearer token. Confirmation precedes encrypted bootstrap.
+        val client = ApiClient(httpBaseUrl(candidate.host, candidate.port), callTimeoutSeconds = 4)
+        if (!force && candidate == settings.getIntentMasterEndpoint() && settings.isBootstrapped() &&
+            settings.getClusterSecret().isNotBlank() && settings.getMasterTcpHost().isNotBlank()
+        ) return client.getBootstrapInfo().getOrNull()?.isMaster == true && stillCurrent()
+        val nodeId = settings.getOrCreateAndroidNodeId()
+        val hostname = listOf(android.os.Build.MANUFACTURER, android.os.Build.MODEL)
+            .filter { it.isNotBlank() }.joinToString(" ").ifBlank { nodeId }
+        val bootstrap = client.firstConnectVerifiedMaster(BootstrapRequest(
+            nodeId = nodeId, hostname = hostname,
+            appVariant = if (BuildConfig.IS_LITE) "lite" else "full",
+            appVersion = BuildConfig.VERSION_NAME, capabilities = buildAndroidPresenceDeviceInfo(),
+        ), stillCurrent).getOrNull() ?: return false
+        if (!stillCurrent()) return false
+        val response = bootstrap.response
+        val cluster = response.cluster
+        val newHost = cluster.masterApiHost.ifBlank { candidate.host }
+        val newPort = cluster.masterApiPort.takeIf { it in 1..65535 } ?: candidate.port
+        if (!validDiscoveryHost(canonicalHost(newHost)) ||
+            !validDiscoveryHost(canonicalHost(cluster.masterTcpHost)) || cluster.masterTcpPort !in 1..65535
+        ) return false
+        val saved = settings.saveBootstrapConfig(
+            serverHost = newHost, serverPort = newPort,
+            masterTcpHost = cluster.masterTcpHost, masterTcpPort = cluster.masterTcpPort,
+            clusterId = cluster.clusterId, clusterSecret = bootstrap.clusterSecret,
+            clusterSecretEpoch = cluster.clusterSecretEpoch,
+            nodeId = response.node.nodeId.ifBlank { nodeId },
+            modelManifestUrl = response.android.modelManifestUrl,
+            stillCurrent = stillCurrent,
+            publicationLock = masterBindingPublicationLock,
+        )
+        if (!saved || !stillCurrent()) return false
+        intentEndpoint = settings.getIntentMasterEndpoint()
+        if (!stillCurrent()) return false
+        _uiState.value = _uiState.value.copy(serverHost = newHost, serverPort = newPort)
+        return true
+    }
+
+    fun onDiscoverMaster() {
+        if (!intentInitialized || modeSelectionPending || _uiState.value.masterDiscoveryBusy ||
+            _uiState.value.inferenceMode == SettingsDataStore.MODE_LOCAL) return
+        retireMasterSelection()
+        discoveryJob = viewModelScope.launch {
+            ensureAndroidBootstrap(force = true, allowDiscovery = true)
+            autoRegisterAndroidNode(force = true)
+            ensureAndroidTaskWorker()
+        }
+    }
+
+    fun refreshModelIntent() {
+        if (!intentInitialized || modeSelectionPending || endpointSelectionPending || _uiState.value.masterDiscoveryBusy) return
+        syncModelIntentContext()
+        modelIntentController.refresh()
+    }
+
+    fun selectMasterModel(modelId: String, engine: String = "auto") {
+        modelIntentController.submit(ModelIntentRequest(modelId, engine))
+    }
+
+    fun retryModelIntent() = modelIntentController.retry()
+    fun cancelModelIntent() = modelIntentController.cancel()
+
+    fun openPreparedChat() {
+        if (modelIntentAllowsChat(_uiState.value.inferenceMode, modelIntentController.state.value)) selectTab("chat")
     }
 
     private suspend fun autoRegisterAndroidNode(force: Boolean = false) {
@@ -1467,6 +1595,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     override fun onCleared() {
         val application = getApplication<Application>()
+        discoveryJob?.cancel()
+        modelIntentController.suspendForSelection()
         application.stopService(AndroidPresenceService.stopIntent(application))
         runCatching { TaskWorkerService.requestStop(application) }
             .onFailure { error ->
@@ -1537,10 +1667,23 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     // ==================== 设置 ====================
 
     fun setServerHost(host: String) {
+        retireMasterSelection()
+        endpointSelectionPending = true
+        val selection = masterSelectionSerial
+        _uiState.value = _uiState.value.copy(serverHost = host)
         viewModelScope.launch {
-            settings.setServerHost(host)
-            settings.clearBootstrapConfig()
-            _uiState.value = _uiState.value.copy(serverHost = host)
+            endpointChangeMutex.withLock {
+                if (selection != masterSelectionSerial) return@withLock
+                settings.setServerHost(host)
+                if (selection != masterSelectionSerial) return@withLock
+                settings.clearBootstrapConfig()
+            }
+            if (selection != masterSelectionSerial) return@launch
+            val latestEndpoint = settings.getIntentMasterEndpoint()
+            if (selection != masterSelectionSerial) return@launch
+            intentEndpoint = latestEndpoint
+            endpointSelectionPending = false
+            syncModelIntentContext()
             ensureAndroidBootstrap(force = true)
             autoRegisterAndroidNode(force = true)
             ensureAndroidTaskWorker()
@@ -1556,10 +1699,23 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             QlhLogger.w("MainViewModel", "忽略非法端口: $port（应为 1..65535），保持 ${_uiState.value.serverPort}")
             return
         }
+        retireMasterSelection()
+        endpointSelectionPending = true
+        val selection = masterSelectionSerial
+        _uiState.value = _uiState.value.copy(serverPort = port)
         viewModelScope.launch {
-            settings.setServerPort(port)
-            settings.clearBootstrapConfig()
-            _uiState.value = _uiState.value.copy(serverPort = port)
+            endpointChangeMutex.withLock {
+                if (selection != masterSelectionSerial) return@withLock
+                settings.setServerPort(port)
+                if (selection != masterSelectionSerial) return@withLock
+                settings.clearBootstrapConfig()
+            }
+            if (selection != masterSelectionSerial) return@launch
+            val latestEndpoint = settings.getIntentMasterEndpoint()
+            if (selection != masterSelectionSerial) return@launch
+            intentEndpoint = latestEndpoint
+            endpointSelectionPending = false
+            syncModelIntentContext()
             ensureAndroidBootstrap(force = true)
             autoRegisterAndroidNode(force = true)
             ensureAndroidTaskWorker()
@@ -1569,8 +1725,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun setInferenceMode(mode: String) {
         if (BuildConfig.IS_LITE && mode != SettingsDataStore.MODE_FALLBACK) return
         val normalized = SettingsDataStore.normalizeInferenceMode(mode)
+        val selection = synchronized(masterBindingPublicationLock) { ++modeSelectionSerial }
+        retireMasterSelection()
+        modeSelectionPending = true
         viewModelScope.launch {
             modeSwitchMutex.withLock {
+                if (selection != modeSelectionSerial) return@withLock
                 try {
                     inferenceModes.switchMode(
                         mode = normalized,
@@ -1580,16 +1740,30 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                                 ?: Result.success(Unit)
                         },
                     )
+                    if (selection != modeSelectionSerial) return@withLock
+                    modeSelectionPending = false
                     _uiState.value = _uiState.value.copy(inferenceMode = normalized, modelMessage = null)
+                    syncModelIntentContext()
                     autoRegisterAndroidNode(force = true)
                     ensureAndroidTaskWorker()
                     refreshRuntimeStatus()
                 } catch (cancelled: CancellationException) {
                     throw cancelled
                 } catch (error: Exception) {
-                    _uiState.value = _uiState.value.copy(modelMessage = "模式切换失败: ${error.message}")
+                    if (selection == modeSelectionSerial) {
+                        modeSelectionPending = false
+                        syncModelIntentContext()
+                        _uiState.value = _uiState.value.copy(modelMessage = "模式切换失败: ${error.message}")
+                    }
                 }
             }
+        }
+    }
+
+    fun setShowThinking(enabled: Boolean) {
+        viewModelScope.launch {
+            settings.setShowThinking(enabled)
+            _uiState.value = _uiState.value.copy(showThinking = enabled)
         }
     }
 

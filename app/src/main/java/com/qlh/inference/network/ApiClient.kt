@@ -1,7 +1,13 @@
 package com.qlh.inference.network
 
 import com.google.gson.Gson
+import com.google.gson.GsonBuilder
+import com.google.gson.ToNumberPolicy
 import com.google.gson.JsonParser
+import com.google.gson.Strictness
+import com.google.gson.stream.JsonReader
+import com.google.gson.stream.JsonToken
+import java.io.StringReader
 import com.google.gson.annotations.SerializedName
 import com.qlh.inference.BuildConfig
 import com.qlh.inference.security.AuthSessionStore
@@ -65,6 +71,9 @@ data class ChatRequest(
     val allowExternal: Boolean? = null,
     @SerializedName("prefer_external")
     val preferExternal: Boolean? = null,
+    /** The Android thinking switch controls generation as well as display. */
+    @SerializedName("enable_thinking")
+    val enableThinking: Boolean = showThinking,
 )
 
 data class ChatResponse(
@@ -616,9 +625,13 @@ data class TailscaleBinding(
 
 class ApiClient(
     private val baseUrl: String,
-    private val gson: Gson = Gson(),
+    // Keep native generation integers exact; fractional metrics still use Double.
+    private val gson: Gson = GsonBuilder()
+        .setObjectToNumberStrategy(ToNumberPolicy.LONG_OR_DOUBLE)
+        .create(),
     private val authStore: AuthSessionStore? = null,
-) {
+    private val callTimeoutSeconds: Long = 0,
+) : ModelIntentApi {
     /** Login is anonymous; all other control-plane requests may use the local session. */
     private val anonymousPaths = setOf(
         "/api/auth/capability",
@@ -626,11 +639,13 @@ class ApiClient(
         "/api/auth/bootstrap",
         "/api/auth/totp/verify",
         "/api/bootstrap/first-connect",
+        "/api/bootstrap/info",
         "/api/cluster/android/register",
         "/api/cluster/android/heartbeat",
     )
 
     private val client: OkHttpClient = OkHttpClient.Builder()
+        .callTimeout(callTimeoutSeconds, TimeUnit.SECONDS)
         .connectTimeout(10, TimeUnit.SECONDS)
         .readTimeout(120, TimeUnit.SECONDS)   // 推理可能较慢
         .writeTimeout(30, TimeUnit.SECONDS)
@@ -1205,6 +1220,121 @@ class ApiClient(
                 secretEpoch = bootstrapResponse.cluster.clusterSecretEpoch,
             )
             Result.success(BootstrapResult(bootstrapResponse, secret))
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    // ==================== Master model intent ====================
+
+    suspend fun getBootstrapInfo(): Result<MasterBootstrapInfo> =
+        intentJson("", "GET", MasterBootstrapInfo::class.java, endpointPath = "/api/bootstrap/info")
+
+    /** Never bootstrap a UDP hint before confirming the HTTP master role. */
+    suspend fun firstConnectVerifiedMaster(
+        request: BootstrapRequest,
+        stillCurrent: () -> Boolean = { true },
+    ): Result<BootstrapResult> {
+        val info = getBootstrapInfo()
+        if (info.isFailure) return Result.failure(info.exceptionOrNull()!!)
+        if (!info.getOrThrow().isMaster) return Result.failure(IOException("INTENT_MASTER_NOT_FOUND"))
+        if (!stillCurrent()) return Result.failure(IOException("master_selection_changed"))
+        return firstConnectBootstrap(request)
+    }
+
+    override suspend fun getModelIntentCatalog(): Result<ModelIntentCatalog> =
+        intentJson("catalog", "GET", ModelIntentCatalog::class.java).mapCatching { catalog ->
+            require(catalog.binding.status in setOf("connected", "not_found", "local")) {
+                "intent_binding_invalid"
+            }
+            catalog
+        }
+
+    override suspend fun getCurrentModelIntent(): Result<ModelIntentOperation?> =
+        intentJsonNullable("current", "GET").mapCatching { it?.validate() }
+
+    override suspend fun submitModelIntent(intent: ModelIntentRequest): Result<ModelIntentOperation> =
+        intentJson("", "POST", ModelIntentOperation::class.java, intent).mapCatching { it.validate() }
+
+    override suspend fun getModelIntent(operationId: String): Result<ModelIntentOperation> =
+        intentOperationRequest(operationId, "GET")
+
+    override suspend fun cancelModelIntent(operationId: String): Result<ModelIntentOperation> =
+        intentOperationRequest(operationId, "DELETE")
+
+    private suspend fun intentOperationRequest(id: String, method: String): Result<ModelIntentOperation> {
+        return try {
+            validateModelIntentOperationId(id)
+            intentJson(id, method, ModelIntentOperation::class.java).mapCatching {
+                it.validate()
+                require(it.operationId == id) { "intent_operation_mismatch" }
+                it
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    private suspend fun intentJsonNullable(path: String, method: String): Result<ModelIntentOperation?> =
+        withContext(Dispatchers.IO) {
+            try {
+                val request = Request.Builder()
+                    .url("${baseUrl.trimEnd('/')}/api/models/intent/$path")
+                    .method(method, null).build()
+                executeAsync(request).use { response ->
+                    val body = response.body?.string().orEmpty()
+                    if (!response.isSuccessful) return@withContext Result.failure(httpException(response, body))
+                    require(body.isNotBlank()) { "intent_response_invalid" }
+                    val json = parseIntentJson(body)
+                    Result.success(if (json.isJsonNull) null else gson.fromJson(json, ModelIntentOperation::class.java))
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+
+    private fun parseIntentJson(body: String): com.google.gson.JsonElement {
+        require(body.isNotBlank()) { "intent_response_invalid" }
+        return JsonReader(StringReader(body)).use { reader ->
+            reader.strictness = Strictness.STRICT
+            val json = JsonParser.parseReader(reader)
+            require(reader.peek() == JsonToken.END_DOCUMENT) { "intent_response_trailing_data" }
+            json
+        }
+    }
+
+    private suspend fun <T> intentJson(
+        path: String,
+        method: String,
+        type: Class<T>,
+        payload: ModelIntentRequest? = null,
+        endpointPath: String? = null,
+    ): Result<T> = withContext(Dispatchers.IO) {
+        try {
+            payload?.validate()
+            val suffix = if (path.isEmpty()) "" else "/$path"
+            val request = Request.Builder()
+                .url("${baseUrl.trimEnd('/')}${endpointPath ?: "/api/models/intent$suffix"}")
+                .method(method, payload?.let { gson.toJson(it).toRequestBody(jsonMediaType) })
+                .build()
+            executeAsync(request).use { response ->
+                val body = response.body?.string().orEmpty()
+                if (!response.isSuccessful) return@withContext Result.failure(httpException(response, body))
+                if (type == MasterBootstrapInfo::class.java) {
+                    val isMaster = parseIntentJson(body).asJsonObject.get("is_master")
+                    require(isMaster != null && isMaster.isJsonPrimitive && isMaster.asJsonPrimitive.isBoolean) {
+                        "bootstrap_info_invalid"
+                    }
+                }
+                val parsed = gson.fromJson(parseIntentJson(body), type) ?: throw IOException("intent_response_invalid")
+                Result.success(parsed)
+            }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {

@@ -1,5 +1,30 @@
 package com.qlh.inference.status
 
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+
+/** Refresh notifications only; model facts still come from InferenceService.getRuntimeStatus. */
+internal class AndroidRuntimeStatusInvalidation {
+    private val revision = MutableStateFlow(0L)
+    val revisions = revision.asStateFlow()
+
+    suspend fun <T> afterModelChange(change: suspend () -> T): T = try {
+        change()
+    } finally {
+        // Also reread after failures: the owner may still hold its real native context.
+        revision.update { it + 1 }
+    }
+
+    suspend fun readSnapshot(read: suspend () -> AndroidRuntimeStatus): AndroidRuntimeStatus? {
+        val startedAt = revision.value
+        val snapshot = read()
+        return snapshot.takeIf { revision.value == startedAt }
+    }
+}
+
+internal val androidRuntimeStatusInvalidation = AndroidRuntimeStatusInvalidation()
+
 data class AndroidRuntimeStatus(
     val nativeRuntimeAvailable: Boolean = false,
     val nativeRuntimeError: String? = null,
@@ -93,6 +118,8 @@ data class ModelRuntimeStatus(
     val vocabTokens: String = "",
     val embedding: String = "",
     val heads: String = "",
+    /** Source-model interval [start, end); empty means a whole model, only when loaded. */
+    val loadedLayerRange: List<Int> = emptyList(),
 )
 
 data class ContextRuntimeStatus(

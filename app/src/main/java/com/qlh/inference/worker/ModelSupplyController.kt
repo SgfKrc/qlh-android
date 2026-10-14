@@ -1,6 +1,7 @@
 package com.qlh.inference.worker
 
 import com.google.gson.JsonObject
+import com.qlh.inference.logging.QlhLogger
 import com.qlh.inference.service.ModelSupplyException
 import com.qlh.inference.service.ModelSupplyManifest
 import com.qlh.inference.service.ModelSupplyReceiver
@@ -175,7 +176,8 @@ internal class ModelSupplyController(
                                             publish()
                                         }
                                     }
-                                })
+                                },
+                                diagnostics = { QlhLogger.i("ModelSupply", it.logMessage()) })
                             currentCoroutineContext().ensureActive()
                             checkSupply(current(), "SUPPLY_CANCELLED", "supply retired")
                             publicationGate {

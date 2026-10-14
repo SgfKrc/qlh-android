@@ -121,4 +121,103 @@ class SettingsDataStoreCorruptionTest {
             scope.cancel()
         }
     }
+    @Test
+    fun retiredBootstrapNeverPersistsEndpointOrCredential() = runBlocking {
+        val source = temporaryFolder.newFile("bootstrap.preferences_pb")
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val dataStore = PreferenceDataStoreFactory.create(scope = scope, produceFile = { source })
+        val storage = object : ClusterCredentialStorage {
+            var secret: String? = null
+            override fun read() = secret
+            override fun save(clusterSecret: String) { secret = clusterSecret }
+            override fun clear() { secret = null }
+        }
+        try {
+            val settings = SettingsDataStore(dataStore, storage)
+            assertEquals(null, settings.getIntentMasterEndpoint()) // A hardcoded default is not a saved binding.
+            settings.setServerHost("100.64.0.1")
+            settings.setInferenceMode(SettingsDataStore.MODE_LOCAL)
+            assertFalse(settings.saveBootstrapConfig(
+                serverHost = "100.64.0.9", serverPort = 8001, masterTcpHost = "100.64.0.9",
+                masterTcpPort = 8888, clusterId = "stale", clusterSecret = "old-secret", nodeId = "android-1",
+                modelManifestUrl = "", stillCurrent = { false },
+            ))
+            assertEquals("100.64.0.1", settings.getServerHost())
+            assertEquals(SettingsDataStore.MODE_LOCAL, settings.getInferenceMode())
+            assertFalse(settings.isBootstrapped())
+            assertEquals(null, storage.secret)
+            assertTrue(settings.saveBootstrapConfig(
+                serverHost = "100.64.0.2", serverPort = 8002, masterTcpHost = "100.64.0.2",
+                masterTcpPort = 8889, clusterId = "fresh", clusterSecret = "fresh-secret", nodeId = "android-1",
+                modelManifestUrl = "", clusterSecretEpoch = 2,
+            ))
+            assertEquals(com.qlh.inference.IntentMasterEndpoint("100.64.0.2", 8002, "fresh", 2), settings.getIntentMasterEndpoint())
+            assertEquals("fresh-secret", storage.secret)
+            assertEquals(SettingsDataStore.MODE_LOCAL, settings.getInferenceMode()) // Binding never changes mode.
+        } finally { scope.cancel() }
+    }
+
+    @Test
+    fun userSelectionRetiresBootstrapWaitingForPreferencePublication() = runBlocking {
+        val source = temporaryFolder.newFile("delayed-bootstrap.preferences_pb")
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val dataStore = PreferenceDataStoreFactory.create(scope = scope, produceFile = { source })
+        val entered = kotlinx.coroutines.CompletableDeferred<Unit>()
+        val release = kotlinx.coroutines.CompletableDeferred<Unit>()
+        val current = java.util.concurrent.atomic.AtomicBoolean(true)
+        val publicationLock = Any()
+        val storage = object : ClusterCredentialStorage {
+            var saved = false
+            override fun read(): String? = null
+            override fun save(clusterSecret: String) { saved = true }
+            override fun clear() {}
+        }
+        try {
+            val settings = SettingsDataStore(dataStore, storage)
+            settings.setServerHost("100.64.0.1")
+            val blockingEdit = async {
+                dataStore.edit { entered.complete(Unit); release.await() }
+            }
+            entered.await()
+            val staleBootstrap = async(start = kotlinx.coroutines.CoroutineStart.UNDISPATCHED) {
+                settings.saveBootstrapConfig(
+                    serverHost = "100.64.0.9", serverPort = 8009, masterTcpHost = "100.64.0.9",
+                    masterTcpPort = 8889, clusterId = "stale", clusterSecret = "secret", nodeId = "phone",
+                    modelManifestUrl = "", stillCurrent = current::get, publicationLock = publicationLock,
+                )
+            }
+            synchronized(publicationLock) { current.set(false) }
+            release.complete(Unit)
+            blockingEdit.await()
+            assertFalse(withTimeout(2000) { staleBootstrap.await() })
+            assertFalse(storage.saved)
+            assertEquals("100.64.0.1", settings.getServerHost())
+            assertFalse(settings.isBootstrapped())
+        } finally { release.complete(Unit); scope.cancel() }
+    }
+
+    @Test
+    fun noThinkingAndShortTokenLimitPersistForNextChat() = runBlocking {
+        val source = temporaryFolder.newFile("chat-settings.preferences_pb")
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val dataStore = PreferenceDataStoreFactory.create(scope = scope, produceFile = { source })
+        val storage = object : ClusterCredentialStorage {
+            override fun read(): String? = null
+            override fun save(clusterSecret: String) {}
+            override fun clear() {}
+        }
+        try {
+            val settings = SettingsDataStore(dataStore, storage)
+            assertFalse(settings.getShowThinking())
+            settings.setShowThinking(true)
+            assertTrue(settings.showThinking.first())
+            settings.setShowThinking(false)
+            settings.setMaxTokens(32)
+            val restored = SettingsDataStore(dataStore, storage)
+            assertFalse(restored.getShowThinking())
+            assertFalse(restored.showThinking.first())
+            assertEquals(32, restored.getMaxTokens())
+        } finally { scope.cancel() }
+    }
+
 }

@@ -68,6 +68,8 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.qlh.inference.data.MessageEntity
+import com.qlh.inference.ModelIntentUiState
+import com.qlh.inference.modelIntentMetricsLabel
 import com.qlh.inference.media.EncodedImageAttachment
 import com.qlh.inference.media.ImageAttachmentEncoder
 import com.qlh.inference.ui.components.EmptyState
@@ -102,6 +104,12 @@ fun ChatScreen(
     onClearError: () -> Unit,
     modifier: Modifier = Modifier,
     inferenceMode: String = "",
+    modelIntent: ModelIntentUiState = ModelIntentUiState(),
+    modelReady: Boolean = true,
+    masterDiscoveryBusy: Boolean = false,
+    onOpenModelSettings: () -> Unit = {},
+    onRetryModelIntent: () -> Unit = {},
+    onCancelModelIntent: () -> Unit = {},
     onSendMessageWithImages: (String, List<String>) -> Unit = { message, _ ->
         onSendMessage(message)
     },
@@ -115,7 +123,7 @@ fun ChatScreen(
     var pendingImage by remember { mutableStateOf<EncodedImageAttachment?>(null) }
     var imageError by remember { mutableStateOf<String?>(null) }
     var isEncodingImage by remember { mutableStateOf(false) }
-    val canAttachImage = inferenceMode != SettingsDataStore.MODE_DISTRIBUTED && !isLoading
+    val canAttachImage = inferenceMode != SettingsDataStore.MODE_DISTRIBUTED && !isLoading && modelReady
     val imagePicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent(),
     ) { uri ->
@@ -226,8 +234,10 @@ fun ChatScreen(
             if (error != null) {
                 item(key = "error") {
                     ErrorBubble(error = error, onRetry = {
-                        onRetry()
-                        onClearError()
+                        if (modelReady) {
+                            onRetry()
+                            onClearError()
+                        } else onOpenModelSettings()
                     })
                 }
             }
@@ -235,6 +245,22 @@ fun ChatScreen(
             // 底部留白，避免被输入框遮挡
             item(key = "spacer") {
                 Spacer(modifier = Modifier.height(4.dp))
+            }
+        }
+
+        if (inferenceMode != SettingsDataStore.MODE_LOCAL && inferenceMode.isNotBlank()) {
+            Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)) {
+                if (masterDiscoveryBusy) Text("正在发现并验证主节点", style = MaterialTheme.typography.bodySmall)
+                ModelIntentProgress(modelIntent, onRetryModelIntent, onCancelModelIntent, showNodes = false)
+                if (isLoading && modelIntent.operation != null) {
+                    Text("正在推理 · ${modelIntent.operation.intent.modelId} · ${modelIntent.operation.operationId}",
+                        style = MaterialTheme.typography.bodySmall)
+                }
+                if (!modelReady) {
+                    Button(onClick = onOpenModelSettings, modifier = Modifier.fillMaxWidth().testTag("chat_choose_master_model")) {
+                        Text("选择主节点模型 / 查看准备进度")
+                    }
+                }
             }
         }
 
@@ -257,7 +283,7 @@ fun ChatScreen(
                     focusManager.clearFocus()
                 }
             },
-            enabled = !isLoading,
+            enabled = !isLoading && modelReady,
             pendingImage = pendingImage,
             imageError = imageError,
             isEncodingImage = isEncodingImage,
@@ -705,6 +731,11 @@ internal fun formatMetrics(metricsJson: String): String {
             else -> 0.0
         }
         if (tps > 0) parts += "%.1f tok/s".format(tps)
+        val intentAttribution = modelIntentMetricsLabel(
+            obj.optString("model_operation_id", ""), obj.optString("model_config_id", ""),
+            if (obj.has("model_generation")) obj.optLong("model_generation", -1) else null,
+        )
+        if (intentAttribution.isNotBlank()) parts += intentAttribution
         val route = obj.optString("route", "")
         if (route.isNotBlank()) parts += route
         val fallback = obj.optString("fallback_reason", "")

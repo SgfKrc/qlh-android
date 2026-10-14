@@ -2,6 +2,13 @@ package com.qlh.inference.worker
 
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
+import com.qlh.inference.status.AndroidRuntimeStatus
+import com.qlh.inference.status.AndroidRuntimeStatusInvalidation
+import com.qlh.inference.status.ModelRuntimeStatus
+import com.qlh.inference.ui.modelRuntimeStatusLabel
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
@@ -155,6 +162,91 @@ class WorkerPrepareControllerTest {
         transact(c, request("prepare", next), this); transact(c, request("commit", next), this)
         assertEquals("released", transact(c, request("release"), this)["status"].asString)
         assertNull(c.validateStage(offer(next))); assertEquals(1, runtime.unloads)
+    }
+
+    @Test fun `remote release refreshes the native status card only after actual unload without a mode switch`() = runBlocking {
+        val changes = AndroidRuntimeStatusInvalidation()
+        val entered = CompletableDeferred<Unit>()
+        val finish = CompletableDeferred<Unit>()
+        val runtime = object : Runtime() {
+            override suspend fun unload() = changes.afterModelChange {
+                entered.complete(Unit)
+                finish.await()
+                super.unload()
+            }
+        }
+        val c = WorkerPrepareController(node, runtime)
+        transact(c, request("prepare"), this); transact(c, request("commit"), this)
+        val ui = MutableStateFlow(AndroidRuntimeStatus())
+        val observer = launch(start = CoroutineStart.UNDISPATCHED) {
+            changes.revisions.collect {
+                changes.readSnapshot {
+                    AndroidRuntimeStatus(inferenceMode = "distributed", model = ModelRuntimeStatus(
+                        loaded = runtime.hasRuntime(), name = if (runtime.hasRuntime()) "native crop" else "",
+                        loadedLayerRange = runtime.current?.range.orEmpty(),
+                    ))
+                }?.let { ui.value = it }
+            }
+        }
+        try {
+            assertEquals("已加载层段 [2,4)：native crop", modelRuntimeStatusLabel(ui.value.model))
+            val replies = mutableListOf<JsonObject>()
+            c.command(request("release"), this, { replies += it }, {})
+            withTimeout(5000) { entered.await() }
+            assertTrue(ui.value.model.loaded)
+            assertEquals(0L, changes.revisions.value)
+            assertTrue(replies.isEmpty())
+            finish.complete(Unit)
+            withTimeout(5000) {
+                c.awaitIdle()
+                ui.first { !it.model.loaded }
+            }
+            assertEquals("尚未加载模型", modelRuntimeStatusLabel(ui.value.model))
+            assertEquals("distributed", ui.value.inferenceMode)
+            assertEquals("released", replies.single()["status"].asString)
+            // An old release after re-prepare must not notify an unload of the new owner.
+            val next = identity(largeGeneration + 1, "supply_two")
+            transact(c, request("prepare", next), this); transact(c, request("commit", next), this)
+            val revision = changes.revisions.value
+            transact(c, request("release"), this)
+            assertEquals(revision, changes.revisions.value)
+            assertTrue(runtime.loaded(WorkerPrepareIdentity.parse(next)))
+        } finally {
+            finish.complete(Unit)
+            observer.cancel()
+        }
+    }
+
+    @Test fun `failed remote free refreshes actual loaded facts instead of pretending the slot is empty`() = runBlocking {
+        val changes = AndroidRuntimeStatusInvalidation()
+        val runtime = object : Runtime() {
+            override suspend fun unload() = changes.afterModelChange { super.unload() }
+        }
+        val c = WorkerPrepareController(node, runtime)
+        transact(c, request("prepare"), this); transact(c, request("commit"), this)
+        val refreshed = CompletableDeferred<AndroidRuntimeStatus>()
+        val observer = launch(start = CoroutineStart.UNDISPATCHED) {
+            changes.revisions.collect { revision ->
+                val snapshot = changes.readSnapshot {
+                    AndroidRuntimeStatus(model = ModelRuntimeStatus(loaded = runtime.hasRuntime()))
+                }
+                if (revision > 0 && snapshot != null) refreshed.complete(snapshot)
+            }
+        }
+        try {
+            runtime.failUnload = true
+            val failed = transact(c, request("release"), this)
+            assertEquals("prepare_unload_failed", failed["error"].asString)
+            assertTrue(withTimeout(5000) { refreshed.await() }.model.loaded)
+            assertTrue(runtime.hasRuntime())
+            runtime.failUnload = false
+            assertEquals("released", transact(c, request("release"), this)["status"].asString)
+            assertFalse(changes.readSnapshot {
+                AndroidRuntimeStatus(model = ModelRuntimeStatus(loaded = runtime.hasRuntime()))
+            }!!.model.loaded)
+        } finally {
+            observer.cancel()
+        }
     }
 
     @Test fun `failed unload never sends released and retry requires successful free`() = runBlocking {

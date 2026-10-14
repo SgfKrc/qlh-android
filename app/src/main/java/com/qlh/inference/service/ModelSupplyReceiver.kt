@@ -12,6 +12,7 @@ import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.ResponseBody
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
@@ -33,6 +34,61 @@ internal data class ModelSupplyProgress(
     val resumedBytes: Long,
 )
 
+/** Numeric, local transfer timings only: no manifest, endpoint, token or filesystem fields. */
+internal data class ModelSupplyTransferDiagnostic(
+    val elapsedNanos: Long,
+    val readNanos: Long,
+    val liveCheckNanos: Long,
+    val writeHashNanos: Long,
+    val checkpointNanos: Long,
+    // Includes the controller's existing progress fence and synchronous control send.
+    val progressNanos: Long,
+    val actualNewBytes: Long,
+    val actualTotalBytes: Long,
+    val terminal: Boolean,
+) {
+    fun logMessage(): String = "transfer_perf elapsed_ms=${elapsedNanos / 1_000_000}" +
+        " read_ms=${readNanos / 1_000_000} live_check_ms=${liveCheckNanos / 1_000_000}" +
+        " write_hash_ms=${writeHashNanos / 1_000_000} checkpoint_ms=${checkpointNanos / 1_000_000}" +
+        " progress_ms=${progressNanos / 1_000_000} actual_new_bytes=$actualNewBytes" +
+        " actual_total_bytes=$actualTotalBytes terminal=${if (terminal) 1 else 0}"
+}
+
+/** Owned by the receiving coroutine; diagnostic callbacks are observational only. */
+private class TransferDiagnostics(
+    private val nanoTime: () -> Long,
+    private val report: (ModelSupplyTransferDiagnostic) -> Unit,
+) {
+    enum class Stage { READ, LIVE_CHECK, WRITE_HASH, CHECKPOINT, PROGRESS }
+    private val elapsed = LongArray(Stage.entries.size)
+    private var windowStart = nanoTime()
+    private var previousActual = 0L
+    private var active = false
+
+    fun start(): Long = nanoTime()
+
+    fun record(stage: Stage, start: Long) {
+        elapsed[stage.ordinal] += (nanoTime() - start).coerceAtLeast(0)
+        active = true
+    }
+
+    fun emit(actual: Long, terminal: Boolean = false) {
+        val now = nanoTime()
+        val duration = (now - windowStart).coerceAtLeast(0)
+        if (!active || (!terminal && duration < 5_000_000_000L)) return
+        val snapshot = ModelSupplyTransferDiagnostic(
+            duration, elapsed[0], elapsed[1], elapsed[2], elapsed[3], elapsed[4],
+            actual - previousActual, actual, terminal,
+        )
+        windowStart = now
+        previousActual = actual
+        elapsed.fill(0)
+        active = false
+        // A logging failure must never change resume durability or the transfer outcome.
+        try { report(snapshot) } catch (_: Exception) { }
+    }
+}
+
 /** One cancellable transfer, confined to a bound master's origin and private storage. */
 internal class ModelSupplyReceiver(
     private val root: File,
@@ -41,6 +97,7 @@ internal class ModelSupplyReceiver(
     readTimeoutMillis: Long = 60_000,
     private val client: OkHttpClient = OkHttpClient.Builder().followRedirects(false).followSslRedirects(false)
         .connectTimeout(15, TimeUnit.SECONDS).readTimeout(readTimeoutMillis, TimeUnit.MILLISECONDS).build(),
+    private val nanoTime: () -> Long = System::nanoTime,
 ) {
     init { require(checkpointIntervalBytes > 0 && readTimeoutMillis > 0) }
     private val call = AtomicReference<Call?>()
@@ -53,230 +110,314 @@ internal class ModelSupplyReceiver(
         stillCurrent: suspend () -> Boolean,
         progress: suspend (ModelSupplyProgress) -> Unit,
         publish: suspend (() -> Unit) -> Unit,
+        diagnostics: (ModelSupplyTransferDiagnostic) -> Unit = {},
     ): File {
         checkSupply(apiPort in 1..65535 && token.isNotBlank() && token.length <= 4096 && token.none { it.code < 32 || it.code == 127 },
             "SUPPLY_INVALID_REQUEST", "port or token")
         checkSupply(stillCurrent(), "SUPPLY_CANCELLED", "binding changed")
         ensureDirectory(root)
-        val total = manifest.files.fold(0L) { n, file -> Math.addExact(n, file.size) }
-        var completed = 0L
-        var actualDownloaded = 0L
-        var reused = 0L
-        var resumed = 0L
-        suspend fun report(phase: String, bytes: Long = completed) {
-            progress(ModelSupplyProgress(phase, bytes, total, actualDownloaded, reused, resumed))
-        }
-        val final = confined("segment-${manifest.manifestSha256}")
-        if (final.exists()) {
-            val marker = safeFile(final, ModelSupplyManifest.MARKER)
-            checkSupply(marker.isFile && marker.length() <= 4 * 1024 * 1024 &&
-                ModelSupplyManifest.parse(marker.readText(Charsets.UTF_8)).json == manifest.json,
-                "SUPPLY_MANIFEST_DIGEST_MISMATCH", "published marker differs")
-            report("verifying", 0)
-            validateFiles(final, manifest)
-            checkSupply(stillCurrent(), "SUPPLY_CANCELLED", "binding changed")
-            completed = total; reused = total
-            report("registering")
-            return final
-        }
-        val stage = confined(".receive-${manifest.manifestSha256}")
-        ensureDirectory(stage)
-        val journal = ResumeJournal(stage, manifest)
-        val inventory = receiveInventory(manifest)
-        // Staged targets are byte donors only; their validated source marker never publishes them.
-        val candidates = (scanSuppliedSegmentRoots(root).flatMap { (directory, existing) ->
-            existing.files.map { ReuseCandidate(directory, it) }
-        } + inventory.complete).groupBy { fileKey(it.file) }
-        for (file in manifest.files) {
-            currentCoroutineContext().ensureActive()
-            checkSupply(stillCurrent(), "SUPPLY_CANCELLED", "binding changed")
-            val target = safeFile(stage, file.path)
-            val partial = safeFile(stage, file.path + ".part")
-            if (target.exists() && matches(target, file)) {
-                currentCoroutineContext().ensureActive()
+        val transfer = TransferState(
+            manifest.files.fold(0L) { n, file -> Math.addExact(n, file.size) },
+            progress, TransferDiagnostics(nanoTime, diagnostics),
+        )
+        try {
+            val final = confined("segment-${manifest.manifestSha256}")
+            if (final.exists()) {
+                val marker = safeFile(final, ModelSupplyManifest.MARKER)
+                checkSupply(marker.isFile && marker.length() <= 4 * 1024 * 1024 &&
+                    ModelSupplyManifest.parse(marker.readText(Charsets.UTF_8)).json == manifest.json,
+                    "SUPPLY_MANIFEST_DIGEST_MISMATCH", "published marker differs")
+                transfer.report("verifying", 0)
+                validateFiles(final, manifest)
                 checkSupply(stillCurrent(), "SUPPLY_CANCELLED", "binding changed")
-                journal.recordSource()
-                completed += file.size; reused += file.size
-                Files.deleteIfExists(partial.toPath())
-                report("reusing")
-                continue
+                transfer.completed = transfer.total; transfer.reused = transfer.total
+                transfer.report("registering")
+                return final
             }
-            var reusedFile = false
-            for ((directory, entry) in candidates[fileKey(file)].orEmpty()) {
-                val candidate = runCatching { safeFile(directory, entry.path) }.getOrNull() ?: continue
-                report("verifying_reuse")
-                if (!matches(candidate, file)) continue
+            val stage = confined(".receive-${manifest.manifestSha256}")
+            ensureDirectory(stage)
+            val journal = ResumeJournal(stage, manifest)
+            val inventory = receiveInventory(manifest)
+            // Staged targets are byte donors only; their validated source marker never publishes them.
+            val candidates = (scanSuppliedSegmentRoots(root).flatMap { (directory, existing) ->
+                existing.files.map { ReuseCandidate(directory, it) }
+            } + inventory.complete).groupBy { fileKey(it.file) }
+            for (file in manifest.files) {
                 currentCoroutineContext().ensureActive()
                 checkSupply(stillCurrent(), "SUPPLY_CANCELLED", "binding changed")
-                // Never truncate a target that may already be a link to a published file.
-                Files.deleteIfExists(target.toPath())
-                try {
-                    Files.createLink(target.toPath(), candidate.toPath())
-                } catch (_: IOException) {
-                    copyReusable(candidate, partial, file.size, stillCurrent)
+                val target = safeFile(stage, file.path)
+                val partial = safeFile(stage, file.path + ".part")
+                if (target.exists() && matches(target, file)) {
                     currentCoroutineContext().ensureActive()
                     checkSupply(stillCurrent(), "SUPPLY_CANCELLED", "binding changed")
-                    Files.move(partial.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
-                } catch (_: UnsupportedOperationException) {
-                    copyReusable(candidate, partial, file.size, stillCurrent)
-                    currentCoroutineContext().ensureActive()
-                    checkSupply(stillCurrent(), "SUPPLY_CANCELLED", "binding changed")
-                    Files.move(partial.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
-                }
-                // Recheck live bytes after link/copy, including changes during verification.
-                if (!matches(target, file)) {
-                    Files.deleteIfExists(target.toPath())
+                    journal.recordSource()
+                    transfer.completed += file.size; transfer.reused += file.size
+                    Files.deleteIfExists(partial.toPath())
+                    transfer.report("reusing")
                     continue
                 }
-                currentCoroutineContext().ensureActive()
-                checkSupply(stillCurrent(), "SUPPLY_CANCELLED", "binding changed")
-                journal.recordSource()
-                Files.deleteIfExists(partial.toPath())
-                completed += file.size; reused += file.size
-                report("reusing")
-                reusedFile = true
-                break
-            }
-            if (reusedFile) continue
-            report("verifying_resume")
-            var prefix = trustedPrefix(journal, file, partial, stillCurrent)
-            prefix = importPrefix(inventory.prefixes[fileKey(file)].orEmpty(), file, partial, prefix, journal, stillCurrent)
-            val offset = prefix.length
-            if (file.size > 0 && offset == file.size && matches(partial, file)) {
+                var reusedFile = false
+                for ((directory, entry) in candidates[fileKey(file)].orEmpty()) {
+                    val candidate = runCatching { safeFile(directory, entry.path) }.getOrNull() ?: continue
+                    transfer.report("verifying_reuse")
+                    if (!matches(candidate, file)) continue
+                    currentCoroutineContext().ensureActive()
+                    checkSupply(stillCurrent(), "SUPPLY_CANCELLED", "binding changed")
+                    // Never truncate a target that may already be a link to a published file.
+                    Files.deleteIfExists(target.toPath())
+                    try {
+                        Files.createLink(target.toPath(), candidate.toPath())
+                    } catch (_: IOException) {
+                        copyReusable(candidate, partial, file.size, stillCurrent)
+                        currentCoroutineContext().ensureActive()
+                        checkSupply(stillCurrent(), "SUPPLY_CANCELLED", "binding changed")
+                        Files.move(partial.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
+                    } catch (_: UnsupportedOperationException) {
+                        copyReusable(candidate, partial, file.size, stillCurrent)
+                        currentCoroutineContext().ensureActive()
+                        checkSupply(stillCurrent(), "SUPPLY_CANCELLED", "binding changed")
+                        Files.move(partial.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
+                    }
+                    // Recheck live bytes after link/copy, including changes during verification.
+                    if (!matches(target, file)) {
+                        Files.deleteIfExists(target.toPath())
+                        continue
+                    }
+                    currentCoroutineContext().ensureActive()
+                    checkSupply(stillCurrent(), "SUPPLY_CANCELLED", "binding changed")
+                    journal.recordSource()
+                    Files.deleteIfExists(partial.toPath())
+                    transfer.completed += file.size; transfer.reused += file.size
+                    transfer.report("reusing")
+                    reusedFile = true
+                    break
+                }
+                if (reusedFile) continue
+                transfer.report("verifying_resume")
+                var prefix = trustedPrefix(journal, file, partial, stillCurrent)
+                prefix = importPrefix(inventory.prefixes[fileKey(file)].orEmpty(), file, partial, prefix, journal, stillCurrent)
+                val offset = prefix.length
+                if (file.size > 0 && offset == file.size && matches(partial, file)) {
+                    currentCoroutineContext().ensureActive()
+                    checkSupply(stillCurrent(), "SUPPLY_CANCELLED", "binding changed")
+                    journal.recordSource()
+                    Files.move(partial.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
+                    transfer.completed += file.size; transfer.reused += file.size
+                    transfer.report("reusing")
+                    continue
+                }
+                if (file.size > 0 && offset == file.size) {
+                    Files.deleteIfExists(partial.toPath())
+                    throw ModelSupplyException("SUPPLY_ARTIFACT_DIGEST_MISMATCH", "complete prefix digest mismatch")
+                }
+                checkSupply(root.usableSpace >= file.size - offset, "SUPPLY_DISK_INSUFFICIENT", "insufficient private storage")
+                if (file.size == 0L) {
+                    FileOutputStream(partial).use { it.fd.sync() }
+                } else {
+                    downloadFile(manifest, file, partial, prefix, journal, apiPort, token, stillCurrent, transfer)
+                }
+                transfer.report("verifying", transfer.completed + file.size)
+                if (!matches(partial, file)) {
+                    Files.deleteIfExists(partial.toPath())
+                    throw ModelSupplyException("SUPPLY_ARTIFACT_DIGEST_MISMATCH", "file digest mismatch")
+                }
                 currentCoroutineContext().ensureActive()
                 checkSupply(stillCurrent(), "SUPPLY_CANCELLED", "binding changed")
                 journal.recordSource()
                 Files.move(partial.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
-                completed += file.size; reused += file.size
-                report("reusing")
-                continue
+                transfer.completed += file.size
             }
-            if (file.size > 0 && offset == file.size) {
-                Files.deleteIfExists(partial.toPath())
-                throw ModelSupplyException("SUPPLY_ARTIFACT_DIGEST_MISMATCH", "complete prefix digest mismatch")
-            }
-            checkSupply(root.usableSpace >= file.size - offset, "SUPPLY_DISK_INSUFFICIENT", "insufficient private storage")
-            if (file.size == 0L) {
-                FileOutputStream(partial).use { it.fd.sync() }
-            } else {
-                val request = Request.Builder().url(fileUrl(boundHost, apiPort, manifest.operationId, manifest.nodeId, file.path))
-                    .header("X-QLH-Supply-Token", token).header("Accept-Encoding", "identity")
-                    .apply { if (offset > 0) header("Range", "bytes=$offset-") }.build()
-                val active = client.newCall(request)
-                call.set(active)
-                try {
-                    currentCoroutineContext().ensureActive()
-                    checkSupply(stillCurrent(), "SUPPLY_CANCELLED", "binding changed")
-                    active.execute().use { response ->
-                        checkSupply(response.code in setOf(200, 206), if (response.code in 300..399) "SUPPLY_REDIRECT_FORBIDDEN" else "SUPPLY_HTTP_${response.code}", "supply HTTP failed")
-                        val body = response.body ?: throw ModelSupplyException("SUPPLY_HTTP_BODY_MISSING", "empty response")
-                        val plan = try {
-                            planModelDownloadWrite(offset, response.code, body.contentLength(), response.header("Content-Range"), file.size)
-                        } catch (_: IllegalArgumentException) {
-                            throw ModelSupplyException("SUPPLY_RANGE_INVALID", "invalid partial response")
-                        }
-                        if (response.code == 206) {
-                            val range = Regex("bytes ([0-9]+)-([0-9]+)/([0-9]+)", RegexOption.IGNORE_CASE)
-                                .matchEntire(response.header("Content-Range").orEmpty())
-                            checkSupply(range != null && range.groupValues[2].toLongOrNull() == file.size - 1,
-                                "SUPPLY_RANGE_INVALID", "partial response must cover the declared suffix")
-                        }
-                        resumed += plan.startBytes
-                        FileOutputStream(partial, plan.append).use { output ->
-                            var downloaded = plan.startBytes
-                            var checkpointAt = plan.startBytes
-                            val digest = if (plan.append) prefix.digest else MessageDigest.getInstance("SHA-256")
-                            try {
-                                body.byteStream().use { input ->
-                                    // Bound live participation checks by completed chunks, not OkHttp short reads.
-                                    val buffer = ByteArray(minOf(DOWNLOAD_CHUNK_BYTES.toLong(), checkpointIntervalBytes).toInt())
-                                    while (true) {
-                                        currentCoroutineContext().ensureActive()
-                                        checkSupply(stillCurrent(), "SUPPLY_CANCELLED", "binding changed")
-                                        var count = 0
-                                        var readFailure: IOException? = null
-                                        while (count < buffer.size) {
-                                            currentCoroutineContext().ensureActive()
-                                            val read = try { input.read(buffer, count, buffer.size - count) }
-                                                catch (error: IOException) { readFailure = error; break }
-                                            if (read < 0) break
-                                            count += read
-                                            actualDownloaded = Math.addExact(actualDownloaded, read.toLong())
-                                        }
-                                        if (count == 0) {
-                                            readFailure?.let { throw it }
-                                            break
-                                        }
-                                        currentCoroutineContext().ensureActive()
-                                        checkSupply(stillCurrent(), "SUPPLY_CANCELLED", "binding changed")
-                                        if (active.isCanceled()) throw IOException("supply HTTP cancelled")
-                                        checkSupply(count.toLong() <= file.size - downloaded, "SUPPLY_SIZE_MISMATCH", "response exceeds declared size")
-                                        output.write(buffer, 0, count)
-                                        digest.update(buffer, 0, count)
-                                        downloaded += count
-                                        if (downloaded < file.size && downloaded - checkpointAt >= checkpointIntervalBytes) {
-                                            output.fd.sync()
-                                            journal.checkpoint(file, downloaded, digestSnapshot(digest))
-                                            checkpointAt = downloaded
-                                        }
-                                        report("downloading", completed + downloaded)
-                                        // A short prefix read before an IO error is safe only after the live write fence.
-                                        // The outer catch syncs and journals these written bytes before rethrowing.
-                                        readFailure?.let {
-                                            currentCoroutineContext().ensureActive()
-                                            checkSupply(stillCurrent(), "SUPPLY_CANCELLED", "binding changed")
-                                            throw it
-                                        }
-                                    }
-                                }
-                                output.fd.sync()
-                                checkSupply(downloaded == file.size, "SUPPLY_SIZE_MISMATCH", "incomplete response")
-                            } catch (error: Exception) {
-                                // Preserve written progress on disconnect, timeout or cancellation.
-                                // Save the durable prefix before any suspending terminal progress callback.
-                                if (downloaded > checkpointAt && partial.length() == downloaded) {
-                                    try {
-                                        output.fd.sync()
-                                        journal.checkpoint(file, downloaded, digestSnapshot(digest))
-                                    } catch (checkpointError: Exception) { error.addSuppressed(checkpointError) }
-                                }
-                                // Terminal network snapshot includes bytes read into a discarded chunk.
-                                // The controller records the snapshot before its own live callback fences.
-                                try { report("downloading", completed + downloaded) }
-                                catch (progressError: Exception) {
-                                    if (progressError !== error) error.addSuppressed(progressError)
-                                }
-                                throw error
-                            }
-                        }
-                    }
-                } finally { call.compareAndSet(active, null) }
-            }
-            report("verifying", completed + file.size)
-            if (!matches(partial, file)) {
-                Files.deleteIfExists(partial.toPath())
-                throw ModelSupplyException("SUPPLY_ARTIFACT_DIGEST_MISMATCH", "file digest mismatch")
-            }
+            validateFiles(stage, manifest)
+            transfer.report("registering", transfer.total)
             currentCoroutineContext().ensureActive()
             checkSupply(stillCurrent(), "SUPPLY_CANCELLED", "binding changed")
-            journal.recordSource()
-            Files.move(partial.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
-            completed += file.size
-        }
-        validateFiles(stage, manifest)
-        report("registering", total)
-        currentCoroutineContext().ensureActive()
-        checkSupply(stillCurrent(), "SUPPLY_CANCELLED", "binding changed")
-        publish {
-            journal.discard()
-            FileOutputStream(safeFile(stage, ModelSupplyManifest.MARKER)).use {
-                it.write(canonicalSupplyJson(manifest.json).toByteArray(Charsets.UTF_8)); it.fd.sync()
+            publish {
+                journal.discard()
+                FileOutputStream(safeFile(stage, ModelSupplyManifest.MARKER)).use {
+                    it.write(canonicalSupplyJson(manifest.json).toByteArray(Charsets.UTF_8)); it.fd.sync()
+                }
+                Files.move(stage.toPath(), final.toPath(), StandardCopyOption.ATOMIC_MOVE)
             }
-            Files.move(stage.toPath(), final.toPath(), StandardCopyOption.ATOMIC_MOVE)
-        }
-        return final
+            return final
+        } finally { transfer.diagnostics.emit(transfer.actualDownloaded, terminal = true) }
     }
 
+
+    private class TransferState(
+        val total: Long,
+        private val progress: suspend (ModelSupplyProgress) -> Unit,
+        val diagnostics: TransferDiagnostics,
+    ) {
+        var completed = 0L
+        var actualDownloaded = 0L
+        var reused = 0L
+        var resumed = 0L
+
+        suspend fun report(phase: String, bytes: Long = completed) {
+            progress(ModelSupplyProgress(phase, bytes, total, actualDownloaded, reused, resumed))
+        }
+    }
+
+    /** Keep HTTP admission and resource cleanup outside the hot transfer state machine. */
+    private suspend fun downloadFile(
+        manifest: ModelSupplyManifest,
+        file: ModelSupplyManifest.SupplyFile,
+        partial: File,
+        prefix: Prefix,
+        journal: ResumeJournal,
+        apiPort: Int,
+        token: String,
+        stillCurrent: suspend () -> Boolean,
+        transfer: TransferState,
+    ) {
+        val offset = prefix.length
+        val request = Request.Builder().url(fileUrl(boundHost, apiPort, manifest.operationId, manifest.nodeId, file.path))
+            .header("X-QLH-Supply-Token", token).header("Accept-Encoding", "identity")
+            .apply { if (offset > 0) header("Range", "bytes=$offset-") }.build()
+        val active = client.newCall(request)
+        call.set(active)
+        try {
+            currentCoroutineContext().ensureActive()
+            checkTransferCurrent(stillCurrent, transfer.diagnostics)
+            val started = transfer.diagnostics.start()
+            val response = try { active.execute() }
+                finally { transfer.diagnostics.record(TransferDiagnostics.Stage.READ, started) }
+            response.use {
+                checkSupply(response.code in setOf(200, 206), if (response.code in 300..399) "SUPPLY_REDIRECT_FORBIDDEN" else "SUPPLY_HTTP_${response.code}", "supply HTTP failed")
+                val body = response.body ?: throw ModelSupplyException("SUPPLY_HTTP_BODY_MISSING", "empty response")
+                val plan = try {
+                    planModelDownloadWrite(offset, response.code, body.contentLength(), response.header("Content-Range"), file.size)
+                } catch (_: IllegalArgumentException) {
+                    throw ModelSupplyException("SUPPLY_RANGE_INVALID", "invalid partial response")
+                }
+                if (response.code == 206) {
+                    val range = Regex("bytes ([0-9]+)-([0-9]+)/([0-9]+)", RegexOption.IGNORE_CASE)
+                        .matchEntire(response.header("Content-Range").orEmpty())
+                    checkSupply(range != null && range.groupValues[2].toLongOrNull() == file.size - 1,
+                        "SUPPLY_RANGE_INVALID", "partial response must cover the declared suffix")
+                }
+                transfer.resumed += plan.startBytes
+                FileOutputStream(partial, plan.append).use { output ->
+                    val digest = if (plan.append) prefix.digest else MessageDigest.getInstance("SHA-256")
+                    transferBody(body, output, partial, file, journal, digest,
+                        plan.startBytes, active, stillCurrent, transfer)
+                }
+            }
+        } finally { call.compareAndSet(active, null) }
+    }
+
+    /** Non-inline so nested use/catch cleanup cannot expand receive's coroutine state machine. */
+    private suspend fun transferBody(
+        body: ResponseBody,
+        output: FileOutputStream,
+        partial: File,
+        file: ModelSupplyManifest.SupplyFile,
+        journal: ResumeJournal,
+        digest: MessageDigest,
+        startBytes: Long,
+        active: Call,
+        stillCurrent: suspend () -> Boolean,
+        transfer: TransferState,
+    ) {
+        var downloaded = startBytes
+        var checkpointAt = startBytes
+        val timing = transfer.diagnostics
+        try {
+            body.byteStream().use { input ->
+                // Bound live participation checks by completed chunks, not OkHttp short reads.
+                val buffer = ByteArray(minOf(DOWNLOAD_CHUNK_BYTES.toLong(), checkpointIntervalBytes).toInt())
+                while (true) {
+                    currentCoroutineContext().ensureActive()
+                    checkTransferCurrent(stillCurrent, timing)
+                    var count = 0
+                    var readFailure: IOException? = null
+                    while (count < buffer.size) {
+                        currentCoroutineContext().ensureActive()
+                        val started = timing.start()
+                        val read = try { input.read(buffer, count, buffer.size - count) }
+                            catch (error: IOException) { readFailure = error; break }
+                            finally { timing.record(TransferDiagnostics.Stage.READ, started) }
+                        if (read < 0) break
+                        count += read
+                        transfer.actualDownloaded = Math.addExact(transfer.actualDownloaded, read.toLong())
+                    }
+                    if (count == 0) {
+                        readFailure?.let { throw it }
+                        break
+                    }
+                    currentCoroutineContext().ensureActive()
+                    checkTransferCurrent(stillCurrent, timing)
+                    if (active.isCanceled()) throw IOException("supply HTTP cancelled")
+                    checkSupply(count.toLong() <= file.size - downloaded, "SUPPLY_SIZE_MISMATCH", "response exceeds declared size")
+                    val started = timing.start()
+                    try {
+                        output.write(buffer, 0, count)
+                        digest.update(buffer, 0, count)
+                        downloaded += count
+                    } finally { timing.record(TransferDiagnostics.Stage.WRITE_HASH, started) }
+                    if (downloaded < file.size && downloaded - checkpointAt >= checkpointIntervalBytes) {
+                        checkpoint(output, journal, file, downloaded, digest, timing)
+                        checkpointAt = downloaded
+                    }
+                    reportDownload(transfer, transfer.completed + downloaded)
+                    // A short prefix read before an IO error is safe only after the live write fence.
+                    // The outer catch syncs and journals these written bytes before rethrowing.
+                    readFailure?.let {
+                        currentCoroutineContext().ensureActive()
+                        checkTransferCurrent(stillCurrent, timing)
+                        throw it
+                    }
+                }
+            }
+            val started = timing.start()
+            try { output.fd.sync() }
+                finally { timing.record(TransferDiagnostics.Stage.CHECKPOINT, started) }
+            checkSupply(downloaded == file.size, "SUPPLY_SIZE_MISMATCH", "incomplete response")
+        } catch (error: Exception) {
+            // Save the durable prefix before any suspending terminal progress callback.
+            if (downloaded > checkpointAt && partial.length() == downloaded) {
+                try { checkpoint(output, journal, file, downloaded, digest, timing) }
+                catch (checkpointError: Exception) { error.addSuppressed(checkpointError) }
+            }
+            // Includes bytes read into a discarded chunk, recorded before controller live fences.
+            try { reportDownload(transfer, transfer.completed + downloaded) }
+            catch (progressError: Exception) {
+                if (progressError !== error) error.addSuppressed(progressError)
+            }
+            throw error
+        }
+    }
+
+    private suspend fun checkTransferCurrent(stillCurrent: suspend () -> Boolean, timing: TransferDiagnostics) {
+        val started = timing.start()
+        try { checkSupply(stillCurrent(), "SUPPLY_CANCELLED", "binding changed") }
+        finally { timing.record(TransferDiagnostics.Stage.LIVE_CHECK, started) }
+    }
+
+    private suspend fun reportDownload(transfer: TransferState, bytes: Long) {
+        val started = transfer.diagnostics.start()
+        try { transfer.report("downloading", bytes) }
+        finally {
+            transfer.diagnostics.record(TransferDiagnostics.Stage.PROGRESS, started)
+            // Sample at existing chunk boundaries; no timer job or asynchronous control send.
+            transfer.diagnostics.emit(transfer.actualDownloaded)
+        }
+    }
+
+    private fun checkpoint(
+        output: FileOutputStream,
+        journal: ResumeJournal,
+        file: ModelSupplyManifest.SupplyFile,
+        downloaded: Long,
+        digest: MessageDigest,
+        timing: TransferDiagnostics,
+    ) {
+        val started = timing.start()
+        try {
+            output.fd.sync()
+            journal.checkpoint(file, downloaded, digestSnapshot(digest))
+        } finally { timing.record(TransferDiagnostics.Stage.CHECKPOINT, started) }
+    }
 
     private data class Prefix(val length: Long, val digest: MessageDigest)
     private data class Checkpoint(val path: String, val length: Long, val sha256: String)
