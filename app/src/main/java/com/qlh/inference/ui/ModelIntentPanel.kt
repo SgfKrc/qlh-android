@@ -23,6 +23,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import com.qlh.inference.ModelIntentUiState
+import com.qlh.inference.formatModelIntentCapacity
 import com.qlh.inference.modelIntentStatusLabel
 import com.qlh.inference.network.ServerModelSummary
 import com.qlh.inference.ui.components.SettingsGroup
@@ -157,7 +158,7 @@ fun ModelIntentProgress(
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.testTag("intent_progress")) {
         state.operation?.let { operation ->
-            Text("${operation.intent.modelId} · ${modelIntentStatusLabel(operation.status)}",
+            Text("${operation.intent.modelId} · ${modelIntentStatusLabel(operation)}",
                 style = MaterialTheme.typography.titleSmall)
             if (operation.status == "ready" && !operation.loadedReady) Text("等待主节点确认推理就绪")
             if (state.readyForChat) Text("模型已准备完成，可开始聊天", color = MaterialTheme.colorScheme.primary)
@@ -168,6 +169,10 @@ fun ModelIntentProgress(
             if (!operation.reasonCode.isNullOrBlank() || !operation.reason.isNullOrBlank()) {
                 Text(listOfNotNull(operation.reasonCode, operation.reason).joinToString(" · "),
                     color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+            }
+            val capacityLines = formatModelIntentCapacity(operation)
+            if (capacityLines.isNotEmpty()) Column(modifier = Modifier.testTag("intent_capacity_diagnostic")) {
+                capacityLines.forEach { line -> Text(line, style = MaterialTheme.typography.bodySmall) }
             }
             if (operation.plan != null && !operation.plan.isJsonNull) Text("供给计划已生成", style = MaterialTheme.typography.bodySmall)
             if (showNodes) operation.nodes.forEach { (id, node) ->
