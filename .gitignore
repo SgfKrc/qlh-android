@@ -24,3 +24,8 @@ models/
 
 # 原生库
 app/.cxx/
+
+# 重连调试/验收实验证据（本机保留，不入库；内容见 worker-reconnect-evidence/）
+worker-reconnect-*.log
+worker-reconnect-evidence/
+pc-reconnect-*.log
