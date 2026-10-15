@@ -20,6 +20,16 @@ import com.qlh.inference.R
 import com.qlh.inference.data.SettingsDataStore
 import com.qlh.inference.model.Gemma4NativeAssets
 import com.qlh.inference.status.AndroidRuntimeStatus
+import com.qlh.inference.status.ReleaseRuntimeProbe
+import com.qlh.inference.status.ReleaseRuntimeProbe.ErrorCode
+import com.qlh.inference.worker.TaskWorkerService
+import java.io.FileDescriptor
+import java.io.PrintWriter
+import java.util.concurrent.ExecutionException
+import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.TimeoutException
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.TimeoutCancellationException
 import com.qlh.inference.status.androidRuntimeStatusInvalidation
 import com.qlh.inference.status.BackendStatus
 import com.qlh.inference.status.ContextRuntimeStatus
@@ -56,6 +66,7 @@ class InferenceService : Service() {
 
     companion object {
         private const val TAG = "InferenceService"
+        private val releaseProbeReader by lazy { ReleaseRuntimeProbe.BoundedReader() }
 
         /** Intent action: 预加载模型 */
         const val ACTION_LOAD_MODEL = "com.qlh.inference.LOAD_MODEL"
@@ -169,6 +180,48 @@ class InferenceService : Service() {
     override fun onBind(intent: Intent?): IBinder {
         Log.i(TAG, "Service onBind")
         return binder
+    }
+
+    /** ActivityManager/dumpsys supplies the existing system permission boundary. */
+    protected override fun dump(fd: FileDescriptor, writer: PrintWriter, args: Array<out String>?) {
+        val nonce = ReleaseRuntimeProbe.nonce(args) ?: return
+        val identity = ReleaseRuntimeProbe.PackageIdentity(android.os.Process.myPid(), packageName)
+        fun failure(code: ErrorCode): String = ReleaseRuntimeProbe.line(
+            nonce, identity, ReleaseRuntimeProbe.failure(code, TaskWorkerService.workerSnapshot.value),
+        )
+        val line = try {
+            releaseProbeReader.read {
+                val info = packageManager.getPackageInfo(packageName, 0)
+                val installed = identity.copy(
+                    versionName = info.versionName,
+                    versionCode = if (Build.VERSION.SDK_INT >= 28) info.longVersionCode else {
+                        @Suppress("DEPRECATION")
+                        info.versionCode.toLong()
+                    },
+                )
+                val snapshot = engine?.releaseRuntimeProbe(
+                    readMode = { settings.getInferenceMode() },
+                    readWorker = { TaskWorkerService.workerSnapshot.value },
+                ) ?: ReleaseRuntimeProbe.failure(ErrorCode.ENGINE_MISSING, TaskWorkerService.workerSnapshot.value)
+                ReleaseRuntimeProbe.line(nonce, installed, snapshot)
+            }
+        } catch (_: TimeoutException) {
+            failure(ErrorCode.PROBE_TIMEOUT)
+        } catch (_: RejectedExecutionException) {
+            failure(ErrorCode.PROBE_BUSY)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            failure(ErrorCode.PROBE_INTERRUPTED)
+        } catch (error: ExecutionException) {
+            when (val cause = error.cause) {
+                is TimeoutCancellationException -> failure(ErrorCode.PROBE_TIMEOUT)
+                is CancellationException -> throw cause
+                is VirtualMachineError -> throw cause
+                is ThreadDeath -> throw cause
+                else -> failure(ErrorCode.PROBE_FAILED)
+            }
+        }
+        writer.println(line)
     }
 
     override fun onUnbind(intent: Intent?): Boolean {

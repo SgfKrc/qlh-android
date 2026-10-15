@@ -1,10 +1,122 @@
 import java.util.Properties
+import java.io.File
+import javax.inject.Inject
+import org.gradle.process.ExecOperations
 
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.ksp)
+}
+
+// Build identity comes from the containing core checkout and its fixed Git graph.
+// Use one executable path/name, with no shell command or revision environment override.
+abstract class GenerateQlhBuildInfo : DefaultTask() {
+    @get:Input
+    abstract val pythonExecutable: Property<String>
+
+    @get:InputFile
+    @get:PathSensitive(PathSensitivity.RELATIVE)
+    abstract val generatorScript: RegularFileProperty
+
+    @get:Internal
+    abstract val coreCheckout: DirectoryProperty
+
+    @get:OutputDirectory
+    abstract val assetsDirectory: DirectoryProperty
+
+    @get:Inject
+    abstract val execOperations: ExecOperations
+
+    @TaskAction
+    fun generate() {
+        execOperations.exec {
+            commandLine(
+                pythonExecutable.get(), "-B", generatorScript.get().asFile.absolutePath,
+                "--root", coreCheckout.get().asFile.absolutePath,
+                "--output", assetsDirectory.file("build-info.json").get().asFile.absolutePath,
+            )
+        }
+    }
+}
+
+// A package action, rather than a sibling task: all compile/native/merge
+// dependencies must have completed before comparing the original source snapshot.
+open class VerifyQlhBuildInfoAction @Inject constructor(
+    private val execOperations: ExecOperations,
+) : Action<Task> {
+    lateinit var pythonExecutable: String
+    lateinit var generatorScript: File
+    lateinit var coreCheckout: File
+    lateinit var snapshotFile: Provider<RegularFile>
+
+    override fun execute(task: Task) {
+        task.logger.lifecycle("Verifying QLH build-info snapshot before ${task.path}")
+        execOperations.exec {
+            commandLine(
+                pythonExecutable, "-B", generatorScript.absolutePath,
+                "--root", coreCheckout.absolutePath,
+                "--verify", snapshotFile.get().asFile.absolutePath,
+            )
+        }
+    }
+}
+
+val provenanceCoreRoot = rootProject.projectDir.parentFile
+val provenancePython = providers.environmentVariable("QLH_BUILD_PYTHON").orElse("python")
+val provenanceScript = provenanceCoreRoot.resolve("scripts/package_contract/build_provenance.py")
+// Observe actual HEADs, source bytes and dirty state even when timestamps/HEAD did
+// not change. This input also validates the selected Python and exact Git roots.
+val provenanceSnapshot = providers.exec {
+    commandLine(
+        provenancePython.get(), "-B", provenanceScript.absolutePath,
+        "--root", provenanceCoreRoot.absolutePath, "--print",
+    )
+}.standardOutput.asText
+
+val generateQlhBuildInfo = tasks.register<GenerateQlhBuildInfo>("generateQlhBuildInfo") {
+    pythonExecutable.set(provenancePython)
+    generatorScript.set(provenanceScript)
+    coreCheckout.set(provenanceCoreRoot)
+    assetsDirectory.set(layout.buildDirectory.dir("generated/qlhBuildInfo/assets"))
+    inputs.property("sourceProvenance", provenanceSnapshot)
+    // A copied generated asset or cached configuration must never reuse old identity.
+    outputs.upToDateWhen { false }
+    outputs.doNotCacheIf("Build source provenance must be freshly observed") { true }
+}
+
+androidComponents {
+    onVariants(selector().all()) { variant ->
+        variant.sources.assets?.addGeneratedSourceDirectory(
+            generateQlhBuildInfo, GenerateQlhBuildInfo::assetsDirectory,
+        )
+    }
+}
+tasks.named("preBuild") {
+    dependsOn(generateQlhBuildInfo)
+}
+
+// Use the actual APK task provider for every application variant (debug/release).
+// doFirst runs after its dependencies and before AGP writes/signs the APK. JVM
+// compile/test tasks do not invoke this action. Never refresh metadata here.
+android.applicationVariants.all {
+    packageApplicationProvider.configure {
+        val originalSnapshot = generateQlhBuildInfo.flatMap {
+            it.assetsDirectory.file("build-info.json")
+        }
+        inputs.file(originalSnapshot).withPropertyName("qlhBuildInfoSnapshot")
+            .withPathSensitivity(PathSensitivity.RELATIVE)
+        outputs.upToDateWhen { false }
+        outputs.doNotCacheIf("APK packaging must verify the original source snapshot") { true }
+        val verification = objects.newInstance(VerifyQlhBuildInfoAction::class.java).apply {
+            pythonExecutable = provenancePython.get()
+            generatorScript = provenanceScript
+            coreCheckout = provenanceCoreRoot
+            snapshotFile = originalSnapshot
+        }
+        doFirst("verifyQlhBuildInfo", verification)
+    }
 }
 
 val keystorePropertiesFile = rootProject.file("keystore.properties")

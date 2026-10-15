@@ -3,6 +3,11 @@ package com.qlh.inference.service
 import android.content.Context
 import android.os.Build
 import android.util.Log
+import com.qlh.inference.status.RuntimeProcessObservations
+import com.qlh.inference.status.ReleaseRuntimeProbe
+import com.qlh.inference.status.ReleaseRuntimeProbe.ErrorCode
+import com.qlh.inference.worker.TaskWorkerSnapshot
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.sync.Mutex
@@ -488,6 +493,60 @@ class LocalInferenceEngine(private val context: Context) {
             Result.success(nativeGetBackendInfo())
         } catch (e: Exception) {
             Result.failure(e)
+        }
+    }
+
+    /** One actual JNI/model generation; never call getBackendInfo/getModelInfo under this mutex. */
+    internal suspend fun releaseRuntimeProbe(
+        readMode: suspend () -> String,
+        readWorker: () -> TaskWorkerSnapshot,
+    ): ReleaseRuntimeProbe.Snapshot = withContext(Dispatchers.IO) {
+        modelMutex.withLock {
+            ReleaseRuntimeProbe.capture(readMode, readWorker) {
+                if (closed) {
+                    ReleaseRuntimeProbe.RuntimeState(
+                        ReleaseRuntimeProbe.NativeState(errorCode = ErrorCode.ENGINE_CLOSED),
+                    )
+                } else {
+                    val loaded = modelPtr != 0L
+                    val range = loadedLayerRange.toList()
+                    val backend = try {
+                        if (ensureNativeLibraryLoaded().isFailure) {
+                            ReleaseRuntimeProbe.NativeState(errorCode = ErrorCode.NATIVE_LIBRARY_UNAVAILABLE)
+                        } else {
+                            ReleaseRuntimeProbe.NativeState.fromBackend(nativeGetBackendInfo())
+                        }
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (_: LinkageError) {
+                        ReleaseRuntimeProbe.NativeState(errorCode = ErrorCode.NATIVE_QUERY_FAILED)
+                    } catch (_: Exception) {
+                        ReleaseRuntimeProbe.NativeState(errorCode = ErrorCode.NATIVE_QUERY_FAILED)
+                    }
+                    var modelError: ErrorCode? = null
+                    val count = if (loaded && nativeLoaded) {
+                        try {
+                            // Read the retained pointer directly while holding modelMutex.
+                            nativeGetModelInfo(modelPtr)["n_layer"]?.toIntOrNull()?.takeIf { it > 0 }
+                                .also { if (it == null) modelError = ErrorCode.MODEL_INFO_FAILED }
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (_: LinkageError) {
+                            modelError = ErrorCode.MODEL_INFO_FAILED
+                            null
+                        } catch (_: Exception) {
+                            modelError = ErrorCode.MODEL_INFO_FAILED
+                            null
+                        }
+                    } else null
+                    ReleaseRuntimeProbe.RuntimeState(
+                        native = backend,
+                        model = ReleaseRuntimeProbe.ModelState(loaded, range, count),
+                        errorCode = backend.errorCode ?: modelError,
+                        process = RuntimeProcessObservations.capture(),
+                    )
+                }
+            }
         }
     }
 
