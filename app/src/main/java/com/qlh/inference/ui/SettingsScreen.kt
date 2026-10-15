@@ -104,6 +104,12 @@ import com.qlh.inference.ManagementUiState
 import com.qlh.inference.ManagedBindingSnapshot
 import com.qlh.inference.ManagedUserSnapshot
 import com.qlh.inference.MAX_MANAGEMENT_AUDIT_EVENTS
+import com.qlh.inference.worker.TaskWorkerSnapshot
+import com.qlh.inference.worker.TaskWorkerConnectionState
+import com.qlh.inference.worker.taskWorkerConnectionLabel
+import com.qlh.inference.network.ControlPlaneProbeResult
+import com.qlh.inference.network.ControlPlaneProbeState
+import com.qlh.inference.network.probeControlPlaneConnection
 import com.qlh.inference.network.ConnectionHealthState
 import com.qlh.inference.network.ApiClient
 import com.qlh.inference.network.GgufModelInfo
@@ -215,6 +221,10 @@ fun SettingsScreen(
     runtimeStatusError: String?,
     onRefreshRuntimeStatus: () -> Unit,
     presence: AndroidPresenceSnapshot = AndroidPresenceSnapshot(),
+    taskWorker: TaskWorkerSnapshot = TaskWorkerSnapshot(),
+    onTestControlPlaneConnection: suspend (String, Int) -> ControlPlaneProbeResult = { host, apiPort ->
+        probeControlPlaneConnection(host, 8888, bootstrapInfo = { ApiClient(httpBaseUrl(host, apiPort)).getBootstrapInfo() })
+    },
     onConnectionTestSuccess: () -> Unit = {},
     remoteModels: List<GgufModelInfo> = emptyList(),
     remoteModelsLoading: Boolean = false,
@@ -313,10 +323,12 @@ fun SettingsScreen(
                     serverHost = serverHost, serverPort = serverPort,
                     onServerHostChange = onServerHostChange, onServerPortChange = onServerPortChange,
                     onConnectionTestSuccess = onConnectionTestSuccess,
+                    onTestControlPlaneConnection = onTestControlPlaneConnection,
                 )
             }
 
-            PresenceStatusGroup(presence)
+            if (inferenceMode == SettingsDataStore.MODE_DISTRIBUTED) WorkerConnectionStatusGroup(taskWorker)
+            else PresenceStatusGroup(presence)
 
             ClusterOverviewGroup(
                 state = clusterOverview,
@@ -478,6 +490,36 @@ private fun AppearanceGroup(
 // ================================================================
 // 主节点连接
 // ================================================================
+
+@Composable
+private fun WorkerConnectionStatusGroup(snapshot: TaskWorkerSnapshot) {
+    SettingsGroup(title = "Worker 连接", icon = Icons.Default.Cloud) {
+        QlhSemanticStatusChip(
+            text = taskWorkerConnectionLabel(snapshot),
+            status = if (snapshot.connectionAlive && snapshot.processRunning) "connected" else "offline",
+            modifier = Modifier.testTag("worker_connection_status"),
+        )
+        Text("Worker 进程：${if (snapshot.processRunning) "运行中" else "未运行"}",
+            style = MaterialTheme.typography.bodySmall)
+        if (snapshot.connection == TaskWorkerConnectionState.BACKING_OFF) {
+            Text("重连次数：${snapshot.reconnectAttempt}；下次重试：${java.util.Date(snapshot.nextRetryAtMs)}",
+                style = MaterialTheme.typography.bodySmall)
+        }
+        if (snapshot.connection == TaskWorkerConnectionState.RETRY_EXHAUSTED) {
+            Text("worker_reconnect_exhausted：请确认主节点与身份配置后，点击测试连接重试。",
+                color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+        }
+        snapshot.lastErrorCode?.let { code ->
+            val kind = when (snapshot.failureKind) {
+                "identity" -> "身份或注册失败"
+                "network" -> "网络连接失败"
+                else -> "协议失败"
+            }
+            Text("$kind：$code", color = MaterialTheme.colorScheme.error,
+                style = MaterialTheme.typography.bodySmall)
+        }
+    }
+}
 
 @Composable
 private fun PresenceStatusGroup(snapshot: AndroidPresenceSnapshot) {
@@ -1509,12 +1551,13 @@ private fun ConnectionGroup(
     serverPort: Int,
     onServerHostChange: (String) -> Unit,
     onServerPortChange: (Int) -> Unit,
-    onConnectionTestSuccess: () -> Unit
+    onConnectionTestSuccess: () -> Unit,
+    onTestControlPlaneConnection: suspend (String, Int) -> ControlPlaneProbeResult,
 ) {
     val scope = rememberCoroutineScope()
     val focusManager = LocalFocusManager.current
     var isTesting by remember { mutableStateOf(false) }
-    var connectionResult by remember { mutableStateOf<Boolean?>(null) }
+    var connectionResult by remember { mutableStateOf<ControlPlaneProbeResult?>(null) }
     // Keep incomplete input local; persistence/bootstrap only receives a complete value.
     var hostDraft by rememberSaveable { mutableStateOf(serverHost) }
     var portDraft by rememberSaveable { mutableStateOf(serverPort.toString()) }
@@ -1574,6 +1617,8 @@ private fun ConnectionGroup(
         return true
     }
 
+    LaunchedEffect(serverHost, serverPort) { connectionResult = null }
+
     val hostInvalid = validHost(hostDraft) == null
     val portInvalid = validPort(portDraft) == null
     SettingsGroup(title = "主节点连接", icon = Icons.Default.NetworkCheck) {
@@ -1614,7 +1659,7 @@ private fun ConnectionGroup(
                 portEdited = true
                 connectionResult = null
             },
-            label = { Text("端口") },
+            label = { Text("引导 API 端口") },
             modifier = Modifier
                 .fillMaxWidth()
                 .testTag("settings_server_port")
@@ -1631,7 +1676,7 @@ private fun ConnectionGroup(
             }),
             isError = portInvalid,
             supportingText = if (portInvalid) {
-                { Text("端口需为 1–65535（TCP 工作端口，默认 8888）") }
+                { Text("API 端口需为 1–65535；控制面使用绑定的 TCP 端口（默认 8888）") }
             } else null,
             enabled = !isTesting
         )
@@ -1655,16 +1700,11 @@ private fun ConnectionGroup(
                     connectionResult = null
                     scope.launch {
                         try {
-                            QlhLogger.i("Settings", "测试连接: $url")
-                            val raw = ApiClient(url).testConnection()
-                            val success = raw.getOrDefault(false)
-                            connectionResult = success
-                            if (success) {
-                                QlhLogger.i("Settings", "连接测试成功: $url")
-                                onConnectionTestSuccess()
-                            } else {
-                                QlhLogger.w("Settings", "连接测试失败: $url — ${raw.exceptionOrNull()?.message ?: "HTTP 请求失败"}")
-                            }
+                            val result = onTestControlPlaneConnection(host, port)
+                            connectionResult = result
+                            QlhLogger.i("Settings", "control_plane_probe=${result.code} " +
+                                "tcp=${result.tcpHost}:${result.tcpPort} state=${result.state}")
+                            if (result.state == ControlPlaneProbeState.VERIFIED) onConnectionTestSuccess()
                         } finally {
                             isTesting = false
                         }
@@ -1688,22 +1728,16 @@ private fun ConnectionGroup(
                 }
             }
 
-            connectionResult?.let { success ->
-                Spacer(modifier = Modifier.width(12.dp))
-                if (success) {
-                    QlhSemanticStatusChip(
-                        text = "已连接",
-                        status = "connected",
-                        showDot = false,
-                    )
-                } else {
-                    QlhSemanticStatusChip(
-                        text = "无法连接",
-                        status = "offline",
-                        showDot = false,
-                    )
-                }
-            }
+        }
+        connectionResult?.let { result ->
+            Text(
+                text = "${result.message}（${result.tcpHost}:${result.tcpPort}）\n${result.code}",
+                modifier = Modifier.testTag("settings_connection_result"),
+                style = MaterialTheme.typography.bodySmall,
+                color = if (result.state == ControlPlaneProbeState.VERIFIED) MaterialTheme.colorScheme.primary
+                    else MaterialTheme.colorScheme.error,
+            )
+
         }
     }
 }

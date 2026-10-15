@@ -116,7 +116,8 @@ class ModelManager(private val context: Context) {
             return dir
         }
 
-    internal val suppliedSegmentsDir: File get() = File(modelsDir, "supply")
+    // Resolve only the OS-owned app directory alias; private models/supply children reject reparse paths.
+    internal val suppliedSegmentsDir: File get() = File(File(context.filesDir.canonicalFile, MODELS_DIR), "supply")
 
     internal suspend fun currentSupplyBinding(): String = supplyBindingSha256(
         settings.getClusterId(), settings.getMasterTcpHost(), settings.getMasterTcpPort(), settings.getClusterSecretEpoch(),
@@ -370,88 +371,94 @@ class ModelManager(private val context: Context) {
         preferFd: Boolean = true,
         expectedArtifactModelId: String = "",
     ): Result<LayerArtifactHandle> = withContext(Dispatchers.IO) {
-        if (layerRange.size != 2 || layerRange[1] <= layerRange[0] || layerRange[0] < 0) {
-            return@withContext Result.failure(IOException("invalid layer range"))
-        }
-        if (expectedSourceModelId.isBlank() ||
-            !expectedSourceModelSha256.matches(Regex("[0-9a-fA-F]{64}")) ||
-            !expectedArtifactSha256.matches(Regex("[0-9a-fA-F]{64}"))
-        ) {
-            return@withContext Result.failure(IOException("source identity and artifact digest are required"))
-        }
-        val artifacts = listLayerArtifacts(
-            expectedModelSha256 = expectedSourceModelSha256,
-            verifyArtifactDigest = true,
-        ).getOrElse { return@withContext Result.failure(it) }
-        val choice = chooseLayerArtifact(
-            candidates = artifacts.map { it.toCandidate() },
-            masterModelId = expectedSourceModelId,
-            masterSourceSha256 = expectedSourceModelSha256,
-            startLayer = layerRange[0],
-            endLayerExclusive = layerRange[1],
-            offeredArtifactSha256 = expectedArtifactSha256,
-            offeredArtifactModelId = expectedArtifactModelId,
-        )
-        val artifact = when (choice) {
-            is LayerArtifactChoice.Selected -> artifacts.first {
-                it.document.uri.toString() == choice.artifact.reference
+        val pendingSupply = ModelSupplyStorage.pending(suppliedSegmentsDir)
+        try {
+            if (layerRange.size != 2 || layerRange[1] <= layerRange[0] || layerRange[0] < 0) {
+                return@withContext Result.failure(IOException("invalid layer range"))
             }
-            is LayerArtifactChoice.ManualRequired -> return@withContext Result.failure(
-                IOException("${choice.reason}: ${choice.prompt}"),
+            if (expectedSourceModelId.isBlank() ||
+                !expectedSourceModelSha256.matches(Regex("[0-9a-fA-F]{64}")) ||
+                !expectedArtifactSha256.matches(Regex("[0-9a-fA-F]{64}"))
+            ) {
+                return@withContext Result.failure(IOException("source identity and artifact digest are required"))
+            }
+            val artifacts = listLayerArtifacts(
+                expectedModelSha256 = expectedSourceModelSha256,
+                verifyArtifactDigest = true,
+            ).getOrElse { return@withContext Result.failure(it) }
+            val choice = chooseLayerArtifact(
+                candidates = artifacts.map { it.toCandidate() },
+                masterModelId = expectedSourceModelId,
+                masterSourceSha256 = expectedSourceModelSha256,
+                startLayer = layerRange[0],
+                endLayerExclusive = layerRange[1],
+                offeredArtifactSha256 = expectedArtifactSha256,
+                offeredArtifactModelId = expectedArtifactModelId,
             )
-        }
+            val artifact = when (choice) {
+                is LayerArtifactChoice.Selected -> artifacts.first {
+                    it.document.uri.toString() == choice.artifact.reference
+                }
+                is LayerArtifactChoice.ManualRequired -> return@withContext Result.failure(
+                    IOException("${choice.reason}: ${choice.prompt}"),
+                )
+            }
 
-        openModelHandle(artifact.document.uri, preferFd).map { handle ->
-            LayerArtifactHandle(
-                handle = handle,
-                startLayer = artifact.startLayer,
-                endLayerExclusive = artifact.endLayerExclusive,
-                sourceModelSha256 = artifact.sourceModelSha256,
-                artifactSha256 = artifact.artifactSha256,
-            )
-        }
+            openModelHandle(artifact.document.uri, preferFd).map { handle ->
+                LayerArtifactHandle(
+                    handle = handle,
+                    startLayer = artifact.startLayer,
+                    endLayerExclusive = artifact.endLayerExclusive,
+                    sourceModelSha256 = artifact.sourceModelSha256,
+                    artifactSha256 = artifact.artifactSha256,
+                )
+            }
+        } finally { pendingSupply.close() }
     }
 
     /** Resolve the exact prepare identity before a native reuse/load; inventory alone is insufficient. */
     internal suspend fun verifyWorkerPrepare(identity: com.qlh.inference.worker.WorkerPrepareIdentity) = withContext(Dispatchers.IO) {
-        val manifest = currentSupply()
-        val expectedManifest = identity.text("manifest_sha256")
-        if (expectedManifest.isNotEmpty()) {
-            com.qlh.inference.worker.checkPrepare(manifest != null, "prepare_manifest_missing", "no selected supply")
-            identity.verifyManifest(manifest!!)
-        } else {
-            com.qlh.inference.worker.checkPrepare(manifest == null, "prepare_manifest_mismatch", "supply cannot be treated as legacy SAF")
-        }
-        val artifacts = listLayerArtifacts(identity.text("source_model_sha256"), verifyArtifactDigest = true).getOrThrow()
-        val matching = artifacts.filter { artifact ->
-            identity.range == listOf(artifact.startLayer, artifact.endLayerExclusive) &&
-                artifact.artifactSha256 == identity.text("artifact_sha256") &&
-                artifact.sourceModelSha256 == identity.text("source_model_sha256") &&
-                artifact.sourceModelId == identity.text("source_model_id") &&
-                artifact.tokenizerSha256 == identity.text("tokenizer_sha256") &&
-                artifact.hiddenSize == identity.hiddenSize && artifact.mode == identity.mode &&
-                com.qlh.inference.worker.AndroidWorkerCapabilities.artifactModelId(artifact.document.name, artifact.artifactSha256) ==
-                    identity.stageIdentity["model_id"]
-        }
-        com.qlh.inference.worker.checkPrepare(matching.isNotEmpty(), "prepare_artifact_identity_mismatch", "no verified exact artifact")
-        val artifact = matching.first()
-        val native = com.google.gson.JsonParser.parseString(readDocument(artifact.manifest.uri)
-            ?: throw IOException("prepare native manifest missing")).asJsonObject
-        com.qlh.inference.worker.checkPrepare(native["n_layer"]?.asInt == identity.totalLayers,
-            "prepare_manifest_mismatch", "source total layers differ")
-        if (manifest != null) {
-            val expectedReference = Uri.fromFile(File(ModelSupplyCurrent(suppliedSegmentsDir).directory(manifest), manifest.weight.path)).toString()
-            com.qlh.inference.worker.checkPrepare(artifact.document.uri.toString() == expectedReference,
-                "prepare_manifest_mismatch", "exact selected supply required")
-        }
-        val scan = context.contentResolver.openInputStream(artifact.document.uri)?.use {
-            com.qlh.inference.worker.GgufLayerWeightReader.scan(it, identity.range[1] - identity.range[0])
-        }
-        com.qlh.inference.worker.checkPrepare(scan != null &&
-            com.qlh.inference.worker.GgufLayerWeightReader.matchesTokenizerSha256(identity.text("tokenizer_sha256"), scan),
-            "prepare_gguf_shape_mismatch", "proper decoder segment and tokenizer required before native load")
-        com.qlh.inference.worker.checkPrepare(currentSupply()?.manifestSha256.orEmpty() == expectedManifest,
-            "prepare_manifest_mismatch", "supply selection changed during verification")
+        val pendingSupply = ModelSupplyStorage.pending(suppliedSegmentsDir)
+        try {
+            val manifest = currentSupply()
+            val expectedManifest = identity.text("manifest_sha256")
+            if (expectedManifest.isNotEmpty()) {
+                com.qlh.inference.worker.checkPrepare(manifest != null, "prepare_manifest_missing", "no selected supply")
+                identity.verifyManifest(manifest!!)
+            } else {
+                com.qlh.inference.worker.checkPrepare(manifest == null, "prepare_manifest_mismatch", "supply cannot be treated as legacy SAF")
+            }
+            val artifacts = listLayerArtifacts(identity.text("source_model_sha256"), verifyArtifactDigest = true).getOrThrow()
+            val matching = artifacts.filter { artifact ->
+                identity.range == listOf(artifact.startLayer, artifact.endLayerExclusive) &&
+                    artifact.artifactSha256 == identity.text("artifact_sha256") &&
+                    artifact.sourceModelSha256 == identity.text("source_model_sha256") &&
+                    artifact.sourceModelId == identity.text("source_model_id") &&
+                    artifact.tokenizerSha256 == identity.text("tokenizer_sha256") &&
+                    artifact.hiddenSize == identity.hiddenSize && artifact.mode == identity.mode &&
+                    com.qlh.inference.worker.AndroidWorkerCapabilities.artifactModelId(artifact.document.name, artifact.artifactSha256) ==
+                        identity.stageIdentity["model_id"]
+            }
+            com.qlh.inference.worker.checkPrepare(matching.isNotEmpty(), "prepare_artifact_identity_mismatch", "no verified exact artifact")
+            val artifact = matching.first()
+            val native = com.google.gson.JsonParser.parseString(readDocument(artifact.manifest.uri)
+                ?: throw IOException("prepare native manifest missing")).asJsonObject
+            com.qlh.inference.worker.checkPrepare(native["n_layer"]?.asInt == identity.totalLayers,
+                "prepare_manifest_mismatch", "source total layers differ")
+            if (manifest != null) {
+                val expectedReference = Uri.fromFile(File(ModelSupplyCurrent(suppliedSegmentsDir).directory(manifest), manifest.weight.path)).toString()
+                com.qlh.inference.worker.checkPrepare(artifact.document.uri.toString() == expectedReference,
+                    "prepare_manifest_mismatch", "exact selected supply required")
+            }
+            val scan = context.contentResolver.openInputStream(artifact.document.uri)?.use {
+                com.qlh.inference.worker.GgufLayerWeightReader.scan(it, identity.range[1] - identity.range[0])
+            }
+            com.qlh.inference.worker.checkPrepare(scan != null &&
+                com.qlh.inference.worker.GgufLayerWeightReader.matchesTokenizerSha256(identity.text("tokenizer_sha256"), scan),
+                "prepare_gguf_shape_mismatch", "proper decoder segment and tokenizer required before native load")
+            com.qlh.inference.worker.checkPrepare(currentSupply()?.manifestSha256.orEmpty() == expectedManifest,
+                "prepare_manifest_mismatch", "supply selection changed during verification")
+        } finally { pendingSupply.close() }
     }
 
     /**
@@ -1626,14 +1633,17 @@ class ModelManager(private val context: Context) {
         val mode: String,
         val pfd: ParcelFileDescriptor?
     ) : AutoCloseable {
+        private val supplyReference = ModelSupplyStorage.artifact(File(loadPath))
         @Volatile
         private var closed = false
 
+        @Synchronized
         override fun close() {
             if (closed) return
-            closed = true
             try {
                 pfd?.close()
+                supplyReference?.close()
+                closed = true
             } catch (e: Exception) {
                 Log.w(TAG, "关闭模型文件句柄失败: ${e.message}")
             }

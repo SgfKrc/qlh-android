@@ -148,6 +148,54 @@ class TaskWorkerClientStateTest {
         assertEquals(15_000L, TaskWorkerClient.HEARTBEAT_INTERVAL_MS)
     }
 
+    @Test
+    fun `consecutive failures stop at a named limit and retain the root cause`() {
+        val machine = TaskWorkerStateMachine(baseBackoffMs = 1_000, maxBackoffMs = 2_000, maxConsecutiveFailures = 4)
+        machine.start()
+        val delays = mutableListOf<Long>()
+        var now = 0L
+        repeat(4) {
+            val failed = machine.onDisconnected(now, "transport_connect_failed", "refused")
+            if (it < 3) {
+                delays += failed.nextRetryAtMs - now
+                now = failed.nextRetryAtMs
+                machine.retryIfDue(now)
+            }
+        }
+        val failed = machine.snapshot()
+        assertEquals(listOf(1_000L, 2_000L, 2_000L), delays)
+        assertEquals(TaskWorkerConnectionState.RETRY_EXHAUSTED, failed.connection)
+        assertEquals(4, failed.reconnectAttempt)
+        assertEquals(0L, failed.nextRetryAtMs)
+        assertEquals("transport_connect_failed", failed.lastErrorCode)
+        assertEquals("network", failed.failureKind)
+        assertEquals(failed, machine.retryIfDue(Long.MAX_VALUE))
+        assertEquals(failed, machine.onDisconnected(now, "transport_loop_stopped", "finished"))
+    }
+
+    @Test
+    fun `accepted registration resets the consecutive failure budget`() {
+        val machine = TaskWorkerStateMachine(baseBackoffMs = 1, maxConsecutiveFailures = 2)
+        machine.start()
+        machine.onDisconnected(0, "transport_connect_failed", "refused")
+        machine.retryIfDue(1)
+        machine.onConnected()
+        machine.onHelloAck(true, "", "", 2)
+        val next = machine.onDisconnected(3, "heartbeat_timeout", "no ack")
+        assertEquals(TaskWorkerConnectionState.BACKING_OFF, next.connection)
+        assertEquals(1, next.reconnectAttempt)
+    }
+
+    @Test
+    fun `registration and identity failures stay distinct from network errors`() {
+        assertEquals("identity", TaskWorkerSnapshot(lastErrorCode = "registration_rejected").failureKind)
+        assertEquals("identity", TaskWorkerSnapshot(lastErrorCode = "master_identity_unconfirmed").failureKind)
+        assertEquals("identity", TaskWorkerSnapshot(lastErrorCode = "auth_failed").failureKind)
+        assertEquals("network", TaskWorkerSnapshot(lastErrorCode = "heartbeat_timeout").failureKind)
+        assertEquals("network", TaskWorkerSnapshot(lastErrorCode = "transport_timeout").failureKind)
+        assertEquals("protocol", TaskWorkerSnapshot(lastErrorCode = "invalid_frame").failureKind)
+    }
+
     private fun readyMachine(): TaskWorkerStateMachine = TaskWorkerStateMachine().also {
         it.start()
         it.onConnected()

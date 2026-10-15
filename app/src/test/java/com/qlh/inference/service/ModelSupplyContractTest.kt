@@ -41,15 +41,32 @@ class ModelSupplyContractTest {
     private val node = "android_12345678"
 
     private data class Fixture(val manifest: ModelSupplyManifest, val files: Map<String, ByteArray>)
-    private fun fixture(extraWeightBytes: Int = 0): Fixture {
+    private fun fixture(
+        extraWeightBytes: Int = 0,
+        headerMetadata: JsonObject = JsonParser.parseString("""{
+            "architecture":"test","block_count":2,"head_count_kv":null,
+            "key_length":null,"full_attention_interval":null
+        }""").asJsonObject,
+    ): Fixture {
         // A header-only GGUF fixture: reader consumes no tensor payload.
         val buffer = ByteArrayOutputStream()
         DataOutputStream(buffer).use { out ->
             fun int(value: Int) = out.writeInt(Integer.reverseBytes(value))
             fun long(value: Long) = out.writeLong(java.lang.Long.reverseBytes(value))
             fun string(value: String) { val b=value.toByteArray(); long(b.size.toLong()); out.write(b) }
-            out.write("GGUF".toByteArray()); int(3); long(2); long(1)
+            val fields = headerMetadata.entrySet().filter { it.key != "architecture" && !it.value.isJsonNull }
+            out.write("GGUF".toByteArray()); int(3); long(2); long(2L + fields.size)
             string("tokenizer.ggml.model"); int(8); string("test")
+            string("general.architecture"); int(8); string(headerMetadata["architecture"].asString)
+            val suffixes = mapOf("block_count" to "block_count", "head_count_kv" to "attention.head_count_kv",
+                "key_length" to "attention.key_length", "full_attention_interval" to "full_attention_interval")
+            for ((key, value) in fields) {
+                string("${headerMetadata["architecture"].asString}.${suffixes.getValue(key)}")
+                if (value.isJsonArray) {
+                    int(9); int(4); long(value.asJsonArray.size().toLong())
+                    value.asJsonArray.forEach { int(it.asInt) }
+                } else { int(4); int(value.asInt) }
+            }
             for (index in 0..1) { string("blk.$index.attn.weight"); int(1); long(1); int(0); long(index * 4L) }
         }
         val header = buffer.toByteArray()
@@ -61,8 +78,11 @@ class ModelSupplyContractTest {
             "source_model_id":"source","source_model_sha256":"$source",
             "tokenizer_sha256":"${scan.tokenizerSha256}","hidden_size":1,"mode":"tail",
             "source_layer_range":[2,4],"n_layer":4,"kept_block_count":2,
+            "gguf_metadata":{"architecture":"test","block_count":2,"head_count_kv":null,
+                "key_length":null,"full_attention_interval":null},
             "conversion_proof":null,"layer_weight_bytes":[0,0,4,4]
         }""").asJsonObject
+        native.add("gguf_metadata", headerMetadata.deepCopy())
         val nativeBytes = canonicalSupplyJson(native).toByteArray()
         val manifest = JsonParser.parseString("""{
             "manifest_kind":"qlh.segment_supply.v1","operation_id":"$operation","node_id":"$node",
@@ -424,6 +444,162 @@ class ModelSupplyContractTest {
         }
         resign(manifest)
         return Fixture(ModelSupplyManifest.parse(manifest), f.files + (f.manifest.native.path to nativeBytes))
+    }
+
+    @Test fun `receipt checks each actual header value for matching scalars and per layer arrays`() = runBlocking {
+        for (array in listOf(false, true)) {
+            val values = JsonParser.parseString(if (array) """{
+                "architecture":"test","block_count":2,"head_count_kv":[2,4],
+                "key_length":[128,256],"full_attention_interval":[4,8]
+            }""" else """{
+                "architecture":"test","block_count":2,"head_count_kv":2,
+                "key_length":128,"full_attention_interval":4
+            }""").asJsonObject
+            val good = revisedFixture(fixture(headerMetadata = values)) { _, native ->
+                native.addProperty("block_count", 4)
+                native.addProperty("nextn_predict_layers", 1)
+                native["gguf_metadata"].asJsonObject.addProperty("nextn_predict_layers", 0)
+            }
+            val root = temp.newFolder("metadata-matching-$array")
+            val final = ModelSupplyReceiver(root, "127.0.0.1", client = shortReadClient(good)).receive(
+                good.manifest, 1, "secret", { true }, {}, { it() })
+            ModelSupplyReceiver(root, "unused").validateFiles(final, good.manifest)
+            for (key in listOf("block_count", "head_count_kv", "key_length", "full_attention_interval")) {
+                val bad = revisedFixture(good) { _, native -> native["gguf_metadata"].asJsonObject.addProperty(key, 99) }
+                val badRoot = temp.newFolder("metadata-mismatch-$array-$key")
+                val failure = runCatching {
+                    ModelSupplyReceiver(badRoot, "127.0.0.1", client = shortReadClient(bad)).receive(
+                        bad.manifest, 1, "secret", { true }, {}, { fail("header mismatch published: $key") })
+                }.exceptionOrNull()
+                assertTrue(key, failure is ModelSupplyException)
+                assertEquals(key, "SUPPLY_GGUF_METADATA_MISMATCH", (failure as ModelSupplyException).reasonCode)
+                assertTrue("missing named mismatch for $key: ${failure.message}",
+                    failure.message.orEmpty().contains("$key: mismatch"))
+                assertTrue(scanSuppliedSegmentRoots(badRoot).isEmpty())
+            }
+            val absentDeclaration = revisedFixture(good) { _, native ->
+                native["gguf_metadata"].asJsonObject.add("head_count_kv", JsonParser.parseString("null"))
+            }
+            val failed = runCatching {
+                val absentRoot = temp.newFolder("metadata-false-absence-$array")
+                ModelSupplyReceiver(absentRoot, "127.0.0.1", client = shortReadClient(absentDeclaration)).receive(
+                    absentDeclaration.manifest, 1, "secret", { true }, {}, { fail("actual value treated as absent") })
+            }.exceptionOrNull()
+            assertTrue(failed is ModelSupplyException)
+            assertEquals("SUPPLY_GGUF_METADATA_MISMATCH", (failed as ModelSupplyException).reasonCode)
+        }
+    }
+
+    @Test fun `downloaded receipt rejects missing mismatched null and typed header declarations before publication`() = runBlocking {
+        val changes = linkedMapOf<String, (JsonObject) -> Unit>(
+            "legacy" to { it.remove("gguf_metadata") },
+            "null-contract" to { it.add("gguf_metadata", JsonParser.parseString("null")) },
+            "array-contract" to { it.add("gguf_metadata", JsonParser.parseString("[]")) },
+            "source-block-count" to { it["gguf_metadata"].asJsonObject.addProperty("block_count", 4) },
+            "null-block-count" to { it["gguf_metadata"].asJsonObject.add("block_count", JsonParser.parseString("null")) },
+            "float-block-count" to { it["gguf_metadata"].asJsonObject.addProperty("block_count", 2.0) },
+            "bool-block-count" to { it["gguf_metadata"].asJsonObject.addProperty("block_count", true) },
+            "architecture" to { it["gguf_metadata"].asJsonObject.addProperty("architecture", "other") },
+        )
+        for (key in listOf("block_count", "head_count_kv", "key_length", "full_attention_interval")) {
+            changes["missing-$key"] = { it["gguf_metadata"].asJsonObject.remove(key) }
+            if (key != "block_count") changes["actual-absent-$key"] = { it["gguf_metadata"].asJsonObject.addProperty(key, 1) }
+        }
+        for ((name, change) in changes) {
+            val f = revisedFixture(fixture()) { _, native -> change(native) }
+            val root = temp.newFolder("metadata-$name")
+            val failure = runCatching {
+                ModelSupplyReceiver(root, "127.0.0.1", client = shortReadClient(f)).receive(
+                    f.manifest, 1, "secret", { true }, {}, { fail("invalid metadata published: $name") })
+            }.exceptionOrNull()
+            assertTrue(name, failure is ModelSupplyException)
+            assertEquals(name, "SUPPLY_GGUF_METADATA_MISMATCH", (failure as ModelSupplyException).reasonCode)
+            val stage = root.resolve(".receive-${f.manifest.manifestSha256}")
+            assertTrue(stage.resolve(f.manifest.weight.path).isFile)
+            assertFalse(stage.resolve(ModelSupplyManifest.MARKER).exists())
+            assertFalse(root.resolve("segment-${f.manifest.manifestSha256}").exists())
+            assertFalse(root.resolve(ModelSupplyCurrent.POINTER).exists())
+        }
+    }
+
+    @Test fun `receiver error joins every named missing typedvalue and mismatch detail`() = runBlocking {
+        val f = revisedFixture(fixture()) { _, native ->
+            native["gguf_metadata"].asJsonObject.apply {
+                remove("head_count_kv")
+                addProperty("key_length", true)
+                addProperty("full_attention_interval", 4)
+            }
+        }
+        val root = temp.newFolder("metadata-named-differences")
+        val failure = runCatching {
+            ModelSupplyReceiver(root, "127.0.0.1", client = shortReadClient(f)).receive(
+                f.manifest, 1, "secret", { true }, {}, { fail("metadata differences published") })
+        }.exceptionOrNull()
+        assertTrue(failure is ModelSupplyException)
+        val error = failure as ModelSupplyException
+        assertEquals("SUPPLY_GGUF_METADATA_MISMATCH", error.reasonCode)
+        assertEquals(listOf(
+            "head_count_kv: missing from declared metadata",
+            "key_length: typedvalue in declared metadata",
+            "full_attention_interval: mismatch between actual and declared values",
+        ), error.message.orEmpty().split("; "))
+        assertFalse(root.resolve("segment-${f.manifest.manifestSha256}").exists())
+        assertFalse(root.resolve(ModelSupplyCurrent.POINTER).exists())
+    }
+
+    @Test fun `published legacy receipt is revalidated and remains unchanged on refusal`() = runBlocking {
+        val legacy = revisedFixture(fixture()) { _, native -> native.remove("gguf_metadata") }
+        val root = temp.newFolder("metadata-published-legacy")
+        val old = publishFixture(root, legacy)
+        val marker = old.resolve(ModelSupplyManifest.MARKER).readBytes()
+        val failure = runCatching {
+            ModelSupplyReceiver(root, "127.0.0.1").receive(legacy.manifest, 1, "secret", { true }, {},
+                { fail("legacy receipt republished") })
+        }.exceptionOrNull()
+        assertTrue(failure is ModelSupplyException)
+        assertEquals("SUPPLY_GGUF_METADATA_MISMATCH", (failure as ModelSupplyException).reasonCode)
+        assertArrayEquals(marker, old.resolve(ModelSupplyManifest.MARKER).readBytes())
+        legacy.files.forEach { (path, bytes) -> assertArrayEquals(bytes, old.resolve(path).readBytes()) }
+        assertFalse(root.resolve(ModelSupplyCurrent.POINTER).exists())
+    }
+
+    @Test fun `failed legacy stage cannot bypass metadata validation by reusing every file`() = runBlocking {
+        val legacy = revisedFixture(fixture()) { _, native -> native.remove("gguf_metadata") }
+        val root = temp.newFolder("metadata-stage-legacy")
+        val first = runCatching {
+            ModelSupplyReceiver(root, "127.0.0.1", client = shortReadClient(legacy)).receive(
+                legacy.manifest, 1, "secret", { true }, {}, { fail("legacy download published") })
+        }.exceptionOrNull()
+        assertTrue(first is ModelSupplyException)
+        assertEquals("SUPPLY_GGUF_METADATA_MISMATCH", (first as ModelSupplyException).reasonCode)
+        val next = nextOperation(legacy)
+        val progress = mutableListOf<ModelSupplyProgress>()
+        val second = runCatching {
+            ModelSupplyReceiver(root, "127.0.0.1").receive(next, 1, "secret", { true }, { progress += it },
+                { fail("legacy reused stage published") })
+        }.exceptionOrNull()
+        assertTrue(second is ModelSupplyException)
+        assertEquals("SUPPLY_GGUF_METADATA_MISMATCH", (second as ModelSupplyException).reasonCode)
+        assertEquals(next.files.sumOf { it.size }, progress.last().reusedBytes)
+        assertEquals(0L, progress.last().actualDownloadedBytes)
+        assertTrue(scanSuppliedSegmentRoots(root).isEmpty())
+        assertFalse(root.resolve(ModelSupplyCurrent.POINTER).exists())
+    }
+
+    @Test fun `new authoritative receipt can reuse legacy weights while old ready cache stays unchanged`() = runBlocking {
+        val good = fixture()
+        val legacy = revisedFixture(good) { _, native -> native.remove("gguf_metadata") }
+        val root = temp.newFolder("metadata-upgrade-receipt")
+        val old = publishFixture(root, legacy)
+        val marker = old.resolve(ModelSupplyManifest.MARKER).readBytes()
+        val next = Fixture(nextOperation(good), good.files)
+        val (final, progress) = downloaded(root, next, expectedFiles = setOf(next.manifest.native.path))
+        assertEquals(next.manifest.weight.size, progress.reusedBytes)
+        assertEquals(next.manifest.native.size, progress.actualDownloadedBytes)
+        assertArrayEquals(marker, old.resolve(ModelSupplyManifest.MARKER).readBytes())
+        legacy.files.forEach { (path, bytes) -> assertArrayEquals(bytes, old.resolve(path).readBytes()) }
+        assertArrayEquals(good.files.getValue(good.manifest.native.path), final.resolve(next.manifest.native.path).readBytes())
+        ModelSupplyReceiver(root, "unused").validateFiles(final, next.manifest)
     }
 
     /** A complete failed stage must come from the real receiver, never a fabricated positive journal. */

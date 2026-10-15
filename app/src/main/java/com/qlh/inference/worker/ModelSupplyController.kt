@@ -6,6 +6,7 @@ import com.qlh.inference.service.ModelSupplyException
 import com.qlh.inference.service.ModelSupplyManifest
 import com.qlh.inference.service.ModelSupplyReceiver
 import com.qlh.inference.service.ModelSupplyCurrent
+import com.qlh.inference.service.ModelSupplyGc
 import com.qlh.inference.service.ModelSupplyProgress
 import com.qlh.inference.service.supplyBindingSha256
 import com.qlh.inference.service.checkSupply
@@ -145,6 +146,8 @@ internal class ModelSupplyController(
                         var lastPhase = ""
                         val owner = synchronized(lock) { active?.takeIf { generation == epoch && it.operation == operation } }
                             ?: return@launch
+                        // Keep donors and the newly published directory until registration/terminal ACK.
+                        val pendingReceive = com.qlh.inference.service.ModelSupplyStorage.pending(root)
                         try {
                             synchronized(lock) { retiring.toList() }.forEach { it.join() }
                             checkSupply(current(), "SUPPLY_CANCELLED", "supply retired")
@@ -192,12 +195,30 @@ internal class ModelSupplyController(
                             currentCoroutineContext().ensureActive()
                             checkSupply(current(), "SUPPLY_CANCELLED", "supply retired")
                             reply(result(owner, "available"))
-                            synchronized(lock) { owner.completed = true }
+                            synchronized(lock) {
+                                owner.completed = true
+                                owner.registration?.let { currentSupply.complete(it) }
+                                owner.registration = null
+                            }
+                            pendingReceive.close()
+                            // Only a completed current operation can authorize covered partial cleanup.
+                            val gc = ModelSupplyGc(root).collect(nodeId, ::current, commit = { cleanup ->
+                                publicationGate {
+                                    synchronized(lock) {
+                                        checkSupply(generation == epoch && active?.job?.isActive == true,
+                                            "SUPPLY_CANCELLED", "supply retired during cleanup")
+                                        authorize()
+                                        cleanup()
+                                    }
+                                }
+                            }, completedManifest = parsed)
+                            QlhLogger.i("ModelSupply", gc.logMessage())
                         } catch (cancelled: CancellationException) { throw cancelled }
                         catch (error: Exception) {
                             synchronized(lock) { owner.registration?.let { currentSupply.rollback(it, bindingSha256) }; owner.registration = null }
                             if (current()) reply(result(owner, "failed", (error as? ModelSupplyException)?.reasonCode ?: "SUPPLY_RECEIVE_FAILED"))
                         } finally {
+                            pendingReceive.close()
                             receiver.cancel()
                             synchronized(lock) {
                                 if (!owner.completed) owner.registration?.let { currentSupply.rollback(it, bindingSha256) }

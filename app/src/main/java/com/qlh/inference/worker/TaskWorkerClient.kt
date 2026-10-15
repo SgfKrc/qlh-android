@@ -2,6 +2,7 @@ package com.qlh.inference.worker
 
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
@@ -14,6 +15,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlin.coroutines.resumeWithException
 import kotlinx.coroutines.withContext
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
@@ -39,6 +42,7 @@ enum class TaskWorkerConnectionState {
     HELLO_SENT,
     READY,
     BACKING_OFF,
+    RETRY_EXHAUSTED,
 }
 
 enum class TaskWorkerAttemptState {
@@ -68,7 +72,20 @@ data class TaskWorkerSnapshot(
     val lastErrorCode: String? = null,
     val lastErrorMessage: String? = null,
     val activeAttempt: TaskWorkerAttemptSnapshot = TaskWorkerAttemptSnapshot(),
-)
+    val processRunning: Boolean = false,
+    val connectionAlive: Boolean = false,
+) {
+    val failureKind: String? get() = lastErrorCode?.let { code ->
+        when {
+            code == "registration_rejected" || code == "hello_rejected" ||
+                code == "node_not_admitted" || code == "not_master" ||
+                code.contains("identity") || code.contains("auth") ||
+                code.contains("credential") || code.contains("secret_epoch") -> "identity"
+            code.startsWith("transport_") || code.startsWith("heartbeat_") -> "network"
+            else -> "protocol"
+        }
+    }
+}
 
 /**
  * Transport-independent lifecycle fencing for an Android Full Worker.
@@ -80,7 +97,10 @@ data class TaskWorkerSnapshot(
 class TaskWorkerStateMachine(
     private val baseBackoffMs: Long = 1_000L,
     private val maxBackoffMs: Long = 30_000L,
+    private val maxConsecutiveFailures: Int = 8,
 ) {
+    init { require(maxConsecutiveFailures > 0) }
+
     private var snapshot = TaskWorkerSnapshot()
 
     @Synchronized
@@ -126,7 +146,7 @@ class TaskWorkerStateMachine(
     @Synchronized
     fun onDisconnected(nowMs: Long, code: String, message: String): TaskWorkerSnapshot {
         if (snapshot.connection == TaskWorkerConnectionState.STOPPED) return snapshot
-        if (snapshot.connection == TaskWorkerConnectionState.BACKING_OFF) return snapshot
+        if (snapshot.connection in setOf(TaskWorkerConnectionState.BACKING_OFF, TaskWorkerConnectionState.RETRY_EXHAUSTED)) return snapshot
         val attempt = snapshot.activeAttempt
         snapshot = backoff(nowMs, code.ifEmpty { "transport_disconnected" }, message).copy(
             activeAttempt = if (attempt.state in ACTIVE_ATTEMPT_STATES) {
@@ -270,13 +290,15 @@ class TaskWorkerStateMachine(
     }
 
     private fun backoff(nowMs: Long, code: String, message: String): TaskWorkerSnapshot {
-        val attempt = (snapshot.reconnectAttempt + 1).coerceAtMost(30)
+        val attempt = (snapshot.reconnectAttempt + 1).coerceAtMost(maxConsecutiveFailures)
         val delay = (baseBackoffMs.coerceAtLeast(1L) * (1L shl (attempt - 1).coerceAtMost(5)))
             .coerceAtMost(maxBackoffMs.coerceAtLeast(baseBackoffMs))
         return snapshot.copy(
-            connection = TaskWorkerConnectionState.BACKING_OFF,
+            connection = if (attempt >= maxConsecutiveFailures) {
+                TaskWorkerConnectionState.RETRY_EXHAUSTED
+            } else TaskWorkerConnectionState.BACKING_OFF,
             reconnectAttempt = attempt,
-            nextRetryAtMs = nowMs + delay,
+            nextRetryAtMs = if (attempt >= maxConsecutiveFailures) 0L else nowMs + delay,
             lastErrorCode = code,
             lastErrorMessage = message,
         )
@@ -461,7 +483,9 @@ internal class SocketTaskWorkerTransport(
         if (data?.get("status")?.asString != "registered") {
             throw TaskWorkerProtocolException(
                 data?.get("reason")?.asString ?: "coordinator rejected registration",
-                "registration_rejected", "data.status",
+                data?.get("error_code")?.asString?.takeIf {
+                    it.matches(Regex("[a-z][a-z0-9_]{0,63}"))
+                } ?: "registration_rejected", "data.status",
             )
         }
     }
@@ -613,19 +637,28 @@ class SocketTaskWorkerTransportFactory(
     private val controlFenceRequired: Boolean = false,
     private val controlCertificateValidator: ((com.google.gson.JsonObject) -> Unit)? = null,
 ) : TaskWorkerTransportFactory {
-    override suspend fun connect(host: String, port: Int): TaskWorkerTransport = withContext(Dispatchers.IO) {
+    override suspend fun connect(host: String, port: Int): TaskWorkerTransport {
         require(port in 1..65535) { "port must be between 1 and 65535" }
         val normalizedHost = host.trim().removePrefix("[").removeSuffix("]")
         val socket = Socket()
-        socket.connect(InetSocketAddress(normalizedHost, port), connectTimeoutMs)
-        socket.soTimeout = readTimeoutMs
-        val transport = SocketTaskWorkerTransport(socket, controlFence = TcpControlFence(controlFenceRequired, controlCertificateValidator))
-        try {
-            registration?.let { transport.register(it) }
-            transport
-        } catch (error: Exception) {
-            transport.close()
-            throw error
+        return suspendCancellableCoroutine { continuation ->
+            val opening = CoroutineScope(continuation.context).launch(Dispatchers.IO) {
+                try {
+                    socket.connect(InetSocketAddress(normalizedHost, port), connectTimeoutMs)
+                    socket.soTimeout = readTimeoutMs
+                    val transport = SocketTaskWorkerTransport(socket, controlFence = TcpControlFence(controlFenceRequired, controlCertificateValidator))
+                    registration?.let { transport.register(it) }
+                    continuation.resume(transport) { _, _, _ -> runCatching { socket.close() } }
+                } catch (error: Exception) {
+                    runCatching { socket.close() }
+                    if (continuation.isActive) continuation.resumeWithException(error)
+                }
+            }
+            // Cancellation must unblock connect/REGISTER reads before service retirement joins the owner.
+            continuation.invokeOnCancellation {
+                runCatching { socket.close() }
+                opening.cancel()
+            }
         }
     }
 }
@@ -671,11 +704,18 @@ class TaskWorkerClient(
     private val modelPrepareHandler: TaskWorkerModelPrepareHandler? = null,
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
     private val clockMs: () -> Long = { System.currentTimeMillis() },
+    private val machine: TaskWorkerStateMachine = TaskWorkerStateMachine(),
+    private val heartbeatIntervalMs: Long = HEARTBEAT_INTERVAL_MS,
+    private val heartbeatTimeoutMs: Long = HEARTBEAT_TIMEOUT_MS,
+    private val monotonicMs: () -> Long = { System.nanoTime() / 1_000_000L },
 ) {
-    private val machine = TaskWorkerStateMachine()
+    init {
+        require(heartbeatIntervalMs > 0 && heartbeatTimeoutMs > heartbeatIntervalMs)
+    }
     private val mutableSnapshot = MutableStateFlow(machine.snapshot())
-    private var loopJob: Job? = null
-    private var transport: TaskWorkerTransport? = null
+    @Volatile private var loopJob: Job? = null
+    @Volatile private var transport: TaskWorkerTransport? = null
+    @Volatile private var lastHeartbeatAckMs: Long = 0L
     private var executionJob: Job? = null
     private var heartbeatJob: Job? = null
 
@@ -697,12 +737,25 @@ class TaskWorkerClient(
 
     val snapshot: StateFlow<TaskWorkerSnapshot> = mutableSnapshot.asStateFlow()
 
+    val isRunning: Boolean get() = loopJob?.isActive == true && scope.isActive &&
+        machine.snapshot().connection != TaskWorkerConnectionState.STOPPED
+
+    val isConnectionLive: Boolean get() = isRunning && transport != null &&
+        machine.snapshot().connection == TaskWorkerConnectionState.READY &&
+        monotonicMs() - lastHeartbeatAckMs < heartbeatTimeoutMs
+
     @Synchronized
     fun start() {
-        if (loopJob?.isActive == true) return
+        if (isRunning) return
         machine.start()
+        val job = scope.launch(start = CoroutineStart.LAZY) { runLoop() }
+        loopJob = job
+        job.invokeOnCompletion {
+            machine.onDisconnected(clockMs(), "transport_loop_stopped", "worker connection loop stopped")
+            publish()
+        }
+        job.start()
         publish()
-        loopJob = scope.launch { runLoop() }
     }
 
     fun cancelActive(reasonCode: String = "user_cancelled"): Boolean {
@@ -796,7 +849,9 @@ class TaskWorkerClient(
     }
 
     private suspend fun runLoop() {
-        while (scope.isActive && machine.snapshot().connection != TaskWorkerConnectionState.STOPPED) {
+        while (scope.isActive && machine.snapshot().connection !in setOf(
+                TaskWorkerConnectionState.STOPPED, TaskWorkerConnectionState.RETRY_EXHAUSTED,
+        )) {
             val current = machine.snapshot()
             if (current.connection == TaskWorkerConnectionState.BACKING_OFF) {
                 val waitMs = (current.nextRetryAtMs - clockMs()).coerceAtLeast(0L)
@@ -823,6 +878,7 @@ class TaskWorkerClient(
                     throw TaskWorkerProtocolException("expected hello_ack", "unexpected_message_type", "message_type")
                 }
                 val accepted = ack.payload["accepted"] == true
+                lastHeartbeatAckMs = monotonicMs()
                 machine.onHelloAck(
                     accepted = accepted,
                     reasonCode = ack.payload["reason_code"] as? String ?: "hello_rejected",
@@ -833,26 +889,24 @@ class TaskWorkerClient(
                 if (!accepted) throw TaskWorkerProtocolException("coordinator rejected hello", "hello_rejected", "payload.accepted")
                 heartbeatJob?.cancel()
                 heartbeatJob = scope.launch {
-                    while (isActive && machine.snapshot().connection == TaskWorkerConnectionState.READY) {
-                        delay(HEARTBEAT_INTERVAL_MS)
-                        // ★ 2026-10-08（真机根因）：单次发送失败**不得**让心跳循环静默退出。
-                        //   此前 `sendHeartbeat` 抛异常会直接结束这个 coroutine（`while` 之外没有
-                        //   catch）⇒ 该连接此后**一次心跳都不再发**；master 侧实测
-                        //   `event=tcp_heartbeat_received` 收到 0 条，而 worker 的
-                        //   `soTimeout = 45_000` 又要求 45 秒内必须有入站消息 ⇒ 连接只能被
-                        //   断开重连（真机表现：Y700 每 ~37 秒断开一次）。这里改为：失败记日志并
-                        //   继续下一轮；真需要重连时由 `receiveLoop` 的读失败驱动。
+                    while (isActive && transport === opened &&
+                        machine.snapshot().connection == TaskWorkerConnectionState.READY
+                    ) {
+                        val untilAckTimeout = (heartbeatTimeoutMs - (monotonicMs() - lastHeartbeatAckMs)).coerceAtLeast(1L)
+                        delay(minOf(heartbeatIntervalMs, untilAckTimeout))
+                        if (transport !== opened || machine.snapshot().connection != TaskWorkerConnectionState.READY) break
+                        if (monotonicMs() - lastHeartbeatAckMs >= heartbeatTimeoutMs) {
+                            disconnect(opened, "heartbeat_timeout", "coordinator heartbeat acknowledgement timed out")
+                            break
+                        }
                         try {
                             opened.sendHeartbeat(nodeId, clockMs())
                             QlhLogger.d("TaskWorkerClient", "heartbeat sent")
                         } catch (error: CancellationException) {
                             throw error
                         } catch (error: Exception) {
-                            QlhLogger.w(
-                                "TaskWorkerClient",
-                                "heartbeat send failed: " +
-                                    (error.message ?: error.javaClass.simpleName),
-                            )
+                            disconnect(opened, "heartbeat_send_failed", error.message ?: "heartbeat send failed")
+                            break
                         }
                     }
                 }
@@ -866,22 +920,31 @@ class TaskWorkerClient(
                 modelPrepareHandler?.cancelAll()
                 modelSupplyHandler?.cancelAll()
                 withContext(NonCancellable) {
+                    heartbeatJob?.cancelAndJoin()
+                    heartbeatJob = null
+                    // Close before joining non-cancellable execution so the master observes offline immediately.
+                    runCatching { transport?.close() }
+                    transport = null
                     machine.snapshot().activeAttempt.identity?.let { stageHandler?.requestCancel(it) }
                     executionJob?.cancelAndJoin()
                     executionJob = null
                     modelPrepareHandler?.retireAndJoin()
                 }
-                runCatching { transport?.close() }
-                heartbeatJob?.cancel()
-                heartbeatJob = null
-                transport = null
             }
         }
+    }
+
+    private suspend fun disconnect(connection: TaskWorkerTransport, code: String, message: String) {
+        if (transport !== connection) return
+        machine.onDisconnected(clockMs(), code, message)
+        publish()
+        runCatching { connection.close() }
     }
 
     private suspend fun receiveLoop(connection: TaskWorkerTransport) {
         while (scope.isActive && machine.snapshot().connection == TaskWorkerConnectionState.READY) {
             val event = connection.receiveEvent()
+            if (transport !== connection || machine.snapshot().connection != TaskWorkerConnectionState.READY) return
             // ★ 2026-10-08（真机 P0 候选）：**分发层必须容错**。此前 `handleOffer` 里任何
             //   未预期的异常（例如分片装配抛出的类型不在那一个 `catch` 里）都会直接逃出本
             //   循环 ⇒ 读循环**静默死亡** ⇒ 之后 offer/分片全部无人处理，而心跳是另一个协程、
@@ -890,7 +953,7 @@ class TaskWorkerClient(
             try {
                 when (event) {
                     TaskWorkerInboundEvent.Closed -> throw EOFException("coordinator closed worker connection")
-                    TaskWorkerInboundEvent.HeartbeatAck -> Unit
+                    TaskWorkerInboundEvent.HeartbeatAck -> { lastHeartbeatAckMs = monotonicMs() }
                     is TaskWorkerInboundEvent.ModelPrepare -> {
                         val handler = modelPrepareHandler ?: throw TaskWorkerProtocolException("prepare handler unavailable", "prepare_unavailable")
                         handler.command(event.data, scope,
@@ -1367,7 +1430,15 @@ class TaskWorkerClient(
     )
 
     private fun publish() {
-        mutableSnapshot.value = machine.snapshot()
+        val next = machine.snapshot().copy(processRunning = isRunning, connectionAlive = isConnectionLive)
+        val previous = mutableSnapshot.value
+        mutableSnapshot.value = next
+        if (previous.connection != next.connection || previous.reconnectAttempt != next.reconnectAttempt) {
+            QlhLogger.i("TaskWorkerClient", "worker_connection=${next.connection} " +
+                "process_running=${next.processRunning} connection_alive=${next.connectionAlive} " +
+                "retry=${next.reconnectAttempt} next_retry_at_ms=${next.nextRetryAtMs} " +
+                "error_kind=${next.failureKind} error_code=${next.lastErrorCode}")
+        }
     }
 
     private fun errorCode(error: Throwable): String = when (error) {
@@ -1388,6 +1459,7 @@ class TaskWorkerClient(
          * health 超时。此前这个数字只在这里硬编码，主仓侧没有任何记录。
          */
         const val HEARTBEAT_INTERVAL_MS: Long = 15_000L
+        const val HEARTBEAT_TIMEOUT_MS: Long = 45_000L
 
         /**
          * ★ 2026-10-07（真机 P0）：取消收敛的等待上限。

@@ -334,6 +334,16 @@ data class GgufModelsResponse(
     val count: Int = 0,
 )
 
+/** Per-engine distributed preflight metadata; content proof remains with supply. */
+data class PipelineEngineAvailability(
+    val status: String? = null,
+    @SerializedName("runtime_model_type") val runtimeModelType: String? = null,
+    @SerializedName("reason_code") val reasonCode: String? = null,
+    val reason: String? = null,
+    val source: String? = null,
+    @SerializedName("content_verification") val contentVerification: String? = null,
+)
+
 /** Path-free model configuration returned by the main-node registry. */
 data class ServerModelSummary(
     @SerializedName("model_id") val modelId: String = "",
@@ -348,6 +358,11 @@ data class ServerModelSummary(
     @SerializedName("has_gguf") val hasGguf: Boolean = false,
     @SerializedName("preferred_engine") val preferredEngine: String = "",
     @SerializedName("recommended_vram_gb") val recommendedVramGb: Double? = null,
+    @SerializedName("supported_engines") val supportedEngines: List<String>? = null,
+    @SerializedName("pipeline_engine_availability")
+    val pipelineEngineAvailability: Map<String, PipelineEngineAvailability?>? = null,
+    @SerializedName("pipeline_auto_engine") val pipelineAutoEngine: String? = null,
+    @SerializedName("pipeline_auto_unavailable_reason") val pipelineAutoUnavailableReason: String? = null,
 )
 
 data class ServerModelsResponse(

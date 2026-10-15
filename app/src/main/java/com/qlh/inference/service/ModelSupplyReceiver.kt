@@ -120,6 +120,8 @@ internal class ModelSupplyReceiver(
             manifest.files.fold(0L) { n, file -> Math.addExact(n, file.size) },
             progress, TransferDiagnostics(nanoTime, diagnostics),
         )
+        val receiving = ModelSupplyStorage.pending(root)
+        var stageLease: ModelSupplyStorage.Lease? = null
         try {
             val final = confined("segment-${manifest.manifestSha256}")
             if (final.exists()) {
@@ -135,11 +137,16 @@ internal class ModelSupplyReceiver(
                 return final
             }
             val stage = confined(".receive-${manifest.manifestSha256}")
-            ensureDirectory(stage)
+            synchronized(ModelSupplyStorage.lock) {
+                ensureDirectory(stage)
+                stageLease = ModelSupplyStorage.transfer(root, stage)
+            }
             val journal = ResumeJournal(stage, manifest)
             val inventory = receiveInventory(manifest)
             // Staged targets are byte donors only; their validated source marker never publishes them.
-            val candidates = (scanSuppliedSegmentRoots(root).flatMap { (directory, existing) ->
+            val candidates = (scanSuppliedSegmentRoots(root).filter { (_, existing) ->
+                manifest.sameContentIdentity(existing)
+            }.flatMap { (directory, existing) ->
                 existing.files.map { ReuseCandidate(directory, it) }
             } + inventory.complete).groupBy { fileKey(it.file) }
             for (file in manifest.files) {
@@ -158,39 +165,42 @@ internal class ModelSupplyReceiver(
                 }
                 var reusedFile = false
                 for ((directory, entry) in candidates[fileKey(file)].orEmpty()) {
-                    val candidate = runCatching { safeFile(directory, entry.path) }.getOrNull() ?: continue
-                    transfer.report("verifying_reuse")
-                    if (!matches(candidate, file)) continue
-                    currentCoroutineContext().ensureActive()
-                    checkSupply(stillCurrent(), "SUPPLY_CANCELLED", "binding changed")
-                    // Never truncate a target that may already be a link to a published file.
-                    Files.deleteIfExists(target.toPath())
+                    val donor = runCatching { ModelSupplyStorage.transfer(root, directory) }.getOrNull() ?: continue
                     try {
-                        Files.createLink(target.toPath(), candidate.toPath())
-                    } catch (_: IOException) {
-                        copyReusable(candidate, partial, file.size, stillCurrent)
+                        val candidate = runCatching { safeFile(directory, entry.path) }.getOrNull() ?: continue
+                        transfer.report("verifying_reuse")
+                        if (!matches(candidate, file)) continue
                         currentCoroutineContext().ensureActive()
                         checkSupply(stillCurrent(), "SUPPLY_CANCELLED", "binding changed")
-                        Files.move(partial.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
-                    } catch (_: UnsupportedOperationException) {
-                        copyReusable(candidate, partial, file.size, stillCurrent)
-                        currentCoroutineContext().ensureActive()
-                        checkSupply(stillCurrent(), "SUPPLY_CANCELLED", "binding changed")
-                        Files.move(partial.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
-                    }
-                    // Recheck live bytes after link/copy, including changes during verification.
-                    if (!matches(target, file)) {
+                        // Never truncate a target that may already be a link to a published file.
                         Files.deleteIfExists(target.toPath())
-                        continue
-                    }
-                    currentCoroutineContext().ensureActive()
-                    checkSupply(stillCurrent(), "SUPPLY_CANCELLED", "binding changed")
-                    journal.recordSource()
-                    Files.deleteIfExists(partial.toPath())
-                    transfer.completed += file.size; transfer.reused += file.size
-                    transfer.report("reusing")
-                    reusedFile = true
-                    break
+                        try {
+                            Files.createLink(target.toPath(), candidate.toPath())
+                        } catch (_: IOException) {
+                            copyReusable(candidate, partial, file.size, stillCurrent)
+                            currentCoroutineContext().ensureActive()
+                            checkSupply(stillCurrent(), "SUPPLY_CANCELLED", "binding changed")
+                            Files.move(partial.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
+                        } catch (_: UnsupportedOperationException) {
+                            copyReusable(candidate, partial, file.size, stillCurrent)
+                            currentCoroutineContext().ensureActive()
+                            checkSupply(stillCurrent(), "SUPPLY_CANCELLED", "binding changed")
+                            Files.move(partial.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
+                        }
+                        // Recheck live bytes after link/copy, including changes during verification.
+                        if (!matches(target, file)) {
+                            Files.deleteIfExists(target.toPath())
+                            continue
+                        }
+                        currentCoroutineContext().ensureActive()
+                        checkSupply(stillCurrent(), "SUPPLY_CANCELLED", "binding changed")
+                        journal.recordSource()
+                        Files.deleteIfExists(partial.toPath())
+                        transfer.completed += file.size; transfer.reused += file.size
+                        transfer.report("reusing")
+                        reusedFile = true
+                        break
+                    } finally { donor.close() }
                 }
                 if (reusedFile) continue
                 transfer.report("verifying_resume")
@@ -214,6 +224,7 @@ internal class ModelSupplyReceiver(
                 if (file.size == 0L) {
                     FileOutputStream(partial).use { it.fd.sync() }
                 } else {
+                    transfer.report("transfer_fallback_local_cut_unavailable", transfer.completed + offset)
                     downloadFile(manifest, file, partial, prefix, journal, apiPort, token, stillCurrent, transfer)
                 }
                 transfer.report("verifying", transfer.completed + file.size)
@@ -239,7 +250,11 @@ internal class ModelSupplyReceiver(
                 Files.move(stage.toPath(), final.toPath(), StandardCopyOption.ATOMIC_MOVE)
             }
             return final
-        } finally { transfer.diagnostics.emit(transfer.actualDownloaded, terminal = true) }
+        } finally {
+            stageLease?.close()
+            receiving.close()
+            transfer.diagnostics.emit(transfer.actualDownloaded, terminal = true)
+        }
     }
 
 
@@ -420,8 +435,8 @@ internal class ModelSupplyReceiver(
     }
 
     private data class Prefix(val length: Long, val digest: MessageDigest)
-    private data class Checkpoint(val path: String, val length: Long, val sha256: String)
-    private data class ResumeData(val manifest: ModelSupplyManifest, val records: Map<String, Checkpoint>)
+    internal data class Checkpoint(val path: String, val length: Long, val sha256: String)
+    internal data class ResumeData(val manifest: ModelSupplyManifest, val records: Map<String, Checkpoint>)
     private data class PartialCandidate(val stage: File, val file: ModelSupplyManifest.SupplyFile, val record: Checkpoint)
     private data class ReuseCandidate(val directory: File, val file: ModelSupplyManifest.SupplyFile)
     private data class ReceiveInventory(
@@ -433,40 +448,6 @@ internal class ModelSupplyReceiver(
     private fun digestHex(digest: MessageDigest) = digest.digest().joinToString("") { "%02x".format(it.toInt() and 255) }
     private fun digestSnapshot(digest: MessageDigest) = digestHex(digest.clone() as MessageDigest)
 
-    private fun readResume(stage: File): ResumeData? = try {
-        val marker = safeFile(stage, RESUME_MARKER)
-        if (!marker.isFile || marker.length() > MAX_JOURNAL_BYTES) null else {
-            val json = JsonParser.parseString(marker.readText(Charsets.UTF_8)).asJsonObject
-            checkSupply(json.keySet() == setOf("schema_version", "manifest", "prefixes", "journal_sha256"),
-                "SUPPLY_RESUME_INVALID", "resume fields")
-            val unsigned = json.deepCopy().apply { remove("journal_sha256") }
-            checkSupply(ModelSupplyManifest.integer(json["schema_version"]) == 1L &&
-                supplySha256(canonicalSupplyJson(unsigned).toByteArray(Charsets.UTF_8)) == ModelSupplyManifest.text(json, "journal_sha256"),
-                "SUPPLY_RESUME_INVALID", "resume digest")
-            val manifest = ModelSupplyManifest.parse(json.getAsJsonObject("manifest"))
-            checkSupply(stage.name == ".receive-${manifest.manifestSha256}", "SUPPLY_RESUME_INVALID", "resume stage identity")
-            val records = linkedMapOf<String, Checkpoint>()
-            val entries = manifest.files.associateBy { it.path }
-            val prefixes = json.getAsJsonArray("prefixes")
-            checkSupply(prefixes.size() <= entries.size, "SUPPLY_RESUME_INVALID", "resume inventory")
-            for (element in prefixes) {
-                val record = element.asJsonObject
-                checkSupply(record.keySet() == setOf("path", "file_sha256", "size_bytes", "prefix_bytes", "prefix_sha256"),
-                    "SUPPLY_RESUME_INVALID", "resume file fields")
-                val path = ModelSupplyManifest.text(record, "path")
-                val file = entries[path] ?: throw ModelSupplyException("SUPPLY_RESUME_INVALID", "resume file identity")
-                val length = ModelSupplyManifest.integer(record["prefix_bytes"], 1, file.size)
-                val sha = ModelSupplyManifest.text(record, "prefix_sha256")
-                checkSupply(path !in records && Regex("[0-9a-f]{64}").matches(sha) &&
-                    ModelSupplyManifest.text(record, "file_sha256") == file.sha256 &&
-                    ModelSupplyManifest.integer(record["size_bytes"]) == file.size,
-                    "SUPPLY_RESUME_INVALID", "resume file binding")
-                safeFile(stage, path + ".part")
-                records[path] = Checkpoint(path, length, sha)
-            }
-            ResumeData(manifest, records)
-        }
-    } catch (_: Exception) { null }
 
     private inner class ResumeJournal(val stage: File, val manifest: ModelSupplyManifest) {
         val records = readResume(stage)?.takeIf { it.manifest == manifest }?.records?.toMutableMap() ?: linkedMapOf()
@@ -516,8 +497,7 @@ internal class ModelSupplyReceiver(
                 stage.canonicalFile.parentFile != root.canonicalFile) continue
             val resume = readResume(stage) ?: continue
             // The journal's validated public manifest is its source marker.
-            if (listOf("source_model_id", "source_model_sha256", "tokenizer_sha256", "format", "conversion_proof")
-                    .any { resume.manifest.json[it] != manifest.json[it] }) continue
+            if (!manifest.sameContentIdentity(resume.manifest)) continue
             val files = resume.manifest.files.associateBy { it.path }
             for (file in resume.manifest.files) {
                 val target = runCatching { safeFile(stage, file.path) }.getOrNull() ?: continue
@@ -540,7 +520,7 @@ internal class ModelSupplyReceiver(
         if (!before.isRegularFile || before.size() < length) return null
         val digest = MessageDigest.getInstance("SHA-256")
         var remaining = length
-        source.inputStream().use { input ->
+        Files.newInputStream(source.toPath(), java.nio.file.StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS).use { input ->
             val buffer = ByteArray(1024 * 1024)
             while (remaining > 0) {
                 currentCoroutineContext().ensureActive()
@@ -575,23 +555,26 @@ internal class ModelSupplyReceiver(
                                      existing: Prefix, journal: ResumeJournal, stillCurrent: suspend () -> Boolean): Prefix {
         for (candidate in candidates) {
             if (candidate.record.length <= existing.length || candidate.stage == journal.stage) continue
-            val source = try { safeFile(candidate.stage, candidate.file.path + ".part") }
-                catch (_: ModelSupplyException) { continue }
-            if (!source.isFile || source.length() < candidate.record.length) continue
-            checkSupply(root.usableSpace >= candidate.record.length, "SUPPLY_DISK_INSUFFICIENT", "insufficient storage for prefix copy")
-            val temporary = File.createTempFile(".supply-prefix-", ".tmp", journal.stage)
+            val donor = runCatching { ModelSupplyStorage.transfer(root, candidate.stage) }.getOrNull() ?: continue
             try {
-                val digest = FileOutputStream(temporary).use { output ->
-                    val hash = readPrefix(source, candidate.record.length, output, stillCurrent)
-                    if (hash != null && digestSnapshot(hash) == candidate.record.sha256) { output.fd.sync(); hash } else null
-                } ?: continue
-                currentCoroutineContext().ensureActive()
-                checkSupply(stillCurrent(), "SUPPLY_CANCELLED", "binding changed")
-                safeFile(journal.stage, partial.name)
-                Files.move(temporary.toPath(), partial.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
-                journal.checkpoint(file, candidate.record.length, candidate.record.sha256)
-                return Prefix(candidate.record.length, digest)
-            } finally { Files.deleteIfExists(temporary.toPath()) }
+                val source = try { safeFile(candidate.stage, candidate.file.path + ".part") }
+                    catch (_: ModelSupplyException) { continue }
+                if (!source.isFile || source.length() < candidate.record.length) continue
+                checkSupply(root.usableSpace >= candidate.record.length, "SUPPLY_DISK_INSUFFICIENT", "insufficient storage for prefix copy")
+                val temporary = File.createTempFile(".supply-prefix-", ".tmp", journal.stage)
+                try {
+                    val digest = FileOutputStream(temporary).use { output ->
+                        val hash = readPrefix(source, candidate.record.length, output, stillCurrent)
+                        if (hash != null && digestSnapshot(hash) == candidate.record.sha256) { output.fd.sync(); hash } else null
+                    } ?: continue
+                    currentCoroutineContext().ensureActive()
+                    checkSupply(stillCurrent(), "SUPPLY_CANCELLED", "binding changed")
+                    safeFile(journal.stage, partial.name)
+                    Files.move(temporary.toPath(), partial.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
+                    journal.checkpoint(file, candidate.record.length, candidate.record.sha256)
+                    return Prefix(candidate.record.length, digest)
+                } finally { Files.deleteIfExists(temporary.toPath()) }
+            } finally { donor.close() }
         }
         return existing
     }
@@ -599,7 +582,7 @@ internal class ModelSupplyReceiver(
     private suspend fun copyReusable(source: File, partial: File, size: Long, stillCurrent: suspend () -> Boolean) {
         checkSupply(root.usableSpace >= size, "SUPPLY_DISK_INSUFFICIENT", "insufficient storage for reuse copy")
         FileOutputStream(partial).use { output ->
-            source.inputStream().use { input ->
+            Files.newInputStream(source.toPath(), java.nio.file.StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS).use { input ->
                 val buffer = ByteArray(1024 * 1024)
                 var copied = 0L
                 while (true) {
@@ -637,6 +620,8 @@ internal class ModelSupplyReceiver(
             "SUPPLY_NATIVE_MANIFEST_MISMATCH", "native catalog identity mismatch")
         val scan = safeFile(directory, manifest.weight.path).inputStream().use { GgufLayerWeightReader.scan(it, manifest.end - manifest.start) }
         checkSupply(scan != null && scan.layerWeightBytes == manifest.localLayerBytes, "SUPPLY_LAYER_BYTES_MISMATCH", "GGUF layer bytes differ")
+        val metadataDifferences = GgufMetadataContract.differences(scan?.ggufMetadata, native["gguf_metadata"], manifest.end - manifest.start)
+        checkSupply(metadataDifferences.isEmpty(), "SUPPLY_GGUF_METADATA_MISMATCH", metadataDifferences.joinToString("; "))
         checkSupply(GgufLayerWeightReader.matchesTokenizerSha256(manifest.json["tokenizer_sha256"].asString, scan),
             "SUPPLY_TOKENIZER_DIGEST_MISMATCH", "GGUF tokenizer differs")
     }
@@ -646,7 +631,7 @@ internal class ModelSupplyReceiver(
             catch (_: IOException) { return false }
         if (!before.isRegularFile || before.size() != expected.size) return false
         val digest = MessageDigest.getInstance("SHA-256")
-        file.inputStream().use { input ->
+        Files.newInputStream(file.toPath(), java.nio.file.StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS).use { input ->
             val buffer = ByteArray(1024 * 1024)
             while (true) { currentCoroutineContext().ensureActive(); val n = input.read(buffer); if (n < 0) break; digest.update(buffer, 0, n) }
         }
@@ -657,16 +642,47 @@ internal class ModelSupplyReceiver(
         return digest.digest().joinToString("") { "%02x".format(it.toInt() and 255) } == expected.sha256
     }
     private fun confined(name: String) = safeFile(root, name)
-    private fun safeFile(directory: File, name: String): File {
-        val file = File(directory, name)
-        checkSupply(!Files.isSymbolicLink(directory.toPath()) && !Files.isSymbolicLink(file.toPath()) &&
-            file.canonicalFile.parentFile == directory.canonicalFile, "SUPPLY_UNSAFE_PATH", "private path escaped")
-        return file
-    }
+    private fun safeFile(directory: File, name: String): File = ModelSupplyPaths.child(directory, name)
     private fun ensureDirectory(file: File) {
-        checkSupply(!Files.isSymbolicLink(file.toPath()) && (file.isDirectory || file.mkdirs()), "SUPPLY_STORAGE_UNAVAILABLE", "private directory unavailable")
+        ModelSupplyPaths.check(file)
+        checkSupply(file.isDirectory || file.mkdirs(), "SUPPLY_STORAGE_UNAVAILABLE", "private directory unavailable")
+        ModelSupplyPaths.check(file)
     }
     companion object {
+        internal fun readResume(stage: File): ResumeData? = try {
+            val marker = ModelSupplyPaths.child(stage, RESUME_MARKER)
+            if (!marker.isFile || marker.length() > MAX_JOURNAL_BYTES) null else {
+                val json = JsonParser.parseString(marker.readText(Charsets.UTF_8)).asJsonObject
+                checkSupply(json.keySet() == setOf("schema_version", "manifest", "prefixes", "journal_sha256"),
+                    "SUPPLY_RESUME_INVALID", "resume fields")
+                val unsigned = json.deepCopy().apply { remove("journal_sha256") }
+                checkSupply(ModelSupplyManifest.integer(json["schema_version"]) == 1L &&
+                    supplySha256(canonicalSupplyJson(unsigned).toByteArray(Charsets.UTF_8)) == ModelSupplyManifest.text(json, "journal_sha256"),
+                    "SUPPLY_RESUME_INVALID", "resume digest")
+                val manifest = ModelSupplyManifest.parse(json.getAsJsonObject("manifest"))
+                checkSupply(stage.name == ".receive-${manifest.manifestSha256}", "SUPPLY_RESUME_INVALID", "resume stage identity")
+                val records = linkedMapOf<String, Checkpoint>()
+                val entries = manifest.files.associateBy { it.path }
+                val prefixes = json.getAsJsonArray("prefixes")
+                checkSupply(prefixes.size() <= entries.size, "SUPPLY_RESUME_INVALID", "resume inventory")
+                for (element in prefixes) {
+                    val record = element.asJsonObject
+                    checkSupply(record.keySet() == setOf("path", "file_sha256", "size_bytes", "prefix_bytes", "prefix_sha256"),
+                        "SUPPLY_RESUME_INVALID", "resume file fields")
+                    val path = ModelSupplyManifest.text(record, "path")
+                    val file = entries[path] ?: throw ModelSupplyException("SUPPLY_RESUME_INVALID", "resume file identity")
+                    val length = ModelSupplyManifest.integer(record["prefix_bytes"], 1, file.size)
+                    val sha = ModelSupplyManifest.text(record, "prefix_sha256")
+                    checkSupply(path !in records && Regex("[0-9a-f]{64}").matches(sha) &&
+                        ModelSupplyManifest.text(record, "file_sha256") == file.sha256 &&
+                        ModelSupplyManifest.integer(record["size_bytes"]) == file.size,
+                        "SUPPLY_RESUME_INVALID", "resume file binding")
+                    ModelSupplyPaths.child(stage, path + ".part")
+                    records[path] = Checkpoint(path, length, sha)
+                }
+                ResumeData(manifest, records)
+            }
+        } catch (_: Exception) { null }
         internal const val RESUME_MARKER = ".supply-resume.json"
         private const val DOWNLOAD_CHUNK_BYTES = 256 * 1024
         private const val MAX_JOURNAL_BYTES = 4 * 1024 * 1024

@@ -150,8 +150,10 @@ class ModelSupplyWorkerTest {
             fun int(value: Int) = out.writeInt(Integer.reverseBytes(value))
             fun long(value: Long) = out.writeLong(java.lang.Long.reverseBytes(value))
             fun string(value: String) { val bytes = value.toByteArray(); long(bytes.size.toLong()); out.write(bytes) }
-            out.write("GGUF".toByteArray()); int(3); long(2); long(1)
+            out.write("GGUF".toByteArray()); int(3); long(2); long(3)
             string("tokenizer.ggml.model"); int(8); string("test")
+            string("general.architecture"); int(8); string("test")
+            string("test.block_count"); int(4); int(2)
             for (index in 0..1) { string("blk.$index.attn.weight"); int(1); long(1); int(0); long(index * 4L) }
         }
         val weight = buffer.toByteArray()
@@ -161,6 +163,8 @@ class ModelSupplyWorkerTest {
             "source_model_id":"source","source_model_sha256":"${"a".repeat(64)}",
             "tokenizer_sha256":"${scan.tokenizerSha256}","hidden_size":1,"mode":"tail",
             "source_layer_range":[2,4],"n_layer":4,"kept_block_count":2,
+            "gguf_metadata":{"architecture":"test","block_count":2,"head_count_kv":null,
+                "key_length":null,"full_attention_interval":null},
             "conversion_proof":null,"layer_weight_bytes":[0,0,4,4]
         }""").asJsonObject
         val nativeBytes = canonicalSupplyJson(native).toByteArray()

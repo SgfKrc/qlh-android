@@ -54,6 +54,8 @@ internal data class ModelSupplyManifest(val json: JsonObject, val files: List<Su
     val weight get() = files.single { it.kind == "weights" }
     val native get() = files.single { it.kind == "manifest" && it.path in nativeNames(weight.path) }
     val localLayerBytes get() = json["layer_weight_bytes"].asJsonArray.map { it.asLong }.subList(start, end)
+    /** Operation IDs bind publication; content reuse still requires the complete source/range/role. */
+    fun sameContentIdentity(other: ModelSupplyManifest): Boolean = REUSE_IDENTITY.all { json[it] == other.json[it] }
     fun result(status: String, reason: String = "") = JsonObject().apply {
         addProperty("action", "result"); addProperty("operation_id", operationId); addProperty("node_id", nodeId)
         addProperty("status", status); addProperty("reason_code", reason)
@@ -68,6 +70,9 @@ internal data class ModelSupplyManifest(val json: JsonObject, val files: List<Su
             "tokenizer_sha256", "total_layers", "layer_range", "segment_mode", "layer_weight_bytes", "hidden_size",
             "artifact_sha256", "conversion_proof", "files", "manifest_sha256", "format")
         private val OPTIONAL = setOf("model_type", "has_embedding", "has_lm_head", "tie_word_embeddings")
+        private val REUSE_IDENTITY = setOf("node_id", "source_model_id", "source_model_sha256", "tokenizer_sha256",
+            "format", "conversion_proof", "total_layers", "layer_range", "segment_mode", "hidden_size",
+            "layer_weight_bytes", "model_type", "has_embedding", "has_lm_head", "tie_word_embeddings")
         fun nativeNames(path: String) = setOf(path.removeSuffix(".gguf") + ".manifest.json", path + ".manifest.json")
         fun text(json: JsonObject, key: String): String {
             val v = json[key]

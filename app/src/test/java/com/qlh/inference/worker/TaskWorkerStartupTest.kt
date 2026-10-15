@@ -35,6 +35,29 @@ class TaskWorkerStartupTest {
     )
 
     @Test
+    fun `reuse requires a live registered connection as well as a running process`() {
+        assertTrue(canReuseTaskWorker(true, true, true, true))
+        assertFalse(canReuseTaskWorker(true, false, true, true))
+        assertFalse(canReuseTaskWorker(false, true, true, true))
+        assertFalse(canReuseTaskWorker(true, true, false, true))
+        assertFalse(canReuseTaskWorker(true, true, true, false))
+    }
+
+    @Test
+    fun `UI never calls a running disconnected or stale worker connected`() {
+        for (state in TaskWorkerConnectionState.entries) {
+            val snapshot = TaskWorkerSnapshot(connection = state, processRunning = true)
+            assertFalse(taskWorkerConnectionLabel(snapshot).contains("已连接"))
+        }
+        val ready = TaskWorkerSnapshot(connection = TaskWorkerConnectionState.READY,
+            processRunning = true, connectionAlive = true)
+        assertEquals("已连接并注册", taskWorkerConnectionLabel(ready))
+        assertFalse(taskWorkerConnectionLabel(ready.copy(processRunning = false)).contains("已连接"))
+        assertEquals("持续失败，自动重连已达上限", taskWorkerConnectionLabel(
+            TaskWorkerSnapshot(connection = TaskWorkerConnectionState.RETRY_EXHAUSTED)))
+    }
+
+    @Test
     fun `usable requires only non-sensitive startup metadata`() {
         assertTrue(config().usable)
         assertFalse(config(host = "  ").usable)

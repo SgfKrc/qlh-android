@@ -166,3 +166,23 @@ fun decideTaskWorkerStartup(
         else -> TaskWorkerStartupDecision.Stop
     }
 }
+
+
+/** A process or a retry timer alone is never evidence of a registered connection. */
+internal fun canReuseTaskWorker(
+    processRunning: Boolean,
+    connectionAlive: Boolean,
+    configurationMatches: Boolean,
+    inferenceAvailable: Boolean,
+): Boolean = processRunning && connectionAlive && configurationMatches && inferenceAvailable
+
+fun taskWorkerConnectionLabel(snapshot: TaskWorkerSnapshot): String = when {
+    snapshot.connectionAlive && snapshot.processRunning && snapshot.connection == TaskWorkerConnectionState.READY -> "已连接并注册"
+    snapshot.connection == TaskWorkerConnectionState.RETRY_EXHAUSTED -> "持续失败，自动重连已达上限"
+    snapshot.connection == TaskWorkerConnectionState.STOPPED -> "已停止"
+    !snapshot.processRunning -> "连接已失效"
+    snapshot.connection == TaskWorkerConnectionState.CONNECTING -> "正在连接"
+    snapshot.connection == TaskWorkerConnectionState.HELLO_SENT -> "正在注册"
+    snapshot.connection == TaskWorkerConnectionState.BACKING_OFF -> "已断开，等待重连"
+    else -> "连接已失效"
+}

@@ -46,6 +46,9 @@ import com.qlh.inference.security.AuthTokenStore
 import com.qlh.inference.security.StoredAuthSession
 import com.qlh.inference.update.AndroidAppUpdateManager
 import com.qlh.inference.update.AndroidUpdateCandidate
+import com.qlh.inference.network.ControlPlaneProbeResult
+import com.qlh.inference.network.probeControlPlaneConnection
+import com.qlh.inference.worker.TaskWorkerSnapshot
 import com.qlh.inference.worker.TaskWorkerService
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
@@ -134,6 +137,7 @@ data class MainUiState(
     val authBusy: Boolean = false,
     val authError: String? = null,
     val presence: AndroidPresenceSnapshot = AndroidPresenceSnapshot(),
+    val taskWorker: TaskWorkerSnapshot = TaskWorkerSnapshot(),
 )
 
 // ================================================================
@@ -352,6 +356,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             AndroidPresenceService.snapshot.collect { snapshot ->
                 _uiState.value = _uiState.value.copy(presence = snapshot)
+            }
+        }
+
+        viewModelScope.launch {
+            TaskWorkerService.workerSnapshot.collect { snapshot ->
+                _uiState.value = _uiState.value.copy(taskWorker = snapshot)
             }
         }
 
@@ -1654,6 +1664,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     // ==================== 连接测试回调 ====================
+
+    suspend fun testControlPlaneConnection(host: String, apiPort: Int): ControlPlaneProbeResult {
+        // A saved TCP endpoint belongs only to its saved API binding. Draft endpoints use the default TCP port.
+        val sameBinding = canonicalHost(host) == canonicalHost(settings.getServerHost()) &&
+            apiPort == settings.getServerPort()
+        val tcpHost = if (sameBinding) settings.getMasterTcpHost().ifBlank { host } else host
+        val tcpPort = if (sameBinding) settings.getMasterTcpPort() else 8888
+        return probeControlPlaneConnection(tcpHost, tcpPort, bootstrapInfo = {
+            ApiClient(httpBaseUrl(host, apiPort), callTimeoutSeconds = 4).getBootstrapInfo()
+        })
+    }
 
     /** 测试连接成功后调用，补一刀自动注册（防止之前因服务端未就绪而失败）。 */
     fun onConnectionTestSuccess() {

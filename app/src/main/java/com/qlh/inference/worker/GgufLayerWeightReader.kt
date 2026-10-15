@@ -1,14 +1,31 @@
 package com.qlh.inference.worker
 
+import com.google.gson.JsonArray
+import com.google.gson.JsonElement
+import com.google.gson.JsonNull
+import com.google.gson.JsonPrimitive
 import java.io.DataInputStream
+import java.io.FilterInputStream
 import java.io.IOException
 import java.io.InputStream
+import java.math.BigInteger
 import java.security.DigestInputStream
 import java.security.MessageDigest
 
 /** Streams the GGUF header and tensor directory; never reads model tensor data. */
 internal object GgufLayerWeightReader {
-    data class ScanResult(val layerWeightBytes: List<Long>, val tokenizerSha256: String?)
+    data class ScanResult(
+        val layerWeightBytes: List<Long>,
+        val tokenizerSha256: String?,
+        val ggufMetadata: Map<String, JsonElement> = emptyMap(),
+    )
+
+    private val metadataSuffixes = mapOf(
+        "block_count" to "block_count",
+        "head_count_kv" to "attention.head_count_kv",
+        "key_length" to "attention.key_length",
+        "full_attention_interval" to "full_attention_interval",
+    )
 
     private val blockTypes = mapOf(
         0 to (1 to 4), 1 to (1 to 2), 2 to (32 to 18), 3 to (32 to 20),
@@ -32,19 +49,32 @@ internal object GgufLayerWeightReader {
     fun scan(input: InputStream, layerCount: Int): ScanResult? {
         if (layerCount <= 0 || layerCount > 1024) return null
         return try {
-            val data = DataInputStream(input)
+            val data = DataInputStream(HeaderInputStream(input))
             val magic = ByteArray(4)
             data.readFully(magic)
             if (!magic.contentEquals("GGUF".toByteArray(Charsets.US_ASCII))) return null
-            if (data.intLE() < 2) return null
+            if (data.intLE() !in 2..3) return null
             val tensorCount = data.longLE()
             val metadataCount = data.longLE()
             if (tensorCount !in 1L..100_000L || metadataCount !in 0L..100_000L) return null
             val scratch = ByteArray(8192)
             val tokenizerFields = mutableMapOf<String, ByteArray>()
+            // Keep only contract KVs, never tokenizer values or arbitrary metadata arrays.
+            // Architecture may occur after its qualified fields in a valid GGUF header.
+            val metadataFields = mutableMapOf<String, JsonElement>()
+            val metadataNames = HashSet<String>()
             repeat(metadataCount.toInt()) {
                 val key = data.readString()
-                if (key.startsWith("tokenizer.")) {
+                if (!metadataNames.add(key)) throw IOException("duplicate GGUF metadata key")
+                if (key == "general.architecture") {
+                    if (data.intLE() != 8) throw IOException("invalid GGUF architecture type")
+                    val architecture = data.readString()
+                    if (architecture.isEmpty() || architecture.length > 128) throw IOException("invalid GGUF architecture")
+                    metadataFields[key] = JsonPrimitive(architecture)
+                } else if (!key.startsWith("tokenizer.") && metadataSuffixes.values.any { key.endsWith(".$it") }) {
+                    if (metadataFields.size >= 128) throw IOException("too many GGUF contract fields")
+                    metadataFields[key] = data.readMetadataInteger(data.intLE())
+                } else if (key.startsWith("tokenizer.")) {
                     if (tokenizerFields.containsKey(key)) throw IOException("duplicate GGUF tokenizer key")
                     val digest = MessageDigest.getInstance("SHA-256")
                     val hashed = DataInputStream(DigestInputStream(data, digest))
@@ -63,6 +93,14 @@ internal object GgufLayerWeightReader {
                 }
                 digest.digest().joinToString("") { byte ->
                     "%02x".format(byte.toInt() and 0xff)
+                }
+            }
+            val metadata = linkedMapOf<String, JsonElement>()
+            metadataFields["general.architecture"]?.let { architecture ->
+                metadata["architecture"] = architecture
+                for ((key, suffix) in metadataSuffixes) {
+                    // Explicit null is absence in this architecture's header, never a wildcard.
+                    metadata[key] = metadataFields["${architecture.asString}.$suffix"] ?: JsonNull.INSTANCE
                 }
             }
             val totals = LongArray(layerCount)
@@ -93,7 +131,7 @@ internal object GgufLayerWeightReader {
                 }
             }
             totals.takeIf { it.all { size -> size > 0L } }?.let { sizes ->
-                ScanResult(sizes.toList(), tokenizerSha256)
+                ScanResult(sizes.toList(), tokenizerSha256, metadata)
             }
         } catch (_: IOException) {
             null
@@ -102,6 +140,50 @@ internal object GgufLayerWeightReader {
         } catch (_: IllegalArgumentException) {
             null
         }
+    }
+
+    /** Bound reads and skips together, including streamed tokenizer bytes and tensor names. */
+    private class HeaderInputStream(input: InputStream) : FilterInputStream(input) {
+        private var remaining = 64L * 1024 * 1024
+
+        private fun requireBytes(size: Long) {
+            if (size < 0 || size > remaining) throw IOException("GGUF header exceeds limit")
+        }
+
+        override fun read(): Int {
+            requireBytes(1)
+            return `in`.read().also { if (it >= 0) remaining-- }
+        }
+
+        override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+            requireBytes(length.toLong())
+            return `in`.read(buffer, offset, length).also { if (it > 0) remaining -= it }
+        }
+
+        override fun skip(count: Long): Long {
+            requireBytes(count)
+            return `in`.skip(count).also { remaining -= it }
+        }
+    }
+
+    private fun DataInputStream.readMetadataInteger(type: Int): JsonElement = when (type) {
+        0 -> JsonPrimitive(readUnsignedByte())
+        1 -> JsonPrimitive(readByte())
+        2 -> JsonPrimitive(java.lang.Short.reverseBytes(readShort()).toInt() and 0xffff)
+        3 -> JsonPrimitive(java.lang.Short.reverseBytes(readShort()))
+        4 -> JsonPrimitive(intLE().toLong() and 0xffffffffL)
+        5 -> JsonPrimitive(intLE())
+        10 -> JsonPrimitive(BigInteger(java.lang.Long.toUnsignedString(longLE())))
+        11 -> JsonPrimitive(longLE())
+        9 -> {
+            val elementType = intLE()
+            val count = longLE()
+            if (count !in 0L..1024L || elementType !in setOf(0, 1, 2, 3, 4, 5, 10, 11)) {
+                throw IOException("invalid GGUF contract integer array")
+            }
+            JsonArray().apply { repeat(count.toInt()) { add(readMetadataInteger(elementType)) } }
+        }
+        else -> throw IOException("GGUF contract value must be an integer or integer array")
     }
 
     private fun DataInputStream.intLE(): Int = Integer.reverseBytes(readInt())

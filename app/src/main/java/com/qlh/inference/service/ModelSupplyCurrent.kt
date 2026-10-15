@@ -17,9 +17,12 @@ internal fun supplyBindingSha256(cluster: String, host: String, port: Int, epoch
 /** Only an explicitly registered operation is current; published directories are reuse storage. */
 internal class ModelSupplyCurrent(private val root: File) {
     private val pointer get() = File(root, POINTER)
-    internal data class Registration(val manifest: ModelSupplyManifest, val previous: ByteArray?)
+    internal data class Registration(
+        val manifest: ModelSupplyManifest, val previous: ByteArray?,
+        val pendingRollback: ModelSupplyStorage.Lease,
+    )
 
-    fun read(bindingSha256: String): ModelSupplyManifest? = synchronized(lock) {
+    fun read(bindingSha256: String): ModelSupplyManifest? = synchronized(ModelSupplyStorage.lock) {
         val bytes = readBytes() ?: return@synchronized null
         val record = JsonParser.parseString(bytes.toString(Charsets.UTF_8)).asJsonObject
         checkSupply(record.keySet() == setOf("binding_sha256", "manifest"), "SUPPLY_CURRENT_INVALID", "current fields")
@@ -27,9 +30,9 @@ internal class ModelSupplyCurrent(private val root: File) {
         ModelSupplyManifest.parse(record.getAsJsonObject("manifest"))
     }
 
-    fun select(manifest: ModelSupplyManifest, bindingSha256: String): Registration = synchronized(lock) {
+    fun select(manifest: ModelSupplyManifest, bindingSha256: String): Registration = synchronized(ModelSupplyStorage.lock) {
         val directory = directory(manifest)
-        val marker = File(directory, ModelSupplyManifest.MARKER)
+        val marker = ModelSupplyPaths.child(directory, ModelSupplyManifest.MARKER)
         checkSupply(!Files.isSymbolicLink(marker.toPath()) && marker.isFile && marker.length() <= LIMIT &&
             ModelSupplyManifest.parse(marker.readText(Charsets.UTF_8)).json == manifest.json,
             "SUPPLY_MANIFEST_DIGEST_MISMATCH", "current must refer to the verified published operation")
@@ -38,28 +41,39 @@ internal class ModelSupplyCurrent(private val root: File) {
             addProperty("binding_sha256", bindingSha256); add("manifest", manifest.json.deepCopy())
         }
         write(canonicalSupplyJson(record).toByteArray(Charsets.UTF_8))
-        Registration(manifest, previous)
+        Registration(manifest, previous, ModelSupplyStorage.pending(root))
+    }
+
+    /** Successful terminal acknowledgement ends the rollback retention window. */
+    fun complete(registration: Registration) { registration.pendingRollback.close() }
+
+    /** GC protects every binding's selected operation, and refuses an unreadable/invalid pointer. */
+    internal fun retainedManifestSha256(): String? = synchronized(ModelSupplyStorage.lock) {
+        val bytes = readBytes() ?: return@synchronized null
+        val record = JsonParser.parseString(bytes.toString(Charsets.UTF_8)).asJsonObject
+        checkSupply(record.keySet() == setOf("binding_sha256", "manifest") &&
+            Regex("[0-9a-f]{64}").matches(ModelSupplyManifest.text(record, "binding_sha256")),
+            "SUPPLY_CURRENT_INVALID", "current fields")
+        ModelSupplyManifest.parse(record.getAsJsonObject("manifest")).manifestSha256
     }
 
     /** A failed or retired registration cannot be recovered as current after restart. */
-    fun rollback(registration: Registration, bindingSha256: String) = synchronized(lock) {
-        if (read(bindingSha256)?.manifestSha256 == registration.manifest.manifestSha256) {
-            if (registration.previous == null) Files.deleteIfExists(pointer.toPath())
-            else write(registration.previous)
-        }
+    fun rollback(registration: Registration, bindingSha256: String) = synchronized(ModelSupplyStorage.lock) {
+        try {
+            if (read(bindingSha256)?.manifestSha256 == registration.manifest.manifestSha256) {
+                if (registration.previous == null) Files.deleteIfExists(pointer.toPath())
+                else write(registration.previous)
+            }
+        } finally { registration.pendingRollback.close() }
     }
 
     fun directory(manifest: ModelSupplyManifest): File {
         val directory = File(root, "segment-${manifest.manifestSha256}")
-        checkSupply(!Files.isSymbolicLink(root.toPath()) && !Files.isSymbolicLink(directory.toPath()) &&
-            directory.canonicalFile.parentFile == root.canonicalFile,
-            "SUPPLY_UNSAFE_PATH", "current directory escaped")
-        return directory
+        return ModelSupplyPaths.child(root, directory.name)
     }
 
     private fun readBytes(): ByteArray? {
-        checkSupply(!Files.isSymbolicLink(root.toPath()) && !Files.isSymbolicLink(pointer.toPath()),
-            "SUPPLY_UNSAFE_PATH", "current pointer escaped")
+        ModelSupplyPaths.child(root, POINTER)
         if (!pointer.exists()) return null
         checkSupply(pointer.isFile && pointer.length() <= LIMIT, "SUPPLY_CURRENT_INVALID", "current pointer invalid")
         return pointer.readBytes()
@@ -68,8 +82,8 @@ internal class ModelSupplyCurrent(private val root: File) {
     private fun write(bytes: ByteArray) {
         checkSupply(bytes.size <= LIMIT, "SUPPLY_CURRENT_INVALID", "current pointer exceeds limit")
         val temporary = File(root, ".current.part")
-        checkSupply(!Files.isSymbolicLink(temporary.toPath()) && !Files.isSymbolicLink(pointer.toPath()),
-            "SUPPLY_UNSAFE_PATH", "current pointer escaped")
+        ModelSupplyPaths.child(root, temporary.name)
+        ModelSupplyPaths.child(root, POINTER)
         FileOutputStream(temporary).use { it.write(bytes); it.fd.sync() }
         Files.move(temporary.toPath(), pointer.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
     }
@@ -77,7 +91,6 @@ internal class ModelSupplyCurrent(private val root: File) {
     companion object {
         const val POINTER = "current.supply.json"
         private const val LIMIT = 4 * 1024 * 1024L
-        private val lock = Any()
     }
 }
 

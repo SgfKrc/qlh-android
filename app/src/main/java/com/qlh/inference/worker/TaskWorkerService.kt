@@ -31,6 +31,9 @@ import com.qlh.inference.service.unambiguousLayerArtifactCandidates
 import com.qlh.inference.system.AndroidDeviceInfoProvider
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.NonCancellable
@@ -48,6 +51,7 @@ class TaskWorkerService : Service() {
     private var destroyed = false
     @Volatile
     private var client: TaskWorkerClient? = null
+    private var snapshotJob: Job? = null
     private var activeWorkerKey: TaskWorkerStartKey? = null
     private var activeInferenceStartAccepted = false
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -151,7 +155,7 @@ class TaskWorkerService : Service() {
         when (decideTaskWorkerStartup(
             action = action,
             hasPersistedConfig = persisted?.usable == true && clusterSecret.isNotBlank(),
-            hasActiveClient = client != null,
+            hasActiveClient = client?.isRunning == true,
         )) {
             TaskWorkerStartupDecision.Start -> {
                 val config = startupConfigFromIntent(intent)
@@ -246,6 +250,8 @@ class TaskWorkerService : Service() {
             // Keep ownership registered until even non-cancellable JNI work has exited.
             scope.launch(NonCancellable) { inferenceModes.retireWorker(old) }
         }
+        snapshotJob?.cancel()
+        mutableWorkerSnapshot.value = old?.snapshot?.value ?: TaskWorkerSnapshot()
         scope.cancel()
         super.onDestroy()
     }
@@ -265,15 +271,22 @@ class TaskWorkerService : Service() {
             contentResolver.persistedUriPermissions.any {
                 it.uri.toString() == modelTreeUri && it.isReadPermission
             }
-        if (client != null && client?.snapshot?.value?.connection != TaskWorkerConnectionState.STOPPED &&
-            (activeInferenceStartAccepted || QlhApplication.instance.inferenceService != null) &&
-            activeWorkerKey?.matches(
-                config, modelTreeUri, selectedModelUri, clusterSecret, treePermissionGranted,
-            ) == true
+        val existing = client
+        if (canReuseTaskWorker(
+                processRunning = existing?.isRunning == true,
+                connectionAlive = existing?.isConnectionLive == true,
+                configurationMatches = activeWorkerKey?.matches(
+                    config, modelTreeUri, selectedModelUri, clusterSecret, treePermissionGranted,
+                ) == true,
+                inferenceAvailable = activeInferenceStartAccepted || QlhApplication.instance.inferenceService != null,
+            )
         ) {
-            QlhLogger.i("TaskWorkerService", "worker_start_reused=true")
+            QlhLogger.i("TaskWorkerService", "worker_start_reused=true connection_alive=true")
             return
         }
+        QlhLogger.i("TaskWorkerService", "worker_start_reused=false " +
+            "process_running=${existing?.isRunning == true} connection_alive=${existing?.isConnectionLive == true} " +
+            "previous_connection=${existing?.snapshot?.value?.connection}")
         // A recreated service must release any previous local full model before hello/capabilities.
         if (!inferenceModes.prepareWorkerLocked(
                 readMode = { settings.getInferenceMode() },
@@ -656,6 +669,8 @@ class TaskWorkerService : Service() {
             inferenceModes.registerWorker(worker) {
                 worker.stopAndJoin()
                 if (client === worker) {
+                    snapshotJob?.cancel()
+                    mutableWorkerSnapshot.value = worker.snapshot.value
                     client = null
                     activeWorkerKey = null
                     activeInferenceStartAccepted = false
@@ -667,6 +682,18 @@ class TaskWorkerService : Service() {
             )
             activeInferenceStartAccepted = inferenceStartAccepted
             worker.start()
+            snapshotJob?.cancel()
+            snapshotJob = scope.launch {
+                worker.snapshot.collect { snapshot ->
+                    if (client === worker) {
+                        val previous = mutableWorkerSnapshot.value
+                        mutableWorkerSnapshot.value = snapshot
+                        if (previous.connection != snapshot.connection || previous.lastErrorCode != snapshot.lastErrorCode) {
+                            startForegroundNotification(snapshot)
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -697,13 +724,15 @@ class TaskWorkerService : Service() {
 
     private suspend fun stopWorker() {
         inferenceModes.stopWorkerLocked()
+        snapshotJob?.cancel()
+        mutableWorkerSnapshot.value = TaskWorkerSnapshot()
         activeWorkerKey = null
         activeInferenceStartAccepted = false
         client = null
     }
 
     @SuppressLint("ForegroundServiceType")
-    private fun startForegroundNotification() {
+    private fun startForegroundNotification(snapshot: TaskWorkerSnapshot = TaskWorkerSnapshot()) {
         val pendingIntent = PendingIntent.getActivity(
             this,
             1,
@@ -715,7 +744,7 @@ class TaskWorkerService : Service() {
             QlhApplication.NOTIFICATION_CHANNEL_INFERENCE,
         )
             .setContentTitle("QLH Worker")
-            .setContentText("Android Worker client is running")
+            .setContentText(taskWorkerConnectionLabel(snapshot))
             .setSmallIcon(android.R.drawable.ic_media_play)
             .setOngoing(true)
             .setContentIntent(pendingIntent)
@@ -733,6 +762,9 @@ class TaskWorkerService : Service() {
     }
 
     companion object {
+        private val mutableWorkerSnapshot = MutableStateFlow(TaskWorkerSnapshot())
+        val workerSnapshot = mutableWorkerSnapshot.asStateFlow()
+
         const val ACTION_START = "com.qlh.inference.worker.START"
         const val ACTION_STOP = "com.qlh.inference.worker.STOP"
         const val ACTION_CANCEL = "com.qlh.inference.worker.CANCEL"

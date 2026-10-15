@@ -34,6 +34,42 @@ internal fun filterModelIntentCatalog(models: List<ServerModelSummary>, query: S
     }
 }
 
+internal data class ModelIntentSelectionAvailability(
+    val enabled: Boolean,
+    val message: String,
+    val reasonCode: String = "",
+)
+
+/** Only a typed reason for the selected engine blocks acquisition. */
+internal fun modelIntentSelectionAvailability(
+    model: ServerModelSummary,
+    engine: String,
+    canChooseModel: Boolean = true,
+): ModelIntentSelectionAvailability {
+    val selectedEngine = if (engine == "auto") model.pipelineAutoEngine?.trim()?.takeIf { it.isNotEmpty() } else engine
+    val evidence = selectedEngine?.let { model.pipelineEngineAvailability?.get(it) }
+    val reasonCode = evidence?.reasonCode?.trim().orEmpty()
+    val engineLabel = when (selectedEngine) {
+        "pytorch" -> "PyTorch"
+        "llama_cpp" -> "llama.cpp"
+        null -> "自动"
+        else -> selectedEngine
+    }.let { if (engine == "auto" && selectedEngine != null) "自动（$it）" else it }
+    val message = when {
+        reasonCode.isNotEmpty() -> "$engineLabel 不可选择：${evidence?.reason?.trim()?.takeIf { it.isNotEmpty() } ?: "主节点已确认当前来源不可用"} · $reasonCode"
+        model.modelId.isBlank() -> "模型标识缺失，请刷新主节点模型目录。"
+        evidence?.status == "missing" -> "$engineLabel 来源尚未就绪；选择后由主节点尝试获取并验证。"
+        evidence?.status != "supported" -> "$engineLabel 来源可用性尚未确认；选择后由主节点获取并验证。"
+        evidence.source == "provenance" -> "$engineLabel 转换来源已登记；完整模型内容仍由主节点在供给时验证。"
+        else -> ""
+    }
+    return ModelIntentSelectionAvailability(
+        enabled = canChooseModel && model.modelId.isNotBlank() && reasonCode.isEmpty(),
+        message = message,
+        reasonCode = reasonCode,
+    )
+}
+
 /** The only master-model selector. The same operation status also appears above chat input. */
 @Composable
 fun ModelIntentPanel(
@@ -89,17 +125,20 @@ fun ModelIntentPanel(
             filteredModels.forEach { model ->
                 Column(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
                     val selected = state.requestedIntent?.modelId == model.modelId
+                    val availability = modelIntentSelectionAvailability(model, engine, state.canChooseModel)
                     OutlinedButton(
                         onClick = { onSelectModel(model.modelId, engine) },
-                        enabled = model.modelId.isNotBlank() && state.canChooseModel,
+                        enabled = availability.enabled,
                         modifier = Modifier.fillMaxWidth().testTag("intent_model_${model.modelId}"),
                     ) {
                         Text((if (selected) "已选择 · " else "选择 · ") + model.name.ifBlank { model.modelId })
                     }
-                    if (!model.isAvailable) Text(
-                        "源模型尚未就绪；选择后由主节点尝试获取并自动供给。" +
-                            model.unavailableReason.takeIf { it.isNotBlank() }?.let { " 当前状态：$it" }.orEmpty(),
-                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    if (availability.message.isNotBlank()) Text(
+                        availability.message,
+                        modifier = Modifier.testTag("intent_model_reason_${model.modelId}"),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (availability.reasonCode.isNotEmpty()) MaterialTheme.colorScheme.error
+                            else MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
             }

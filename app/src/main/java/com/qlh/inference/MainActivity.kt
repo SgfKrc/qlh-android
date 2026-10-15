@@ -248,6 +248,8 @@ fun MainApp(
                 runtimeStatusLoading = uiState.runtimeStatusLoading,
                 runtimeStatusError = uiState.runtimeStatusError,
                 presence = uiState.presence,
+                taskWorker = uiState.taskWorker,
+                onTestControlPlaneConnection = viewModel::testControlPlaneConnection,
                 onRefreshRuntimeStatus = { viewModel.refreshRuntimeStatus() },
                 onConnectionTestSuccess = { viewModel.onConnectionTestSuccess() },
                 remoteModels = uiState.remoteModels,
