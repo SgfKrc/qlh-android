@@ -128,6 +128,34 @@ class TaskWorkerProtocolTest {
     }
 
     @Test
+    fun `binary_hidden capability is admitted while typos stay rejected`() {
+        // ★ 票 21a（COMM-WIRE-01）：可选能力键，与主仓 `_validate_capabilities`
+        //   同键集 —— 两侧必须同时放行，否则对端 hello 自校验失败并静默断开。
+        val base = mapOf(
+            "stage_types" to listOf("full_inference"),
+            "engines" to listOf("llama_cpp"),
+            "models" to listOf(model),
+            "max_concurrency" to 1,
+        )
+        fun hello(capabilities: Map<String, Any?>) = TaskWorkerProtocol.buildHello(
+            nodeId = "android_worker_01",
+            capabilities = capabilities,
+            messageId = "msg_hello_android_binary",
+            sentAtMs = 1_700_000_000_000,
+        )
+
+        // 未声明 ⇒ 向后兼容（旧 hello 逐字节不变）
+        TaskWorkerProtocol.validate(hello(base))
+        // 声明 true / false 均放行
+        TaskWorkerProtocol.validate(hello(base + ("binary_hidden" to true)))
+        TaskWorkerProtocol.validate(hello(base + ("binary_hidden" to false)))
+        // 拼错仍必须被拒：放行新键不得放松精确字段校验
+        expectProtocolError("invalid_fields") {
+            TaskWorkerProtocol.validate(hello(base + ("binary_hiddne" to true)))
+        }
+    }
+
+    @Test
     fun `replay cache returns response and rejects message id conflict`() {
         val cache = TaskWorkerReplayCache(maxEntries = 1)
         val hello = TaskWorkerProtocol.buildHello(

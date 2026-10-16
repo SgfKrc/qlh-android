@@ -518,6 +518,15 @@ object TaskWorkerProtocol {
                     setOf("stage_chunked_input")
                 } else {
                     emptySet()
+                }) +
+                // ★ 票 21a（COMM-WIRE-01）：层段 hidden 的二进制帧接收能力（可选，默认关）。
+                //   声明 true 的对端才可能收到 format:"binary" 的帧；未声明者继续走
+                //   base64 内联。与主仓 `_validate_capabilities` 同键集 —— 两侧必须
+                //   同时放行，只改一边会让对端 hello 自校验失败并静默断开。
+                (if (capabilities.containsKey("binary_hidden")) {
+                    setOf("binary_hidden")
+                } else {
+                    emptySet()
                 }),
                 "payload.capabilities",
         )
