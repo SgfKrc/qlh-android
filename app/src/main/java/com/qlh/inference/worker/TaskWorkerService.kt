@@ -669,12 +669,14 @@ class TaskWorkerService : Service() {
                 if (client === worker) {
                     snapshotJob?.cancel()
                     mutableWorkerSnapshot.value = worker.snapshot.value
+                    releaseRuntimeOwner.get()?.takeIf { it.client === worker }?.let { releaseRuntimeOwner.compareAndSet(it, null) }
                     client = null
                     activeWorkerKey = null
                     activeInferenceStartAccepted = false
                 }
             }
             client = worker
+            releaseRuntimeOwner.set(RuntimeOwner(worker, prepare))
             activeWorkerKey = TaskWorkerStartKey(
                 config, modelTreeUri, selectedModelUri, clusterSecret, treePermissionGranted,
             )
@@ -762,6 +764,9 @@ class TaskWorkerService : Service() {
     companion object {
         private val mutableWorkerSnapshot = MutableStateFlow(TaskWorkerSnapshot())
         val workerSnapshot = mutableWorkerSnapshot.asStateFlow()
+        private data class RuntimeOwner(val client: TaskWorkerClient, val prepare: WorkerPrepareController)
+        private val releaseRuntimeOwner = AtomicReference<RuntimeOwner?>(null)
+        internal fun committedRuntimeIdentity(): WorkerPrepareIdentity? = releaseRuntimeOwner.get()?.prepare?.committedIdentity()
 
         const val ACTION_START = "com.qlh.inference.worker.START"
         const val ACTION_STOP = "com.qlh.inference.worker.STOP"

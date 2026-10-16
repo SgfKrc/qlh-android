@@ -74,7 +74,7 @@ class ReleaseRuntimeProbeTest {
         val output = json(snapshot())
         assertEquals(setOf(
             "schema_version", "nonce", "pid", "captured_at", "package_name", "version_name", "version_code",
-            "service_running", "inference_mode", "role", "worker", "native", "model", "error_code",
+            "service_running", "inference_mode", "role", "worker", "native", "model", "error_code", "runtime_receipt", "probe_kind",
         ), output.keySet())
         assertEquals(1, output["schema_version"].asInt)
         assertEquals("client", output["role"].asString)

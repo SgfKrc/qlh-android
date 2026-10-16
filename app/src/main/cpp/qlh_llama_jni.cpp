@@ -1,6 +1,10 @@
 #include <android/log.h>
 #include <jni.h>
 #include <sys/sysinfo.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <cstddef>
 
 #include <algorithm>
 #include <atomic>
@@ -766,6 +770,37 @@ Java_com_qlh_inference_service_LocalInferenceEngine_nativeGetBackendInfo(
     map_put(env, map, put_method, "backend_device_count", std::to_string(ggml_backend_dev_count()));
     map_put(env, map, put_method, "backend_devices", backend_devices_summary());
     return map;
+}
+
+// The caller retains a ParcelFileDescriptor duplicate for this entire read-only call.
+// No model/backend initialization, socket mutation, network I/O or /proc/net access.
+extern "C" JNIEXPORT jint JNICALL
+Java_com_qlh_inference_service_LocalInferenceEngine_nativeReadTcpState(
+    JNIEnv * env, jobject /* thiz */, jint fd
+) {
+    const auto option = [&](int name, int & value) {
+        socklen_t size = sizeof(value);
+        return getsockopt(fd, SOL_SOCKET, name, &value, &size) == 0 && size == sizeof(value);
+    };
+    int family = 0;
+    int type = 0;
+    int protocol = 0;
+    if (fd < 0 || !option(SO_DOMAIN, family) || !option(SO_TYPE, type) || !option(SO_PROTOCOL, protocol)) {
+        throw_java(env, "socket classification unavailable");
+        return -1;
+    }
+    if ((family != AF_INET && family != AF_INET6) || type != SOCK_STREAM || protocol != IPPROTO_TCP) {
+        return 0;
+    }
+    tcp_info info{};
+    socklen_t size = sizeof(info);
+    if (getsockopt(fd, IPPROTO_TCP, TCP_INFO, &info, &size) != 0 ||
+        size < offsetof(tcp_info, tcpi_state) + sizeof(info.tcpi_state) ||
+        info.tcpi_state < 1 || info.tcpi_state > 11) {
+        throw_java(env, "TCP_INFO state unavailable");
+        return -1;
+    }
+    return static_cast<jint>(info.tcpi_state);
 }
 
 extern "C" JNIEXPORT jobject JNICALL

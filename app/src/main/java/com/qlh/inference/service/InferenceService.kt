@@ -67,6 +67,7 @@ class InferenceService : Service() {
     companion object {
         private const val TAG = "InferenceService"
         private val releaseProbeReader by lazy { ReleaseRuntimeProbe.BoundedReader() }
+        private val productProbeReader by lazy { ReleaseRuntimeProbe.ProductReader<String>() }
 
         /** Intent action: 预加载模型 */
         const val ACTION_LOAD_MODEL = "com.qlh.inference.LOAD_MODEL"
@@ -184,27 +185,32 @@ class InferenceService : Service() {
 
     /** ActivityManager/dumpsys supplies the existing system permission boundary. */
     protected override fun dump(fd: FileDescriptor, writer: PrintWriter, args: Array<out String>?) {
-        val nonce = ReleaseRuntimeProbe.nonce(args) ?: return
+        val request = ReleaseRuntimeProbe.request(args) ?: return
+        val nonce = request.nonce
         val identity = ReleaseRuntimeProbe.PackageIdentity(android.os.Process.myPid(), packageName)
         fun failure(code: ErrorCode): String = ReleaseRuntimeProbe.line(
-            nonce, identity, ReleaseRuntimeProbe.failure(code, TaskWorkerService.workerSnapshot.value),
+            nonce, identity, ReleaseRuntimeProbe.failure(code, TaskWorkerService.workerSnapshot.value).copy(product = request.product),
         )
+        suspend fun collect(): String {
+            val info = packageManager.getPackageInfo(packageName, 0)
+            val installed = identity.copy(
+                versionName = info.versionName,
+                versionCode = if (Build.VERSION.SDK_INT >= 28) info.longVersionCode else {
+                    @Suppress("DEPRECATION")
+                    info.versionCode.toLong()
+                },
+            )
+            val snapshot = engine?.releaseRuntimeProbe(
+                readMode = { settings.getInferenceMode() },
+                readWorker = { TaskWorkerService.workerSnapshot.value },
+                readCommitted = { TaskWorkerService.committedRuntimeIdentity() },
+                product = request.product,
+            ) ?: ReleaseRuntimeProbe.failure(ErrorCode.ENGINE_MISSING, TaskWorkerService.workerSnapshot.value)
+            return ReleaseRuntimeProbe.line(nonce, installed, snapshot.copy(product = request.product))
+        }
         val line = try {
-            releaseProbeReader.read {
-                val info = packageManager.getPackageInfo(packageName, 0)
-                val installed = identity.copy(
-                    versionName = info.versionName,
-                    versionCode = if (Build.VERSION.SDK_INT >= 28) info.longVersionCode else {
-                        @Suppress("DEPRECATION")
-                        info.versionCode.toLong()
-                    },
-                )
-                val snapshot = engine?.releaseRuntimeProbe(
-                    readMode = { settings.getInferenceMode() },
-                    readWorker = { TaskWorkerService.workerSnapshot.value },
-                ) ?: ReleaseRuntimeProbe.failure(ErrorCode.ENGINE_MISSING, TaskWorkerService.workerSnapshot.value)
-                ReleaseRuntimeProbe.line(nonce, installed, snapshot)
-            }
+            if (request.product) productProbeReader.poll(nonce) { collect() } ?: failure(ErrorCode.PROBE_PENDING)
+            else releaseProbeReader.read { collect() }
         } catch (_: TimeoutException) {
             failure(ErrorCode.PROBE_TIMEOUT)
         } catch (_: RejectedExecutionException) {
@@ -212,10 +218,12 @@ class InferenceService : Service() {
         } catch (_: InterruptedException) {
             Thread.currentThread().interrupt()
             failure(ErrorCode.PROBE_INTERRUPTED)
+        } catch (_: CancellationException) {
+            failure(ErrorCode.PROBE_INTERRUPTED)
         } catch (error: ExecutionException) {
             when (val cause = error.cause) {
                 is TimeoutCancellationException -> failure(ErrorCode.PROBE_TIMEOUT)
-                is CancellationException -> throw cause
+                is CancellationException -> failure(ErrorCode.PROBE_INTERRUPTED)
                 is VirtualMachineError -> throw cause
                 is ThreadDeath -> throw cause
                 else -> failure(ErrorCode.PROBE_FAILED)
@@ -364,20 +372,61 @@ class InferenceService : Service() {
         prepareIdentity: com.qlh.inference.worker.WorkerPrepareIdentity? = null,
     ): Result<Unit> = inferenceModes.worker({ settings.getInferenceMode() }) {
         androidRuntimeStatusInvalidation.afterModelChange {
-            if (expectedSupplyManifestSha256 != null &&
-                modelManager.currentSupply()?.manifestSha256.orEmpty() != expectedSupplyManifestSha256
-            ) {
-                Result.failure(ModelSupplyException("SUPPLY_CURRENT_CHANGED", "advertised operation is no longer current"))
-            } else {
-                if (prepareIdentity != null) {
-                    modelManager.verifyWorkerPrepare(prepareIdentity)
+            var stage = RuntimePrepareFailure.Stage.SUPPLY
+            try {
+                Log.i(TAG, "worker prepare begin range=$layerRange hidden=$extractHidden context=$contextSize")
+                if (expectedSupplyManifestSha256 != null &&
+                    modelManager.currentSupply()?.manifestSha256.orEmpty() != expectedSupplyManifestSha256
+                ) {
+                    throw ModelSupplyException("SUPPLY_CURRENT_CHANGED", "advertised operation is no longer current")
                 }
+                if (prepareIdentity != null) {
+                    stage = RuntimePrepareFailure.Stage.VERIFY
+                    modelManager.verifyWorkerPrepare(prepareIdentity)
+                    Log.i(TAG, "worker prepare artifact verified range=$layerRange")
+                }
+                stage = RuntimePrepareFailure.Stage.LOAD
                 loadLayerModel(
                     layerRange, contextSize, extractHidden, expectedModelSha256,
                     expectedSourceModelId, expectedSourceModelSha256, expectedEmbeddingWidth, expectedArtifactModelId,
-                )
-            }
+                ).getOrThrow()
+                Log.i(TAG, "worker prepare native validated range=$layerRange")
+                if (prepareIdentity != null) {
+                    stage = RuntimePrepareFailure.Stage.BIND
+                    bindPreparedLayer(prepareIdentity).getOrThrow()
+                }
+                Result.success(Unit)
+            } catch (cancelled: CancellationException) { throw cancelled }
+              catch (error: Exception) {
+                  Log.e(TAG, RuntimePrepareFailure.diagnostic(stage, error))
+                  Result.failure(if (prepareIdentity == null) error else RuntimePrepareFailure.exception(stage, error))
+              }
         }
+    }
+
+    private suspend fun bindPreparedLayer(identity: com.qlh.inference.worker.WorkerPrepareIdentity): Result<Unit> {
+        val eng = engine ?: return Result.failure(IllegalStateException("engine_missing"))
+        var stage = RuntimePrepareFailure.Stage.RESOLVE
+        return try {
+            val inventory = modelManager.listLayerArtifacts(identity.text("source_model_sha256"), verifyArtifactDigest = false).getOrThrow()
+            val matching = inventory.filter { it.document.uri.toString() == eng.loadedModelSourceUri &&
+                it.artifactSha256 == identity.text("artifact_sha256") &&
+                listOf(it.startLayer, it.endLayerExclusive) == identity.range }
+            Log.i(TAG, "worker prepare receipt inventory=${inventory.size} loaded_matches=${matching.size}")
+            require(matching.size == 1)
+            val artifact = matching.single()
+            stage = RuntimePrepareFailure.Stage.MANIFEST
+            val stream = if (artifact.manifest.uri.scheme == "file") java.io.File(artifact.manifest.uri.path!!).inputStream()
+                else contentResolver.openInputStream(artifact.manifest.uri) ?: error("native_manifest_unavailable")
+            val raw = ReleaseRuntimeProbe.boundedText(stream, 4 * 1024 * 1024)
+            Log.i(TAG, "worker prepare receipt manifest read")
+            stage = RuntimePrepareFailure.Stage.BIND
+            eng.bindPreparedRuntime(identity, artifact.document.uri.toString(), artifact.document.name, raw)
+        } catch (cancelled: CancellationException) { throw cancelled }
+          catch (error: Exception) {
+              Log.e(TAG, RuntimePrepareFailure.diagnostic(stage, error))
+              Result.failure(RuntimePrepareFailure.exception(stage, error))
+          }
     }
 
     private suspend fun loadLayerModel(
@@ -419,7 +468,13 @@ class InferenceService : Service() {
                 expectedArtifactSha256 = expectedModelSha256,
                 preferFd = preferFd,
                 expectedArtifactModelId = expectedArtifactModelId,
-            ).getOrElse { return Result.failure(it) }
+            ).getOrElse {
+                if (it is CancellationException) throw it
+                val error = it as? Exception ?: IllegalStateException()
+                Log.e(TAG, RuntimePrepareFailure.diagnostic(RuntimePrepareFailure.Stage.OPEN, error))
+                return Result.failure(RuntimePrepareFailure.exception(RuntimePrepareFailure.Stage.OPEN, error))
+            }
+            Log.i(TAG, "worker prepare artifact opened prefer_fd=$preferFd")
             val loaded = eng.loadModel(
                 handle = artifact.handle,
                 contextSize = contextSize,
@@ -427,8 +482,21 @@ class InferenceService : Service() {
                 gpuLayers = gpuLayers,
                 layerRange = layerRange,
             )
-            if (loaded.isFailure) return loaded
+            if (loaded.isFailure) {
+                val cause = loaded.exceptionOrNull()!!
+                if (cause is CancellationException) throw cause
+                val error = cause as? Exception ?: IllegalStateException()
+                Log.e(TAG, RuntimePrepareFailure.diagnostic(RuntimePrepareFailure.Stage.LOAD, error))
+                return loaded
+            }
             val validation = validateLayerModel(eng, layerRange, expectedEmbeddingWidth)
+            if (validation.isFailure) {
+                val cause = validation.exceptionOrNull()!!
+                if (cause is CancellationException) throw cause
+                val error = cause as? Exception ?: IllegalStateException()
+                Log.e(TAG, RuntimePrepareFailure.diagnostic(RuntimePrepareFailure.Stage.VALIDATE, error))
+                return Result.failure(RuntimePrepareFailure.exception(RuntimePrepareFailure.Stage.VALIDATE, error))
+            }
             if (validation.isSuccess) {
                 loadedLayerContextSize = contextSize
                 loadedLayerArtifactModelId = expectedArtifactModelId
@@ -479,7 +547,7 @@ class InferenceService : Service() {
     /** Read-only check: controlled stages cannot trigger another lazy load. */
     internal fun isPreparedLayerLoaded(identity: com.qlh.inference.worker.WorkerPrepareIdentity): Boolean {
         val eng = engine ?: return false
-        return eng.isLoaded && eng.loadedLayerRange == identity.range &&
+        return eng.isLoaded && eng.matchesPreparedIdentity(identity) && eng.loadedLayerRange == identity.range &&
             eng.loadedExtractHidden == (identity.mode != "tail") && loadedLayerContextSize == 4096 &&
             loadedLayerArtifactSha256 == identity.text("artifact_sha256") &&
             loadedLayerArtifactModelId == identity.stageIdentity["model_id"] &&

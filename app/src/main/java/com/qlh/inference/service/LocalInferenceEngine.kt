@@ -3,7 +3,17 @@ package com.qlh.inference.service
 import android.content.Context
 import android.os.Build
 import android.util.Log
+import android.system.Os
+import android.system.OsConstants
+import android.system.StructStat
+import com.qlh.inference.status.ReleaseProcessTree
 import com.qlh.inference.status.RuntimeProcessObservations
+import com.qlh.inference.worker.WorkerPrepareIdentity
+import com.qlh.inference.worker.WorkerPrepareException
+import com.qlh.inference.worker.GgufLayerWeightReader
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import java.io.FileInputStream
 import com.qlh.inference.status.ReleaseRuntimeProbe
 import com.qlh.inference.status.ReleaseRuntimeProbe.ErrorCode
 import com.qlh.inference.worker.TaskWorkerSnapshot
@@ -18,6 +28,29 @@ import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.withContext
 import java.io.File
+
+internal object RuntimePrepareFailure {
+    enum class Stage(val code: String) {
+        SUPPLY("prepare_supply_check_failed"), VERIFY("prepare_artifact_verification_failed"),
+        OPEN("prepare_artifact_open_failed"), LOAD("prepare_native_load_failed"),
+        VALIDATE("prepare_native_validation_failed"), RESOLVE("prepare_receipt_artifact_resolution_failed"),
+        MANIFEST("prepare_receipt_manifest_read_failed"), STATE("prepare_receipt_runtime_mismatch"),
+        STAMP("prepare_receipt_artifact_changed"), METADATA("prepare_receipt_metadata_invalid"),
+        COUNT("prepare_receipt_native_count_mismatch"), BIND("prepare_receipt_bind_failed"),
+    }
+
+    /** Never include exception messages, URIs or manifest content in diagnostics. */
+    fun diagnostic(stage: Stage, error: Exception): String {
+        val locations = error.stackTrace.take(6).joinToString(",") {
+            "${it.className}.${it.methodName}:${it.lineNumber}"
+        }
+        return "worker prepare failed stage=${stage.name} code=${stage.code} exception=${error.javaClass.simpleName} at=$locations"
+    }
+
+    fun exception(stage: Stage, error: Exception): WorkerPrepareException =
+        (if (error is WorkerPrepareException && stage != Stage.METADATA) error
+        else WorkerPrepareException(stage.code, "worker prepare failed at ${stage.name}").also { it.initCause(error) })
+}
 
 /**
  * 本地推理引擎 — llama.cpp JNI 封装。
@@ -45,6 +78,19 @@ class LocalInferenceEngine(private val context: Context) {
     // Native model pointers and retained handles must outlive every native call.
     private val modelMutex = Mutex()
     private var closed = false
+    private data class ArtifactStamp(val device: Long, val inode: Long, val size: Long,
+        val mtimeSeconds: Long, val mtimeNanos: Long, val ctimeSeconds: Long, val ctimeNanos: Long)
+    private fun artifactStamp(stat: StructStat): ArtifactStamp {
+        require(OsConstants.S_ISREG(stat.st_mode) && stat.st_size > 0)
+        return if (Build.VERSION.SDK_INT >= 27) ArtifactStamp(stat.st_dev, stat.st_ino, stat.st_size,
+            stat.st_mtim.tv_sec, stat.st_mtim.tv_nsec, stat.st_ctim.tv_sec, stat.st_ctim.tv_nsec)
+        else ArtifactStamp(stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime, 0, stat.st_ctime, 0)
+    }
+    private fun artifactStamp(path: String): ArtifactStamp? = runCatching { artifactStamp(Os.stat(path)) }.getOrNull()
+    private var loadedArtifactStamp: ArtifactStamp? = null
+    @Volatile private var loadedPrepareIdentity: WorkerPrepareIdentity? = null
+    private var loadedPreparedMetadata: ReleaseRuntimeProbe.PreparedMetadata? = null
+
 
     private suspend fun <T> withModelContext(action: suspend CoroutineScope.() -> T): T =
         withContext(Dispatchers.IO) {
@@ -221,6 +267,7 @@ class LocalInferenceEngine(private val context: Context) {
         }
 
         try {
+            val beforeLoad = artifactStamp(modelPath)
             val ptr = nativeLoadModel(modelPath, contextSize, extractHidden, gpuLayers)
             if (ptr == 0L) {
                 return@withModelContext Result.failure(
@@ -228,6 +275,9 @@ class LocalInferenceEngine(private val context: Context) {
                 )
             }
             modelPtr = ptr
+            loadedArtifactStamp = beforeLoad?.takeIf { it == artifactStamp(modelPath) }
+            loadedPrepareIdentity = null
+            loadedPreparedMetadata = null
             loadedModelPath = modelPath
             loadedModelSourceUri = ""
             loadedExtractHidden = extractHidden
@@ -281,6 +331,7 @@ class LocalInferenceEngine(private val context: Context) {
         }
 
         try {
+            val beforeLoad = artifactStamp(modelPath)
             val ptr = nativeLoadModel(modelPath, contextSize, extractHidden, gpuLayers)
             if (ptr == 0L) {
                 handle.close()
@@ -289,6 +340,9 @@ class LocalInferenceEngine(private val context: Context) {
                 )
             }
             modelPtr = ptr
+            loadedArtifactStamp = beforeLoad?.takeIf { it == artifactStamp(modelPath) }
+            loadedPrepareIdentity = null
+            loadedPreparedMetadata = null
             loadedModelPath = modelPath
             loadedModelSourceUri = handle.sourceUri.toString()
             loadedExtractHidden = extractHidden
@@ -393,6 +447,9 @@ class LocalInferenceEngine(private val context: Context) {
                 throw e
             }
             modelPtr = 0
+            loadedArtifactStamp = null
+            loadedPrepareIdentity = null
+            loadedPreparedMetadata = null
             loadedModelPath = ""
             loadedModelSourceUri = ""
             loadedExtractHidden = false
@@ -496,13 +553,86 @@ class LocalInferenceEngine(private val context: Context) {
         }
     }
 
+    /** Called only after ModelManager verified this exact artifact and JNI load succeeded. */
+    internal suspend fun bindPreparedRuntime(identity: WorkerPrepareIdentity, sourceUri: String,
+        artifactName: String, nativeManifest: String): Result<Unit> = withModelContext {
+        var stage = RuntimePrepareFailure.Stage.STATE
+        try {
+            require(isLoaded && loadedModelSourceUri == sourceUri && loadedLayerRange == identity.range)
+            require(loadedExtractHidden == (identity.mode != "tail"))
+            stage = RuntimePrepareFailure.Stage.STAMP
+            require(loadedArtifactStamp != null && loadedArtifactStamp == artifactStamp(loadedModelPath))
+            stage = RuntimePrepareFailure.Stage.METADATA
+            val metadata = ReleaseRuntimeProbe.PreparedMetadata.parse(identity, nativeManifest, artifactName)
+            stage = RuntimePrepareFailure.Stage.COUNT
+            val actualCount = nativeGetModelInfo(modelPtr)["n_layer"]?.toIntOrNull()
+            Log.i(TAG, "worker prepare receipt native_layers=$actualCount expected_layers=${metadata.decoderLayers}")
+            require(actualCount == metadata.decoderLayers)
+            loadedPreparedMetadata = metadata
+            loadedPrepareIdentity = identity
+            Log.i(TAG, "worker prepare receipt bound range=${metadata.range} generation=${identity.generation}")
+            Result.success(Unit)
+        } catch (cancelled: CancellationException) { throw cancelled }
+          catch (error: Exception) {
+              Log.e(TAG, RuntimePrepareFailure.diagnostic(stage, error))
+              Result.failure(RuntimePrepareFailure.exception(stage, error))
+          }
+    }
+
+    internal fun matchesPreparedIdentity(identity: WorkerPrepareIdentity): Boolean = loadedPrepareIdentity == identity
+
+    /** Reopen the retained load path, not a selected document or a new inventory result. */
+    private fun runtimeReceipt(identity: WorkerPrepareIdentity?, count: Int?, check: () -> Unit): Map<String, Any?> {
+        require(identity != null && identity == loadedPrepareIdentity)
+        val metadata = requireNotNull(loadedPreparedMetadata)
+        val stamp = requireNotNull(loadedArtifactStamp)
+        require(metadata.range == loadedLayerRange && metadata.decoderLayers == count)
+        require(stamp == artifactStamp(loadedModelPath))
+        val path = File(loadedModelPath).canonicalPath
+        require(path.startsWith('/') && !path.endsWith(" (deleted)"))
+        val scan = FileInputStream(loadedModelPath).use { input ->
+            require(artifactStamp(Os.fstat(input.fd)) == stamp)
+            GgufLayerWeightReader.scan(input, metadata.decoderLayers)
+        }
+        require(scan != null && GgufMetadataContract.matches(scan.ggufMetadata,
+            metadata.contract["gguf_metadata"], metadata.decoderLayers))
+        require(GgufLayerWeightReader.matchesTokenizerSha256(identity.text("tokenizer_sha256"), scan))
+        val digest = FileInputStream(loadedModelPath).use { input ->
+            require(artifactStamp(Os.fstat(input.fd)) == stamp)
+            val digest = ReleaseRuntimeProbe.rehash(input, stamp.size, check)
+            require(artifactStamp(Os.fstat(input.fd)) == stamp)
+            digest
+        }
+        check()
+        require(stamp == artifactStamp(loadedModelPath) && digest == metadata.sha256)
+        val pid = android.os.Process.myPid()
+        return linkedMapOf(
+            "schema_version" to 1, "source" to "committed_worker_prepare", "engine" to "llama_cpp",
+            "pid" to pid, "loader_pid" to pid,
+            "operation_id" to identity.text("operation_id"), "config_id" to identity.text("config_id"),
+            "generation" to identity.generation, "node_id" to identity.text("node_id"),
+            "assignment_id" to identity.text("assignment_id"), "loaded" to true, "full_model_loaded" to false,
+            "layer_range" to metadata.range, "source_layer_range" to metadata.range,
+            "range_source" to "verified_loaded_native_manifest", "total_layers" to metadata.total,
+            "native_layer_count" to count, "captured_at" to ReleaseRuntimeProbe.unixSeconds(),
+            "artifact" to linkedMapOf("path" to path, "load_path" to loadedModelPath,
+                "sha256" to metadata.sha256, "rehashed_sha256" to digest, "size_bytes" to stamp.size,
+                "layer_range" to metadata.range, "decoder_layers" to count,
+                "native_manifest_sha256" to metadata.manifestSha256,
+                "device" to stamp.device, "inode" to stamp.inode),
+        )
+    }
+
     /** One actual JNI/model generation; never call getBackendInfo/getModelInfo under this mutex. */
     internal suspend fun releaseRuntimeProbe(
         readMode: suspend () -> String,
         readWorker: () -> TaskWorkerSnapshot,
+        readCommitted: () -> WorkerPrepareIdentity? = { null },
+        product: Boolean = false,
     ): ReleaseRuntimeProbe.Snapshot = withContext(Dispatchers.IO) {
         modelMutex.withLock {
-            ReleaseRuntimeProbe.capture(readMode, readWorker) {
+            val probeContext = currentCoroutineContext()
+            val snapshot = ReleaseRuntimeProbe.capture(readMode, readWorker, readCommitted) {
                 if (closed) {
                     ReleaseRuntimeProbe.RuntimeState(
                         ReleaseRuntimeProbe.NativeState(errorCode = ErrorCode.ENGINE_CLOSED),
@@ -539,14 +669,31 @@ class LocalInferenceEngine(private val context: Context) {
                             null
                         }
                     } else null
+                    var receipt: Map<String, Any?>? = null
+                    if (product && loaded && range.isNotEmpty()) {
+                        val owner = readCommitted()
+                        if (owner == null || owner != loadedPrepareIdentity) {
+                            modelError = ErrorCode.RUNTIME_RECEIPT_UNAVAILABLE
+                        } else try {
+                            receipt = runtimeReceipt(owner, count) { probeContext.ensureActive() }
+                        } catch (cancelled: CancellationException) { throw cancelled }
+                          catch (_: Exception) { modelError = ErrorCode.ARTIFACT_REHASH_FAILED }
+                    }
+                    val process = if (product) ReleaseProcessTree.captureCurrent { nativeReadTcpState(it) } else RuntimeProcessObservations.capture()
+                    val receiptWithIdentity = receipt?.let {
+                        it + mapOf("created_at" to process["created_at"], "package_name" to context.packageName)
+                    }
+                    if (receiptWithIdentity != null && process["created_at"] == null) modelError = ErrorCode.RUNTIME_RECEIPT_INVALID
                     ReleaseRuntimeProbe.RuntimeState(
                         native = backend,
                         model = ReleaseRuntimeProbe.ModelState(loaded, range, count),
                         errorCode = backend.errorCode ?: modelError,
-                        process = RuntimeProcessObservations.capture(),
+                        process = process,
+                        receipt = receiptWithIdentity,
                     )
                 }
             }
+            snapshot.copy(product = product)
         }
     }
 
@@ -799,6 +946,9 @@ class LocalInferenceEngine(private val context: Context) {
 
     /** 获取 llama.cpp / ggml 后端能力。 */
     private external fun nativeGetBackendInfo(): Map<String, String>
+
+    /** Read-only getsockopt on a caller-owned duplicate: 0 = verified non-TCP; 1..11 = TCP_INFO state. */
+    private external fun nativeReadTcpState(fd: Int): Int
 
     /** 获取 Android MTMD 图像/音频桥接能力。 */
     private external fun nativeGetMultimodalCapability(modelPtr: Long): Map<String, String>
