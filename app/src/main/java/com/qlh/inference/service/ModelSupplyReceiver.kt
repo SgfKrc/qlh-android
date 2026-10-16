@@ -111,6 +111,8 @@ internal class ModelSupplyReceiver(
         progress: suspend (ModelSupplyProgress) -> Unit,
         publish: suspend (() -> Unit) -> Unit,
         diagnostics: (ModelSupplyTransferDiagnostic) -> Unit = {},
+        allowLocalCutFallback: Boolean = false,
+        localWeight: (suspend (File, suspend (Long) -> Unit) -> Unit)? = null,
     ): File {
         checkSupply(apiPort in 1..65535 && token.isNotBlank() && token.length <= 4096 && token.none { it.code < 32 || it.code == 127 },
             "SUPPLY_INVALID_REQUEST", "port or token")
@@ -221,10 +223,30 @@ internal class ModelSupplyReceiver(
                     throw ModelSupplyException("SUPPLY_ARTIFACT_DIGEST_MISMATCH", "complete prefix digest mismatch")
                 }
                 checkSupply(root.usableSpace >= file.size - offset, "SUPPLY_DISK_INSUFFICIENT", "insufficient private storage")
-                if (file.size == 0L) {
+                if (file.kind == "weights" && localWeight != null) {
+                    transfer.report("building", transfer.completed)
+                    // A local build replaces any trusted download prefix; never resume its bytes.
+                    journal.forget(file)
+                    Files.deleteIfExists(partial.toPath())
+                    try {
+                        localWeight(partial) { built ->
+                            checkSupply(built in 0..file.size, "SUPPLY_ARTIFACT_DIGEST_MISMATCH", "cut size")
+                            transfer.report("building", transfer.completed + built)
+                        }
+                    } catch (error: ModelSupplyException) {
+                        if (!allowLocalCutFallback || error.reasonCode !in LOCAL_CUT_FALLBACK_REASONS) throw error
+                        currentCoroutineContext().ensureActive()
+                        checkSupply(stillCurrent(), "SUPPLY_CANCELLED", "binding changed before fallback")
+                        Files.deleteIfExists(partial.toPath())
+                        checkSupply(root.usableSpace >= file.size, "SUPPLY_DISK_INSUFFICIENT", "insufficient fallback storage")
+                        transfer.report("transfer_fallback_local_cut_unavailable")
+                        downloadFile(manifest, file, partial, Prefix(0, MessageDigest.getInstance("SHA-256")),
+                            journal, apiPort, token, stillCurrent, transfer)
+                    }
+                } else if (file.size == 0L) {
                     FileOutputStream(partial).use { it.fd.sync() }
                 } else {
-                    transfer.report("transfer_fallback_local_cut_unavailable", transfer.completed + offset)
+                    if (localWeight == null) transfer.report("transfer_fallback_local_cut_unavailable", transfer.completed + offset)
                     downloadFile(manifest, file, partial, prefix, journal, apiPort, token, stillCurrent, transfer)
                 }
                 transfer.report("verifying", transfer.completed + file.size)
@@ -458,6 +480,10 @@ internal class ModelSupplyReceiver(
             save(records + (file.path to Checkpoint(file.path, length, sha256)))
         }
 
+        fun forget(file: ModelSupplyManifest.SupplyFile) {
+            if (file.path in records) save(records - file.path)
+        }
+
         // Keep a validated source marker even after .part becomes a complete target.
         fun recordSource() { save(records.toMap()) }
 
@@ -684,6 +710,9 @@ internal class ModelSupplyReceiver(
             }
         } catch (_: Exception) { null }
         internal const val RESUME_MARKER = ".supply-resume.json"
+        private val LOCAL_CUT_FALLBACK_REASONS = setOf(
+            "SUPPLY_LOCAL_SOURCE_UNAVAILABLE", "SUPPLY_LOCAL_CUT_UNSUPPORTED", "SUPPLY_LOCAL_CUT_TIMEOUT",
+        )
         private const val DOWNLOAD_CHUNK_BYTES = 256 * 1024
         private const val MAX_JOURNAL_BYTES = 4 * 1024 * 1024
         fun fileUrl(host: String, port: Int, operation: String, node: String, filename: String): HttpUrl {

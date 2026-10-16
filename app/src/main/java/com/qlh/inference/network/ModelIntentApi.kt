@@ -16,10 +16,16 @@ data class ModelIntentRequest(
     val strategy: String = "auto",
     @SerializedName("timeout_seconds") val timeoutSeconds: Int = 3600,
 ) {
-    fun validate() {
+    /** Android submits automatic supply; explicit strategies belong to the public API. */
+    fun validate() = validateStrategies(setOf("auto"))
+
+    /** An operation may have been created by another API client using an explicit strategy. */
+    internal fun validateForOperation() = validateStrategies(setOf("auto", "local_cut", "distribute"))
+
+    private fun validateStrategies(strategies: Set<String>) {
         require(modelId.isNotBlank()) { "model_id_required" }
         require(engine in setOf("auto", "pytorch", "llama_cpp")) { "intent_engine_invalid" }
-        require(strategy == "auto" && timeoutSeconds > 0) { "intent_options_invalid" }
+        require(strategy in strategies && timeoutSeconds > 0) { "intent_options_invalid" }
     }
 }
 
@@ -161,7 +167,7 @@ internal val MODEL_INTENT_STATUSES = setOf(
 
 internal fun ModelIntentOperation.validate(): ModelIntentOperation = apply {
     validateModelIntentOperationId(operationId)
-    intent.validate()
+    intent.validateForOperation()
     require(status in MODEL_INTENT_STATUSES && generation >= 0) { "intent_operation_invalid" }
 }
 

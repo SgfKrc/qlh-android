@@ -36,6 +36,7 @@ internal class ModelSupplyController(
     private val available: (ModelSupplyManifest) -> Unit,
     private val bindingSha256: String = supplyBindingSha256("", boundHost, 0, 0),
     private val participationCurrent: suspend () -> Boolean = { distributed() && bindingCurrent() },
+    private val localSources: com.qlh.inference.service.LocalGgufSources? = null,
 ) : TaskWorkerModelSupplyHandler {
     private data class Active(
         val operation: String, val manifest: ModelSupplyManifest, val receiver: ModelSupplyReceiver, val job: Job,
@@ -49,6 +50,7 @@ internal class ModelSupplyController(
     private var generation = 0L
     private var active: Active? = null
     private val retiring = mutableSetOf<Job>()
+    private val inventoryJobs = mutableMapOf<Job, String>()
     // Connection-owned memory only; replacing the controller starts a new scope.
     private val cancelledOperations = linkedSetOf<String>()
 
@@ -66,7 +68,9 @@ internal class ModelSupplyController(
     }
 
     override fun cancelAll() {
-        cancelRetired(synchronized(lock) { retireLocked() })
+        val (previous, inventories) = synchronized(lock) { retireLocked() to inventoryJobs.keys.toList() }
+        inventories.forEach { it.cancel() }
+        cancelRetired(previous)
     }
 
     private fun cancelRetired(previous: Active?) {
@@ -94,21 +98,57 @@ internal class ModelSupplyController(
             checkSupply(bindingCurrent(), "SUPPLY_MASTER_BINDING_CHANGED", "master binding changed")
             when (ModelSupplyManifest.text(data, "action")) {
                 "inventory" -> {
-                    ModelSupplyManifest.text(data, "model_id")
+                    val modelId = ModelSupplyManifest.text(data, "model_id")
                     val sourceSha = ModelSupplyManifest.text(data, "source_model_sha256")
                     checkSupply(sourceSha.isEmpty() || Regex("[0-9a-f]{64}").matches(sourceSha), "SUPPLY_INVALID_REQUEST", "source sha")
-                    reply(JsonObject().apply {
-                        addProperty("action", "inventory_result"); addProperty("operation_id", operation); addProperty("node_id", nodeId)
-                        addProperty("distributed", distributed()); addProperty("disk_free_bytes", root.parentFile?.usableSpace ?: 0L)
-                        addProperty("memory_available_bytes", memoryAvailable().coerceAtLeast(0)); addProperty("local_cut", false)
-                        add("engines", com.google.gson.JsonArray().apply { add("llama_cpp") }); add("sources", com.google.gson.JsonArray())
-                    })
+                    suspend fun reportInventory() {
+                        val sources = localSources?.inventory(modelId, sourceSha) {
+                            currentCoroutineContext().ensureActive()
+                            authorize()
+                            bindingCurrent() && synchronized(lock) { generation == commandGeneration }
+                        }.orEmpty()
+                        authorize()
+                        checkSupply(bindingCurrent() && synchronized(lock) { generation == commandGeneration },
+                            "SUPPLY_CANCELLED", "inventory retired")
+                        reply(JsonObject().apply {
+                            addProperty("action", "inventory_result"); addProperty("operation_id", operation); addProperty("node_id", nodeId)
+                            addProperty("distributed", distributed()); addProperty("disk_free_bytes", root.parentFile?.usableSpace ?: 0L)
+                            addProperty("memory_available_bytes", memoryAvailable().coerceAtLeast(0)); addProperty("local_cut", localSources != null)
+                            addProperty("local_cut_tool", if (localSources != null) com.qlh.inference.service.GgufSegmentCutter.TOOL else "")
+                            addProperty("local_cut_reason", if (localSources == null) "SUPPLY_LOCAL_CUT_UNAVAILABLE" else if (sources.isEmpty()) "SUPPLY_LOCAL_SOURCE_UNAVAILABLE" else "")
+                            add("engines", com.google.gson.JsonArray().apply { add("llama_cpp") })
+                            add("sources", com.google.gson.JsonArray().apply { sources.forEach { source -> add(JsonObject().apply {
+                                addProperty("source_model_id", source.modelId); addProperty("source_model_sha256", source.sha256)
+                                addProperty("tokenizer_sha256", source.tokenizerSha256); addProperty("size_bytes", source.size)
+                            }) } })
+                        })
+                    }
+                    if (localSources == null) reportInventory() else {
+                        val job = scope.launch(start = CoroutineStart.LAZY) {
+                            try { reportInventory() }
+                            catch (cancelled: CancellationException) { throw cancelled }
+                            catch (error: Exception) {
+                                currentCoroutineContext().ensureActive()
+                                authorize()
+                                if (bindingCurrent() && synchronized(lock) { generation == commandGeneration }) {
+                                    reply(failed(operation, (error as? ModelSupplyException)?.reasonCode ?: "SUPPLY_INVENTORY_FAILED"))
+                                }
+                            }
+                        }
+                        synchronized(lock) {
+                            checkSupply(generation == commandGeneration, "SUPPLY_CANCELLED", "inventory retired")
+                            inventoryJobs[job] = operation
+                        }
+                        job.invokeOnCompletion { synchronized(lock) { inventoryJobs.remove(job) } }
+                        job.start()
+                    }
                 }
                 "cancel" -> {
                     val current = synchronized(lock) {
                         rememberCancelledLocked(operation)
                         if (active?.operation == operation) retireLocked() else null
                     }
+                    synchronized(lock) { inventoryJobs.filterValues { it == operation }.keys.toList() }.forEach { it.cancel() }
                     if (current != null) { manifest = current.manifest; cancelRetired(current) }
                     reply(current?.let { result(it, "failed", "SUPPLY_CANCELLED") } ?: failed(operation, "SUPPLY_CANCELLED"))
                 }
@@ -123,10 +163,18 @@ internal class ModelSupplyController(
                     manifest = parsed
                     checkSupply(parsed.operationId == operation && parsed.nodeId == nodeId, "SUPPLY_IDENTITY_MISMATCH", "manifest target differs")
                     val strategy = ModelSupplyManifest.text(data, "strategy")
-                    checkSupply(strategy != "local_cut", "SUPPLY_LOCAL_CUT_UNAVAILABLE", "Android has no GGUF cutting tool")
-                    checkSupply(strategy == "distribute", "SUPPLY_INVALID_REQUEST", "unknown strategy")
+                    val allowFallback = data["allow_fallback"]?.let {
+                        checkSupply(it.isJsonPrimitive && it.asJsonPrimitive.isBoolean,
+                            "SUPPLY_INVALID_REQUEST", "allow_fallback must be boolean")
+                        it.asBoolean
+                    } ?: false
+                    checkSupply(strategy != "local_cut" || localSources != null, "SUPPLY_LOCAL_CUT_UNAVAILABLE", "local cutter unavailable")
+                    checkSupply(strategy in setOf("distribute", "local_cut"), "SUPPLY_INVALID_REQUEST", "unknown strategy")
                     val port = ModelSupplyManifest.integer(data["api_port"], 1, 65535).toInt()
                     val token = ModelSupplyManifest.text(data, "token")
+                    val cutTimeoutMillis = data["local_cut_timeout_seconds"]?.let {
+                        ModelSupplyManifest.integer(it, 1, 300) * 1000
+                    } ?: 300_000L
                     checkSupply(participationCurrent(), "SUPPLY_CANCELLED", "worker participation changed")
                     val (previous, epoch) = synchronized(lock) {
                         checkSupply(operation !in cancelledOperations && generation == commandGeneration,
@@ -151,6 +199,25 @@ internal class ModelSupplyController(
                         try {
                             synchronized(lock) { retiring.toList() }.forEach { it.join() }
                             checkSupply(current(), "SUPPLY_CANCELLED", "supply retired")
+                            var cutSource: com.qlh.inference.service.LocalGgufSource? = null
+                            val localWeight: (suspend (File, suspend (Long) -> Unit) -> Unit)? = if (strategy == "local_cut") {
+                                { output, progress ->
+                                    try {
+                                        kotlinx.coroutines.withTimeout(cutTimeoutMillis) {
+                                            val source = cutSource ?: localSources!!.resolve(parsed, ::current).also { cutSource = it }
+                                            // Identity failures must not become recoverable source unavailability.
+                                            checkSupply(source.sha256 == parsed.sourceSha256,
+                                                "SUPPLY_SOURCE_DIGEST_MISMATCH", "local source identity differs")
+                                            checkSupply(source.tokenizerSha256 == parsed.json["tokenizer_sha256"].asString,
+                                                "SUPPLY_TOKENIZER_DIGEST_MISMATCH", "local source tokenizer differs")
+                                            com.qlh.inference.service.GgufSegmentCutter.cut(source, parsed, output, ::current, progress)
+                                        }
+                                    } catch (timeout: kotlinx.coroutines.TimeoutCancellationException) {
+                                        currentCoroutineContext().ensureActive()
+                                        throw ModelSupplyException("SUPPLY_LOCAL_CUT_TIMEOUT", "local cutter budget exhausted")
+                                    }
+                                }
+                            } else null
                             receiver.receive(parsed, port, token, ::current,
                                 progress = { progress ->
                                     synchronized(lock) { owner.progress = progress }
@@ -180,7 +247,8 @@ internal class ModelSupplyController(
                                         }
                                     }
                                 },
-                                diagnostics = { QlhLogger.i("ModelSupply", it.logMessage()) })
+                                diagnostics = { QlhLogger.i("ModelSupply", it.logMessage()) },
+                                allowLocalCutFallback = allowFallback, localWeight = localWeight)
                             currentCoroutineContext().ensureActive()
                             checkSupply(current(), "SUPPLY_CANCELLED", "supply retired")
                             publicationGate {

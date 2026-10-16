@@ -102,6 +102,38 @@ class ModelManager(private val context: Context) {
     var lastLayerArtifactInventory: LayerArtifactInventory? = null
         private set
 
+    internal val localCutSources: LocalGgufSourceRegistry by lazy {
+        LocalGgufSourceRegistry(File(context.filesDir.canonicalFile, "local-cut"), ::localCutDocuments)
+    }
+
+    /** Existing read grants only; no selection, storage-mode or permission mutation. */
+    private suspend fun localCutDocuments(): List<LocalGgufSourceRegistry.Document> = withContext(Dispatchers.IO) {
+        val roots = mutableListOf<List<ModelDocument>>()
+        val tree = getSavedTreeUri()
+        if (tree != null && hasPersistedPermission(tree)) {
+            roots += listSafFiles(tree, setOf(GGUF_EXTENSION, JSON_EXTENSION))
+        }
+        roots += runCatching { listPhysicalModels(fallbackModelsDir, ModelSource.FALLBACK, setOf(GGUF_EXTENSION, JSON_EXTENSION)) }
+            .getOrDefault(emptyList())
+        roots += listPhysicalModels(modelsDir, ModelSource.INTERNAL, setOf(GGUF_EXTENSION, JSON_EXTENSION))
+        roots.flatMap { documents ->
+            documents.filter { document ->
+                document.name.endsWith(GGUF_EXTENSION, true) && document.sizeBytes > 0 &&
+                    documents.none { it.parentId == document.parentId && it.name in ModelSupplyManifest.nativeNames(document.name) }
+            }
+        }.distinctBy(::physicalDocumentKey).map { document ->
+            LocalGgufSourceRegistry.Document(document.uri.toString(), document.sizeBytes) {
+                if (document.uri.scheme == "file") {
+                    val file = File(document.uri.path.orEmpty())
+                    ModelSupplyPaths.check(file)
+                    java.nio.file.Files.newInputStream(file.toPath(), java.nio.file.StandardOpenOption.READ,
+                        java.nio.file.LinkOption.NOFOLLOW_LINKS)
+                } else context.contentResolver.openInputStream(document.uri)
+                    ?: throw IOException("GGUF source is unavailable; check the existing SAF read grant")
+            }
+        }
+    }
+
     private val httpClient = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(300, TimeUnit.SECONDS)

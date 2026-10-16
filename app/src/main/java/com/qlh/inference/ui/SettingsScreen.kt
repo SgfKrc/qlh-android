@@ -380,6 +380,12 @@ fun SettingsScreen(
                 onThemeModeChange = onThemeModeChange
             )
 
+            if (!isLite) {
+                SettingsGroup(title = "GGUF 本地裁切源", icon = Icons.Default.FolderOpen) {
+                    LocalCutSourcePicker(availableModels, isScanningModels, onRefreshModels, onChooseModelDirectory)
+                }
+            }
+
             if (!isLite && inferenceMode == SettingsDataStore.MODE_LOCAL) {
                 SettingsGroup(title = "模型管理", icon = Icons.Default.FolderOpen) {
                     ModelManagementPanel(

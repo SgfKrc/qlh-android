@@ -450,15 +450,12 @@ class TaskWorkerService : Service() {
                 ?.layerForwardInfo()
                 ?.getOrNull()
                 .orEmpty()
-            // ★ 2026-10-03：设备自荐层容量 —— 按可用内存与已选工件推算"能承载多少层"。
-            //   `localCut` 先恒为 false：设备侧本地裁层执行体尚未落地，不虚报能力。
-            // ★ 每层字节必须来自**同一个工件**：用它自己的文件字节 ÷ 它覆盖的层数。
-            //   此前用"目录里最大工件 ÷ 当前工件层数"，两者会错配（拿整模的字节除以
-            //   中段的层数）⇒ 每层字节偏大、可承载层数被低估。
+            // This legacy budget describes an existing artifact. Source-specific local cutting
+            // is verified separately by model_supply inventory, never inferred from this estimate.
             val readyArtifact = layerArtifacts.firstOrNull { it.document.sizeBytes > 0 }
             // A single node-level budget cannot truthfully describe several
-            // pre-cut artifacts with different bytes/layer.  Until local
-            // cutting exists, exact per-artifact ranges are the contract; only
+            // artifacts with different bytes/layer. Exact per-artifact ranges remain
+            // the admission contract; only
             // retain the legacy budget hint when there is one artifact.
             val layerBudget = if (layerArtifacts.size == 1) {
                 val availableBytes = runCatching {
@@ -535,6 +532,7 @@ class TaskWorkerService : Service() {
             available = { _ -> },
             bindingSha256 = supplyBinding,
             participationCurrent = { participationCurrent() },
+            localSources = modelManager.localCutSources,
         )
         val prepare = WorkerPrepareController(nodeId, object : WorkerPrepareRuntime {
             override suspend fun load(identity: WorkerPrepareIdentity) {

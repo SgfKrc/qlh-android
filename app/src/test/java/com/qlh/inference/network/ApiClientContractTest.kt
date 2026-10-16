@@ -1229,6 +1229,99 @@ class ApiClientContractTest {
     }
 
     @Test
+    fun `current failed local cut from an API client preserves its source choice and named failure`() = runBlocking {
+        // Regression for the captured intent-before-selection.json from the physical device run.
+        val id = "supply_4946a692602545db88e7994e91864adc"
+        val captured = parseJson(intentOperationJson(status = "failed", id = id)).apply {
+            getAsJsonObject("intent").apply {
+                addProperty("model_id", "qwen3-5-9b")
+                addProperty("engine", "llama_cpp")
+                addProperty("strategy", "local_cut")
+                addProperty("timeout_seconds", 900)
+                add("node_ids", com.google.gson.JsonArray())
+            }
+            addProperty("reason_code", "SUPPLY_LOCAL_CUT_UNAVAILABLE")
+            addProperty("reason", "Worker lacks the verified source or cutter")
+        }
+        route("/api/models/intent/current") { _, reply -> reply(200, captured.toString()) }
+        val operation = client.getCurrentModelIntent().getOrThrow()!!
+        assertEquals(id, operation.operationId)
+        assertEquals("qwen3-5-9b", operation.intent.modelId)
+        assertEquals("llama_cpp", operation.intent.engine)
+        assertEquals("local_cut", operation.intent.strategy)
+        assertEquals(900, operation.intent.timeoutSeconds)
+        assertEquals("failed", operation.status)
+        assertEquals("SUPPLY_LOCAL_CUT_UNAVAILABLE", operation.reasonCode)
+        assertEquals("Worker lacks the verified source or cutter", operation.reason)
+        assertTrue(operation.finished)
+        assertFalse(operation.readyForChat)
+    }
+
+    @Test
+    fun `current get and cancel accept every API strategy without rewriting the returned operation`() = runBlocking {
+        for (strategy in listOf("auto", "local_cut", "distribute")) {
+            val body = parseJson(intentOperationJson("failed")).apply {
+                getAsJsonObject("intent").addProperty("strategy", strategy)
+            }.toString()
+            route("/api/models/intent/current") { _, reply -> reply(200, body) }
+            route("/api/models/intent/supply_abc") { _, reply -> reply(200, body) }
+            for (operation in listOf(client.getCurrentModelIntent().getOrThrow()!!,
+                client.getModelIntent("supply_abc").getOrThrow(), client.cancelModelIntent("supply_abc").getOrThrow())) {
+                assertEquals(strategy, operation.intent.strategy)
+                assertEquals("failed", operation.status)
+            }
+        }
+    }
+
+    @Test
+    fun `unknown returned strategies fail closed for current get and cancel`() = runBlocking {
+        for (strategy in listOf("", "reuse", "LOCAL_CUT", "future_strategy")) {
+            val body = parseJson(intentOperationJson()).apply {
+                getAsJsonObject("intent").addProperty("strategy", strategy)
+            }.toString()
+            route("/api/models/intent/current") { _, reply -> reply(200, body) }
+            route("/api/models/intent/supply_abc") { _, reply -> reply(200, body) }
+            for (result in listOf(client.getCurrentModelIntent(), client.getModelIntent("supply_abc"),
+                client.cancelModelIntent("supply_abc"))) {
+                assertTrue("accepted strategy=$strategy", result.isFailure)
+                assertEquals("intent_options_invalid", result.exceptionOrNull()!!.message)
+            }
+        }
+    }
+
+    @Test
+    fun `UI submissions still reject explicit and unknown strategies before HTTP`() = runBlocking {
+        var submissions = 0
+        route("/api/models/intent") { request, reply ->
+            submissions++
+            assertEquals("auto", parseJson(request.body)["strategy"].asString)
+            reply(202, intentOperationJson())
+        }
+        for (strategy in listOf("local_cut", "distribute", "", "reuse", "future_strategy")) {
+            val result = client.submitModelIntent(ModelIntentRequest("qwen", strategy = strategy))
+            assertTrue("submitted strategy=$strategy", result.isFailure)
+            assertEquals("intent_options_invalid", result.exceptionOrNull()!!.message)
+        }
+        assertEquals(0, submissions)
+        assertTrue(client.submitModelIntent(ModelIntentRequest("qwen")).isSuccess)
+        assertEquals(1, submissions)
+    }
+
+    @Test
+    fun `API strategies do not relax model engine or timeout validation`() = runBlocking {
+        for (strategy in listOf("auto", "local_cut", "distribute")) {
+            for ((field, value) in listOf("model_id" to com.google.gson.JsonPrimitive(""),
+                "engine" to com.google.gson.JsonPrimitive("unknown"), "timeout_seconds" to com.google.gson.JsonPrimitive(0))) {
+                val body = parseJson(intentOperationJson()).apply {
+                    getAsJsonObject("intent").apply { addProperty("strategy", strategy); add(field, value) }
+                }.toString()
+                route("/api/models/intent/current") { _, reply -> reply(200, body) }
+                assertTrue("relaxed $field for $strategy", client.getCurrentModelIntent().isFailure)
+            }
+        }
+    }
+
+    @Test
     fun `intent post uses exact master owned supply and prepare request`() = runBlocking {
         route("/api/models/intent") { request, reply ->
             assertEquals("POST", request.method)

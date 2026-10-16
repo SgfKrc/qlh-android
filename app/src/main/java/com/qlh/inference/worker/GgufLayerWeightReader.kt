@@ -38,6 +38,17 @@ internal object GgufLayerWeightReader {
         25 to (1 to 2), 26 to (1 to 4), 27 to (1 to 8),
         28 to (1 to 8), 29 to (256 to 56), 30 to (1 to 2),
     )
+    internal fun tensorByteSize(typeId: Int, dimensions: List<Long>): Long {
+        val type = blockTypes[typeId] ?: throw IOException("unknown GGUF tensor type")
+        var elements = 1L
+        for (dimension in dimensions) {
+            if (dimension <= 0) throw IOException("invalid GGUF dimension")
+            elements = Math.multiplyExact(elements, dimension)
+        }
+        if (elements % type.first != 0L) throw IOException("invalid GGUF quantization block")
+        return Math.multiplyExact(elements / type.first, type.second.toLong())
+    }
+
     private val blockName = Regex("^blk\\.(\\d+)\\.")
 
     fun read(input: InputStream, layerCount: Int): List<Long>? =
@@ -145,6 +156,7 @@ internal object GgufLayerWeightReader {
     /** Bound reads and skips together, including streamed tokenizer bytes and tensor names. */
     private class HeaderInputStream(input: InputStream) : FilterInputStream(input) {
         private var remaining = 64L * 1024 * 1024
+        private val skipBuffer = ByteArray(8192)
 
         private fun requireBytes(size: Long) {
             if (size < 0 || size > remaining) throw IOException("GGUF header exceeds limit")
@@ -162,7 +174,14 @@ internal object GgufLayerWeightReader {
 
         override fun skip(count: Long): Long {
             requireBytes(count)
-            return `in`.skip(count).also { remaining -= it }
+            // SAF may return a pipe whose FileInputStream.skip throws ESPIPE.
+            var left = count
+            while (left > 0) {
+                val n = read(skipBuffer, 0, minOf(left, skipBuffer.size.toLong()).toInt())
+                if (n < 0) break
+                left -= n
+            }
+            return count - left
         }
     }
 
