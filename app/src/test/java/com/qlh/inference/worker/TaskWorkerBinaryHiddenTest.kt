@@ -131,6 +131,30 @@ class TaskWorkerBinaryHiddenTest {
     }
 
     @Test
+    fun `split preserves the original envelope and nested payload`() {
+        val original = offer()
+        val before = original.deepCopy()
+        val (split, raw) = TaskWorkerBinaryHidden.split(original, enabled = true)
+        assertArrayEquals(hidden, raw)
+        assertEquals(before, original)
+        assertEquals(false, split == original)
+    }
+
+    @Test
+    fun `noncanonical base64 and nonstring fields remain unchanged`() {
+        for (value in listOf("null", "1234", "true", "[]", "{}", "\"AQ\"", "\"AB==\"", "\"\"")) {
+            val message = parse("""{"message_type":"stage_offer","payload":{"root_input":{"hidden_f32":$value}}}""")
+            val before = message.deepCopy()
+            assertNull(TaskWorkerBinaryHidden.split(message, enabled = true).second)
+            assertEquals(before, message)
+        }
+        for (payload in listOf("null", "[]", "123", "true", "{}", "{\"root_input\":[]}")) {
+            val message = parse("""{"message_type":"stage_offer","payload":$payload}""")
+            assertNull(TaskWorkerBinaryHidden.split(message, enabled = true).second)
+        }
+    }
+
+    @Test
     fun `path table matches the python side`() {
         // 与 src/task_worker_protocol.BINARY_HIDDEN_PATHS 逐项对应
         assertEquals(Pair("root_input", "hidden_f32"), TaskWorkerBinaryHidden.PATHS["stage_offer"])

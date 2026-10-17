@@ -28,11 +28,8 @@ object TaskWorkerBinaryHidden {
     /** 二进制体的长度头字节数（4 字节长度前缀）。 */
     const val HEADER_BYTES = 4
 
-    /**
-     * 回程分片的消息类型。Kotlin 协议侧没有它的常量（Android 是**发送方**，接收在
-     * 主节点），故本地持有；取值与主仓 `task_worker_protocol` 的 `MESSAGE_TYPES` 一致。
-     */
-    const val STAGE_RESULT_CHUNK_TYPE = "stage_result_chunk"
+    /** Compatibility alias for the protocol's return-chunk message type. */
+    const val STAGE_RESULT_CHUNK_TYPE = TaskWorkerProtocol.STAGE_RESULT_CHUNK
 
     /**
      * 内联 hidden 的落点表：`消息类型 -> (容器键, 字段名)`。
@@ -56,20 +53,21 @@ object TaskWorkerBinaryHidden {
      */
     fun split(inner: JsonObject, enabled: Boolean): Pair<JsonObject, ByteArray?> {
         if (!enabled) return Pair(inner, null)
-        val messageType = inner.get("message_type")?.takeIf { it.isJsonPrimitive }?.asString
+        val messageType = inner.get("message_type")?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isString }?.asString
         val path = messageType?.let { PATHS[it] } ?: return Pair(inner, null)
-        val payload = inner.getAsJsonObject("payload") ?: return Pair(inner, null)
+        val payload = inner.get("payload")?.takeIf { it.isJsonObject }?.asJsonObject
+            ?: return Pair(inner, null)
         val (containerKey, fieldKey) = path
 
-        if (containerKey == null) {
-            val raw = decodeField(payload, fieldKey) ?: return Pair(inner, null)
-            payload.remove(fieldKey)
-            return Pair(inner, raw)
-        }
-        val container = payload.getAsJsonObject(containerKey) ?: return Pair(inner, null)
+        val container = if (containerKey == null) payload else
+            payload.get(containerKey)?.takeIf { it.isJsonObject }?.asJsonObject
+                ?: return Pair(inner, null)
         val raw = decodeField(container, fieldKey) ?: return Pair(inner, null)
-        container.remove(fieldKey)
-        return Pair(inner, raw)
+        val snapshot = inner.deepCopy()
+        val newPayload = snapshot.getAsJsonObject("payload")
+        val newContainer = if (containerKey == null) newPayload else newPayload.getAsJsonObject(containerKey)
+        newContainer.remove(fieldKey)
+        return Pair(snapshot, raw)
     }
 
     /**
@@ -77,22 +75,40 @@ object TaskWorkerBinaryHidden {
      */
     fun restore(raw: ByteArray?, messageType: String?, payload: JsonObject) {
         if (raw == null) return
-        val path = messageType?.let { PATHS[it] } ?: return
-        val (containerKey, fieldKey) = path
-        if (containerKey == null) {
-            payload.addProperty(fieldKey, Base64.getEncoder().encodeToString(raw))
-            return
-        }
-        val container = payload.getAsJsonObject(containerKey) ?: return
+        val container = restoreTarget(messageType, payload)
+        val fieldKey = requireNotNull(PATHS[messageType]).second
+        if (raw.isEmpty()) invalidBody("binary hidden body must not be empty")
         container.addProperty(fieldKey, Base64.getEncoder().encodeToString(raw))
     }
 
+    /** Validate the destination before allocating or reading the binary body. */
+    internal fun restoreTarget(messageType: String?, payload: JsonObject): JsonObject {
+        val (containerKey, fieldKey) = messageType?.let { PATHS[it] }
+            ?: invalidBody("message type does not carry binary hidden")
+        val container = if (containerKey == null) payload else
+            payload.get(containerKey)?.takeIf { it.isJsonObject }?.asJsonObject
+                ?: invalidBody("binary hidden container must be an object")
+        if (container.has(fieldKey) ||
+            (containerKey == "root_input" && container.has("hidden_ref")) ||
+            (containerKey == "output" && container.has("hidden_out_ref"))) {
+            invalidBody("binary hidden must have exactly one payload source")
+        }
+        return container
+    }
+
+    private fun invalidBody(message: String): Nothing = throw TaskWorkerProtocolException(
+        message, "invalid_frame", "data.payload",
+    )
+
     /** 该字段能否解出非空 raw；不能则返回 null（交给既有协议校验报错）。 */
     private fun decodeField(container: JsonObject, fieldKey: String): ByteArray? {
-        val encoded = container.get(fieldKey)?.takeIf { it.isJsonPrimitive }?.asString
+        val encoded = container.get(fieldKey)?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isString }?.asString
             ?: return null
+        if (encoded.length % 4 != 0) return null
         return try {
-            Base64.getDecoder().decode(encoded).takeIf { it.isNotEmpty() }
+            Base64.getDecoder().decode(encoded).takeIf {
+                it.isNotEmpty() && Base64.getEncoder().encodeToString(it) == encoded
+            }
         } catch (_: IllegalArgumentException) {
             null
         }

@@ -316,6 +316,7 @@ class TaskWorkerStateMachine(
 }
 
 interface TaskWorkerTransport {
+    val isBinaryHiddenNegotiated: Boolean get() = false
     suspend fun send(envelope: TaskWorkerEnvelope)
     suspend fun receive(): TaskWorkerEnvelope?
     suspend fun receiveEvent(): TaskWorkerInboundEvent =
@@ -325,7 +326,7 @@ interface TaskWorkerTransport {
     suspend fun sendModelPrepare(data: com.google.gson.JsonObject) { throw TaskWorkerProtocolException("prepare transport unavailable", "prepare_transport_unavailable") }
     fun requireControlAuthority() = Unit
     suspend fun sendHeartbeat(nodeId: String, sentAtMs: Long) = Unit
-    /** ★ 票 21a：告知本连接"本进程已声明 `binary_hidden`"，出站帧据此走二进制体。 */
+    /** Configure local receive support; outbound binary also needs a positive master ACK. */
     fun setBinaryHiddenEnabled(enabled: Boolean) = Unit
     suspend fun close()
 }
@@ -355,7 +356,7 @@ fun interface TaskWorkerTransportFactory {
 /** Length-prefixed transport compatible with the existing PC TCP framing. */
 internal class SocketTaskWorkerTransport(
     private val socket: Socket,
-    private val maxFrameBytes: Int = TaskWorkerProtocol.MAX_MESSAGE_BYTES + 1024,
+    private val maxFrameBytes: Int = TaskWorkerProtocol.MAX_BINARY_FRAME_BYTES,
     private val controlFence: TcpControlFence = TcpControlFence(),
 ) : TaskWorkerTransport {
     private val input = DataInputStream(BufferedInputStream(socket.getInputStream()))
@@ -363,17 +364,20 @@ internal class SocketTaskWorkerTransport(
     private val sendLock = Any()
     private val gson = GsonBuilder().disableHtmlEscaping().create()
 
-    /**
-     * ★ 票 21a（COMM-WIRE-01）：本进程是否声明了 `binary_hidden`（由 [TaskWorkerClient]
-     * 在发出 hello 时按该 hello 的能力设置）。只有为真时出站帧才走二进制体；为假时
-     * 帧与旧路径**逐字节一致**。
-     */
     @Volatile
     private var binaryHiddenEnabled: Boolean = false
+    @Volatile
+    private var masterBinaryHiddenEnabled: Boolean = false
+
+    override val isBinaryHiddenNegotiated: Boolean
+        get() = binaryHiddenEnabled && masterBinaryHiddenEnabled
 
     override fun setBinaryHiddenEnabled(enabled: Boolean) {
         binaryHiddenEnabled = enabled
+        masterBinaryHiddenEnabled = false
     }
+
+    private data class OuterFrame(val value: com.google.gson.JsonObject, val binaryHidden: Boolean = false)
 
     private suspend fun sendOuter(
         type: String,
@@ -387,7 +391,8 @@ internal class SocketTaskWorkerTransport(
         val outer = "{\"type\":\"$type\",\"format\":\"$format\"$binaryJson$dataJson}"
             .toByteArray(StandardCharsets.UTF_8)
         val bodyBytes = binaryBody?.let { TaskWorkerBinaryHidden.HEADER_BYTES + it.size } ?: 0
-        if (outer.size + bodyBytes > maxFrameBytes) throw TaskWorkerProtocolException(
+        val wireLimit = if (binaryBody == null) maxFrameBytes else minOf(maxFrameBytes, TaskWorkerProtocol.MAX_BINARY_FRAME_BYTES)
+        if (outer.size.toLong() + bodyBytes.toLong() > wireLimit.toLong()) throw TaskWorkerProtocolException(
             "task worker frame exceeds maximum size",
             "message_too_large",
             "message",
@@ -404,17 +409,16 @@ internal class SocketTaskWorkerTransport(
     }
 
     override suspend fun send(envelope: TaskWorkerEnvelope) = withContext(Dispatchers.IO) {
-        val inner = JsonParser.parseString(TaskWorkerProtocol.encode(envelope).toString(StandardCharsets.UTF_8)).asJsonObject
-        // ★ 票 21a：本进程声明了 `binary_hidden` 时，把内联载荷抽成帧的二进制体。
-        //   声明后仍能握手成功 ⇒ 主节点认识这个键 ⇒ 支持二进制帧（旧主节点会以
-        //   `invalid_fields` 拒绝 hello，连接根本建立不起来）。未声明时不传第二个
-        //   参数，帧与旧路径逐字节一致。
-        val (body, binaryBody) = TaskWorkerBinaryHidden.split(inner, binaryHiddenEnabled)
-        if (binaryBody == null) {
-            sendOuter("task_worker", controlFence.decorate(body))
-        } else {
-            sendOuter("task_worker", controlFence.decorate(body), binaryBody)
-        }
+        if (envelope.messageType == TaskWorkerProtocol.HELLO) masterBinaryHiddenEnabled = false
+        val binary = binaryHiddenEnabled && masterBinaryHiddenEnabled
+        // Validate the full envelope, but measure the actual wire representation after extraction.
+        TaskWorkerProtocol.validate(envelope)
+        val inner = JsonParser.parseString(
+            TaskWorkerProtocol.canonicalBytes(envelope).toString(StandardCharsets.UTF_8),
+        ).asJsonObject
+        val (body, binaryBody) = TaskWorkerBinaryHidden.split(inner, binary)
+        if (binaryBody == null) TaskWorkerProtocol.encode(envelope)
+        sendOuter("task_worker", controlFence.decorate(body), binaryBody)
     }
 
     override fun requireControlAuthority() {
@@ -427,74 +431,87 @@ internal class SocketTaskWorkerTransport(
 
     override suspend fun sendModelPrepare(data: com.google.gson.JsonObject) = sendOuter("model_prepare", controlFence.decorate(data))
 
-    private suspend fun receiveOuter(): com.google.gson.JsonObject? = withContext(Dispatchers.IO) {
-        val size = try {
-            input.readInt()
+    private fun invalidFrame(message: String, field: String = "message"): Nothing =
+        throw TaskWorkerProtocolException(message, "invalid_frame", field)
+
+    private fun readFrameLength(allowCleanEof: Boolean = false): Int? {
+        val first = input.read()
+        if (first < 0) {
+            if (allowCleanEof) return null
+            invalidFrame("missing binary body length")
+        }
+        val rest = ByteArray(3)
+        try {
+            input.readFully(rest)
         } catch (_: EOFException) {
-            return@withContext null
+            invalidFrame("truncated frame length")
         }
-        if (size <= 0 || size > maxFrameBytes) {
-            QlhLogger.w(
-                "TaskWorkerClient",
-                "invalid frame length size=$size max=$maxFrameBytes",
-            )
-            throw TaskWorkerProtocolException("invalid task worker frame length", "invalid_frame", "message")
-        }
+        return (first shl 24) or ((rest[0].toInt() and 255) shl 16) or
+            ((rest[1].toInt() and 255) shl 8) or (rest[2].toInt() and 255)
+    }
+
+    private fun readFrameBytes(size: Int): ByteArray {
         val bytes = ByteArray(size)
         try {
             input.readFully(bytes)
-        } catch (error: java.io.IOException) {
-            QlhLogger.w(
-                "TaskWorkerClient",
-                "frame body read failed size=$size " +
-                    "${error::class.simpleName}: ${error.message ?: ""}",
-            )
-            throw error
+        } catch (_: EOFException) {
+            invalidFrame("truncated frame body")
         }
-        QlhLogger.d("TaskWorkerClient", "frame received size=$size")
+        return bytes
+    }
+
+    private suspend fun receiveOuter(): OuterFrame? = withContext(Dispatchers.IO) {
+        val size = readFrameLength(allowCleanEof = true) ?: return@withContext null
+        if (size <= 0 || size > maxFrameBytes) invalidFrame("invalid task worker frame length")
+        val bytes = readFrameBytes(size)
         val root = try {
-            JsonParser.parseString(String(bytes, StandardCharsets.UTF_8))
+            val text = StandardCharsets.UTF_8.newDecoder()
+                .onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
+                .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT)
+                .decode(java.nio.ByteBuffer.wrap(bytes)).toString()
+            JsonParser.parseString(text)
         } catch (error: Exception) {
             throw TaskWorkerProtocolException("task worker frame is not valid JSON", "invalid_frame", "message").also {
                 it.initCause(error)
             }
         }
-        if (!root.isJsonObject) throw TaskWorkerProtocolException("task worker frame must be an object", "invalid_frame", "message")
+        if (!root.isJsonObject) invalidFrame("task worker frame must be an object")
         val objectValue = root.asJsonObject
-        // ★ 票 21a（COMM-WIRE-01）：二进制帧在元数据段之后还有**一个长度前缀的数据段**。
-        //   这里就地还原成内联 base64，使调用方（协议解码与执行器）完全不必知道二进制
-        //   路径存在 —— 与 python 侧"在 decode 之前放回"同一做法。
-        if (objectValue.get("format")?.takeIf { it.isJsonPrimitive }?.asString == "binary") {
-            val bodySize = try {
-                input.readInt()
-            } catch (_: EOFException) {
-                return@withContext null
-            }
-            if (bodySize <= 0 || bodySize > maxFrameBytes) {
-                QlhLogger.w(
-                    "TaskWorkerClient",
-                    "invalid binary body length size=$bodySize max=$maxFrameBytes",
-                )
-                throw TaskWorkerProtocolException("invalid task worker frame length", "invalid_frame", "message")
-            }
-            val body = ByteArray(bodySize)
-            input.readFully(body)
-            val data = objectValue.getAsJsonObject("data")
-            if (data != null) {
-                TaskWorkerBinaryHidden.restore(
-                    body,
-                    data.get("message_type")?.takeIf { it.isJsonPrimitive }?.asString,
-                    data.getAsJsonObject("payload"),
-                )
-            }
-            QlhLogger.d("TaskWorkerClient", "binary frame merged size=$bodySize")
-            // 还原后本帧与旧路径同形，后续校验与调用方一视同仁。
-            objectValue.addProperty("format", "json")
+        val formatValue = objectValue.get("format")
+        if (formatValue == null || !formatValue.isJsonPrimitive || !formatValue.asJsonPrimitive.isString) {
+            invalidFrame("task worker frame format must be a string", "format")
         }
-        if (objectValue.get("format")?.asString != "json") {
-            throw TaskWorkerProtocolException("unexpected task worker frame", "invalid_frame", "format")
+        val binary = formatValue.asString == "binary"
+        if (binary) {
+            if (!binaryHiddenEnabled || !masterBinaryHiddenEnabled) {
+                invalidFrame("binary hidden was not negotiated on this connection", "format")
+            }
+            if (objectValue.get("type")?.let {
+                    it.isJsonPrimitive && it.asJsonPrimitive.isString && it.asString == "task_worker"
+                } != true) invalidFrame("binary hidden requires a task_worker frame", "type")
+            val data = objectValue.get("data")?.takeIf { it.isJsonObject }?.asJsonObject
+                ?: invalidFrame("binary hidden data must be an object", "data")
+            val payload = data.get("payload")?.takeIf { it.isJsonObject }?.asJsonObject
+                ?: invalidFrame("binary hidden payload must be an object", "data.payload")
+            val messageType = data.get("message_type")?.takeIf {
+                it.isJsonPrimitive && it.asJsonPrimitive.isString
+            }?.asString
+            TaskWorkerBinaryHidden.restoreTarget(messageType, payload)
+            val declared = objectValue.get("binary_bytes")?.takeIf {
+                it.isJsonPrimitive && it.asJsonPrimitive.isNumber
+            }?.asString?.takeIf { it.matches(Regex("[0-9]+")) }?.toLongOrNull()
+                ?: invalidFrame("binary_bytes must be an integer", "binary_bytes")
+            if (declared <= 0 || declared > minOf(maxFrameBytes, TaskWorkerProtocol.MAX_BINARY_FRAME_BYTES).toLong() -
+                size.toLong() - TaskWorkerBinaryHidden.HEADER_BYTES) {
+                invalidFrame("binary frame exceeds maximum size", "binary_bytes")
+            }
+            val bodySize = requireNotNull(readFrameLength())
+            if (bodySize.toLong() != declared) invalidFrame("binary body length does not match binary_bytes", "binary_bytes")
+            TaskWorkerBinaryHidden.restore(readFrameBytes(bodySize), messageType, payload)
+        } else if (formatValue.asString != "json") {
+            invalidFrame("unexpected task worker frame", "format")
         }
-        objectValue
+        OuterFrame(objectValue, binary)
     }
 
     suspend fun register(registration: TaskWorkerRegistration) {
@@ -538,7 +555,7 @@ internal class SocketTaskWorkerTransport(
                 ),
             ),
         )
-        val ack = receiveOuter() ?: throw EOFException("coordinator closed during register")
+        val ack = receiveOuter()?.value ?: throw EOFException("coordinator closed during register")
         if (ack.get("type")?.asString != "register") {
             throw TaskWorkerProtocolException("expected register acknowledgement", "unexpected_message_type", "type")
         }
@@ -557,7 +574,8 @@ internal class SocketTaskWorkerTransport(
 
     override suspend fun receiveEvent(): TaskWorkerInboundEvent {
         while (true) {
-            val objectValue = receiveOuter() ?: return TaskWorkerInboundEvent.Closed
+            val frame = receiveOuter() ?: return TaskWorkerInboundEvent.Closed
+            val objectValue = frame.value
             when (objectValue.get("type")?.asString) {
                 "task_worker" -> {
                     val data = objectValue.get("data")
@@ -586,7 +604,8 @@ internal class SocketTaskWorkerTransport(
                             }),
                     )
                     val decoded = try {
-                        TaskWorkerProtocol.decode(
+                        if (frame.binaryHidden) TaskWorkerProtocol.decodeRestoredBinary(admittedData)
+                        else TaskWorkerProtocol.decode(
                             gson.toJson(admittedData).toByteArray(StandardCharsets.UTF_8)
                         )
                     } catch (error: Exception) {
@@ -602,6 +621,10 @@ internal class SocketTaskWorkerTransport(
                                 " ${error::class.simpleName}: ${error.message ?: ""}",
                         )
                         throw error
+                    }
+                    if (decoded.messageType == TaskWorkerProtocol.HELLO_ACK) {
+                        masterBinaryHiddenEnabled = binaryHiddenEnabled &&
+                            decoded.payload["accepted"] == true && decoded.payload["binary_hidden"] == true
                     }
                     return TaskWorkerInboundEvent.Envelope(decoded)
                 }
@@ -729,6 +752,8 @@ class SocketTaskWorkerTransportFactory(
 }
 
 fun interface TaskWorkerStageHandler {
+    /** Set by the owning connection immediately before execution; defaults to JSON budget. */
+    fun setBinaryHiddenEnabled(enabled: Boolean) = Unit
     suspend fun execute(offer: TaskWorkerEnvelope): TaskWorkerStageExecution
 
     /**
@@ -932,8 +957,8 @@ class TaskWorkerClient(
                 transport = opened
                 machine.onConnected()
                 publish()
-                // ★ 票 21a（COMM-WIRE-01）：把"本进程是否声明 binary_hidden"告知连接，
-                //   出站帧据此决定是否走二进制体（与 python 侧同一策略：声明即双向）。
+                // Local receive support and the master's explicit ACK are independent.
+                // A new connection or refreshed hello starts with outbound binary disabled.
                 val helloCapabilities = capabilities()
                 opened.setBinaryHiddenEnabled(
                     helloCapabilities["binary_hidden"] == true,
@@ -1045,7 +1070,7 @@ class TaskWorkerClient(
                             },
                             refreshHello = {
                                 if (transport !== connection || machine.snapshot().connection != TaskWorkerConnectionState.READY) throw CancellationException("supply connection retired")
-                                // ★ 票 21a：能力刷新时同步更新出站帧的二进制开关。
+                                // Refresh receive support and wait for a new explicit master ACK.
                                 val refreshCapabilities = capabilities()
                                 connection.setBinaryHiddenEnabled(
                                     refreshCapabilities["binary_hidden"] == true,
@@ -1199,6 +1224,7 @@ class TaskWorkerClient(
         publish()
         executionJob = scope.launch {
             try {
+                handler.setBinaryHiddenEnabled(connection.isBinaryHiddenNegotiated)
                 val execution = modelPrepareHandler?.executeStage(effectiveOffer) { handler.execute(effectiveOffer) }
                     ?: handler.execute(effectiveOffer)
                 if (isAttemptCancelling(identity)) {

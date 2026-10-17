@@ -194,6 +194,25 @@ class AndroidFullWorkerStageExecutorTest {
     }
 
     @Test
+    fun `binary negotiation permits output above the JSON budget and disabling restores the guard`() = runBlocking {
+        val nEmbd = 1_600_000
+        val executor = layerExecutor(nEmbd)
+        val offer = layerForwardOffer(nEmbd)
+        executor.setBinaryHiddenEnabled(true)
+        val result = executor.execute(offer)
+        val raw = java.util.Base64.getDecoder().decode(result.output["hidden_out_f32"] as String)
+        assertEquals(nEmbd * 4, raw.size)
+        assertEquals(StageChunkAssembler.sha256Hex(raw), result.output["hidden_out_sha256"])
+        executor.setBinaryHiddenEnabled(false)
+        try {
+            executor.execute(offer)
+            assertTrue("JSON budget must be restored", false)
+        } catch (error: AndroidFullWorkerStageException) {
+            assertEquals("stage_result_too_large", error.code)
+        }
+    }
+
+    @Test
     fun `layer-only worker rejects stale full offers without disturbing its artifact`() = runBlocking {
         val artifactIdentity = model + mapOf(
             "model_id" to "tail-2-4.gguf",

@@ -61,6 +61,8 @@ object TaskWorkerProtocol {
     const val LAYER_FORWARD_STAGE = "layer_forward"
 
     const val MAX_MESSAGE_BYTES = 8 * 1024 * 1024
+    /** Metadata + binary body header + raw; excludes the outer metadata length prefix. */
+    const val MAX_BINARY_FRAME_BYTES = MAX_MESSAGE_BYTES + 1024
     const val ANDROID_WORKER_KIND = "android_full_worker"
 
     const val HELLO = "hello"
@@ -78,6 +80,7 @@ object TaskWorkerProtocol {
      * 与主仓 `task_worker_protocol` 的同名消息与上限同值。
      */
     const val STAGE_CHUNK = "stage_chunk"
+    const val STAGE_RESULT_CHUNK = "stage_result_chunk"
     const val MAX_STAGE_CHUNKS = 64
     const val STAGE_CHUNK_BYTES = 1 shl 20
     const val MAX_STAGE_PAYLOAD_BYTES = MAX_STAGE_CHUNKS * STAGE_CHUNK_BYTES
@@ -138,7 +141,7 @@ object TaskWorkerProtocol {
     private val safeCode = Regex("^[a-z][a-z0-9_]{0,63}$")
     private val messageTypes = setOf(
         HELLO, HELLO_ACK, STAGE_OFFER, STAGE_ACCEPT, LEASE_RENEW,
-        STAGE_RESULT, STAGE_ERROR, STAGE_CANCEL, STAGE_CANCELLED, STAGE_CHUNK,
+        STAGE_RESULT, STAGE_ERROR, STAGE_CANCEL, STAGE_CANCELLED, STAGE_CHUNK, STAGE_RESULT_CHUNK,
     )
 
     fun buildHello(
@@ -357,7 +360,13 @@ object TaskWorkerProtocol {
             fail("message is not valid JSON", "invalid_json", "message", error)
         }
         if (!root.isJsonObject) fail("message must be an object", "invalid_envelope", "message")
-        val objectValue = root.asJsonObject
+        return decodeObject(root.asJsonObject)
+    }
+
+    /** The transport already checked the metadata and raw wire budget before restoration. */
+    internal fun decodeRestoredBinary(root: JsonObject): TaskWorkerEnvelope = decodeObject(root)
+
+    private fun decodeObject(objectValue: JsonObject): TaskWorkerEnvelope {
         requireExact(objectValue, envelopeFields, "message")
         val payloadElement = objectValue.get("payload")
         if (payloadElement == null || !payloadElement.isJsonObject) {
@@ -453,8 +462,10 @@ object TaskWorkerProtocol {
             } else {
                 emptySet()
             }
+        val optionalBinaryAck = if (envelope.messageType == HELLO_ACK && envelope.payload.containsKey("binary_hidden"))
+            setOf("binary_hidden") else emptySet()
         val optionalPrepare = if (envelope.messageType == STAGE_OFFER && envelope.payload.containsKey("prepare_identity")) setOf("prepare_identity") else emptySet()
-        requireExact(envelope.payload.keys, allowedFields + optionalPrepare, "payload")
+        requireExact(envelope.payload.keys, allowedFields + optionalPrepare + optionalBinaryAck, "payload")
         if (optionalPrepare.isNotEmpty()) {
             val prepare = envelope.payload["prepare_identity"] as? Map<*, *>
                 ?: fail("prepare_identity must be an object", "invalid_prepare_identity", "payload.prepare_identity")
@@ -596,6 +607,9 @@ object TaskWorkerProtocol {
         // ★ 2026-10-07（DIST-NEXT-2b）：分片接收能力（可选，布尔）。
         if (capabilities.containsKey("stage_chunked_input")) {
             boolean(capabilities, "stage_chunked_input")
+        }
+        if (capabilities.containsKey("binary_hidden")) {
+            boolean(capabilities, "binary_hidden")
         }
         val stageTypes = stringList(capabilities, "stage_types")
         if (!AndroidWorkerCapabilities.areAllStageTypesSupported(stageTypes)) {
@@ -826,8 +840,17 @@ object TaskWorkerProtocol {
     private fun validateHelloAck(payload: Map<String, Any?>, version: Int) {
         requirePattern(string(payload, "coordinator_node_id"), safeId, "payload.coordinator_node_id")
         val accepted = boolean(payload, "accepted")
+        if (payload.containsKey("binary_hidden")) {
+            val binary = boolean(payload, "binary_hidden")
+            if (binary && (!accepted || version < 3)) {
+                fail("binary hidden requires an accepted v3 hello", "invalid_negotiation_result", "payload.binary_hidden")
+            }
+        }
         val selected = integer(payload, "selected_version", allowZero = true)
         val reason = code(payload, "reason_code", allowEmpty = true)
+        if (payload["binary_hidden"] == true && selected < 3) {
+            fail("binary hidden requires selected v3", "invalid_negotiation_result", "payload.binary_hidden")
+        }
         if (accepted && (selected < MIN_VERSION || selected > version || reason.isNotEmpty())) {
             fail(
                 "accepted hello_ack must select a version in v$MIN_VERSION..v$VERSION without a reason",
@@ -844,7 +867,7 @@ object TaskWorkerProtocol {
         val payload = envelope.payload
         validateIdentity(payload)
         val type = envelope.messageType
-        if (type in setOf(STAGE_OFFER, STAGE_ACCEPT, STAGE_RESULT, STAGE_ERROR, STAGE_CANCELLED, STAGE_CHUNK)) {
+        if (type in setOf(STAGE_OFFER, STAGE_ACCEPT, STAGE_RESULT, STAGE_ERROR, STAGE_CANCELLED, STAGE_CHUNK, STAGE_RESULT_CHUNK)) {
             requirePattern(string(payload, "provider_id"), safeId, "payload.provider_id")
         }
         when (type) {
@@ -896,8 +919,8 @@ object TaskWorkerProtocol {
             }
             STAGE_CANCEL -> code(payload, "reason_code")
             // ★ 2026-10-07（DIST-NEXT-2b）：分片的形状与硬上限（顺序语义由
-            // `StageChunkAssembler` 保证）。android 侧只接收，不发送。
-            STAGE_CHUNK -> {
+            // `StageChunkAssembler` 保证）。回程分片与输入分片共用形状。
+            STAGE_CHUNK, STAGE_RESULT_CHUNK -> {
                 val chunkCount = integer(payload, "chunk_count")
                 if (chunkCount > MAX_STAGE_CHUNKS) {
                     fail(
@@ -1238,7 +1261,7 @@ object TaskWorkerProtocol {
         STAGE_CANCEL -> identityFields + setOf("reason_code")
         STAGE_CANCELLED -> identityFields + setOf("provider_id", "reason_code")
         // ★ 2026-10-07（DIST-NEXT-2b）：大 payload 分片（与主仓 `_PAYLOAD_FIELDS` 同键集）。
-        STAGE_CHUNK -> identityFields + setOf(
+        STAGE_CHUNK, STAGE_RESULT_CHUNK -> identityFields + setOf(
             "provider_id", "chunk_index", "chunk_count", "payload_b64",
             "payload_sha256", "total_bytes",
         )
