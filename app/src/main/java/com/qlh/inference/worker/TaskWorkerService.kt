@@ -497,6 +497,9 @@ class TaskWorkerService : Service() {
                 // ★ 2026-10-07（DIST-NEXT-2b）：本构建已接线分片输入（`stage_chunk`
                 //   接收 + `hidden_ref` 装配）⇒ 声明给主节点。
                 stageChunkedInput = true,
+                // ★ 票 21a（COMM-WIRE-01）：本构建已接线二进制 hidden 帧
+                //   （`TaskWorkerBinaryHidden` 抽取/放回 + 帧层数据段）⇒ 声明给主节点。
+                binaryHidden = true,
             )
             QlhLogger.i(
                 "TaskWorkerService",

@@ -307,6 +307,12 @@ object AndroidWorkerCapabilities {
          * `stage_offer.root_input.hidden_ref`）。默认 `false`；只有接线完成的构建才声明。
          */
         stageChunkedInput: Boolean = false,
+        /**
+         * ★ 票 21a（COMM-WIRE-01）：是否声明能**收发二进制 hidden 帧**
+         * （`format:"binary"`，帧体为原始字节）。默认 `false`；只有接线完成的构建
+         * 才声明 —— 未声明的节点不会被主节点发二进制帧，仍走 base64。
+         */
+        binaryHidden: Boolean = false,
     ): Map<String, Any?> {
         require(
             layerArtifacts.map { it.startLayer to it.endLayerExclusive }.distinct().size ==
@@ -379,6 +385,10 @@ object AndroidWorkerCapabilities {
         // ★ 2026-10-07（DIST-NEXT-2b）：声明能接收分片输入（`stage_chunk` + `hidden_ref`）。
         //   只在此接线完成的构建里开启 —— 未声明的对端不会被主节点发分片。
         if (stageChunkedInput) capabilities["stage_chunked_input"] = true
+        // ★ 票 21a（COMM-WIRE-01）：声明能收发二进制 hidden 帧。声明后本节点与主节点
+        //   之间的层段 hidden 走原始字节（省 base64 的 33% 膨胀，单帧容量 +≈33%）；
+        //   主节点只在看到该键时才发二进制帧，故未声明/关闭即天然回退。
+        if (binaryHidden) capabilities["binary_hidden"] = true
         return capabilities
     }
 }

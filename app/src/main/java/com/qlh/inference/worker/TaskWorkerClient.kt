@@ -325,6 +325,8 @@ interface TaskWorkerTransport {
     suspend fun sendModelPrepare(data: com.google.gson.JsonObject) { throw TaskWorkerProtocolException("prepare transport unavailable", "prepare_transport_unavailable") }
     fun requireControlAuthority() = Unit
     suspend fun sendHeartbeat(nodeId: String, sentAtMs: Long) = Unit
+    /** ★ 票 21a：告知本连接"本进程已声明 `binary_hidden`"，出站帧据此走二进制体。 */
+    fun setBinaryHiddenEnabled(enabled: Boolean) = Unit
     suspend fun close()
 }
 
@@ -361,11 +363,31 @@ internal class SocketTaskWorkerTransport(
     private val sendLock = Any()
     private val gson = GsonBuilder().disableHtmlEscaping().create()
 
-    private suspend fun sendOuter(type: String, data: Any? = null) = withContext(Dispatchers.IO) {
+    /**
+     * ★ 票 21a（COMM-WIRE-01）：本进程是否声明了 `binary_hidden`（由 [TaskWorkerClient]
+     * 在发出 hello 时按该 hello 的能力设置）。只有为真时出站帧才走二进制体；为假时
+     * 帧与旧路径**逐字节一致**。
+     */
+    @Volatile
+    private var binaryHiddenEnabled: Boolean = false
+
+    override fun setBinaryHiddenEnabled(enabled: Boolean) {
+        binaryHiddenEnabled = enabled
+    }
+
+    private suspend fun sendOuter(
+        type: String,
+        data: Any? = null,
+        binaryBody: ByteArray? = null,
+    ) = withContext(Dispatchers.IO) {
         val dataJson = data?.let { ",\"data\":${gson.toJson(it)}" } ?: ""
-        val outer = "{\"type\":\"$type\",\"format\":\"json\"$dataJson}"
+        // ★ 票 21a（COMM-WIRE-01）：二进制体独立成段，元数据里只留格式标记与长度。
+        val format = if (binaryBody == null) "json" else "binary"
+        val binaryJson = binaryBody?.let { ",\"binary_bytes\":${it.size}" } ?: ""
+        val outer = "{\"type\":\"$type\",\"format\":\"$format\"$binaryJson$dataJson}"
             .toByteArray(StandardCharsets.UTF_8)
-        if (outer.size > maxFrameBytes) throw TaskWorkerProtocolException(
+        val bodyBytes = binaryBody?.let { TaskWorkerBinaryHidden.HEADER_BYTES + it.size } ?: 0
+        if (outer.size + bodyBytes > maxFrameBytes) throw TaskWorkerProtocolException(
             "task worker frame exceeds maximum size",
             "message_too_large",
             "message",
@@ -373,13 +395,26 @@ internal class SocketTaskWorkerTransport(
         synchronized(sendLock) {
             output.writeInt(outer.size)
             output.write(outer)
+            if (binaryBody != null) {
+                output.writeInt(binaryBody.size)
+                output.write(binaryBody)
+            }
             output.flush()
         }
     }
 
     override suspend fun send(envelope: TaskWorkerEnvelope) = withContext(Dispatchers.IO) {
         val inner = JsonParser.parseString(TaskWorkerProtocol.encode(envelope).toString(StandardCharsets.UTF_8)).asJsonObject
-        sendOuter("task_worker", controlFence.decorate(inner))
+        // ★ 票 21a：本进程声明了 `binary_hidden` 时，把内联载荷抽成帧的二进制体。
+        //   声明后仍能握手成功 ⇒ 主节点认识这个键 ⇒ 支持二进制帧（旧主节点会以
+        //   `invalid_fields` 拒绝 hello，连接根本建立不起来）。未声明时不传第二个
+        //   参数，帧与旧路径逐字节一致。
+        val (body, binaryBody) = TaskWorkerBinaryHidden.split(inner, binaryHiddenEnabled)
+        if (binaryBody == null) {
+            sendOuter("task_worker", controlFence.decorate(body))
+        } else {
+            sendOuter("task_worker", controlFence.decorate(body), binaryBody)
+        }
     }
 
     override fun requireControlAuthority() {
@@ -426,6 +461,36 @@ internal class SocketTaskWorkerTransport(
         }
         if (!root.isJsonObject) throw TaskWorkerProtocolException("task worker frame must be an object", "invalid_frame", "message")
         val objectValue = root.asJsonObject
+        // ★ 票 21a（COMM-WIRE-01）：二进制帧在元数据段之后还有**一个长度前缀的数据段**。
+        //   这里就地还原成内联 base64，使调用方（协议解码与执行器）完全不必知道二进制
+        //   路径存在 —— 与 python 侧"在 decode 之前放回"同一做法。
+        if (objectValue.get("format")?.takeIf { it.isJsonPrimitive }?.asString == "binary") {
+            val bodySize = try {
+                input.readInt()
+            } catch (_: EOFException) {
+                return@withContext null
+            }
+            if (bodySize <= 0 || bodySize > maxFrameBytes) {
+                QlhLogger.w(
+                    "TaskWorkerClient",
+                    "invalid binary body length size=$bodySize max=$maxFrameBytes",
+                )
+                throw TaskWorkerProtocolException("invalid task worker frame length", "invalid_frame", "message")
+            }
+            val body = ByteArray(bodySize)
+            input.readFully(body)
+            val data = objectValue.getAsJsonObject("data")
+            if (data != null) {
+                TaskWorkerBinaryHidden.restore(
+                    body,
+                    data.get("message_type")?.takeIf { it.isJsonPrimitive }?.asString,
+                    data.getAsJsonObject("payload"),
+                )
+            }
+            QlhLogger.d("TaskWorkerClient", "binary frame merged size=$bodySize")
+            // 还原后本帧与旧路径同形，后续校验与调用方一视同仁。
+            objectValue.addProperty("format", "json")
+        }
         if (objectValue.get("format")?.asString != "json") {
             throw TaskWorkerProtocolException("unexpected task worker frame", "invalid_frame", "format")
         }
@@ -867,9 +932,15 @@ class TaskWorkerClient(
                 transport = opened
                 machine.onConnected()
                 publish()
+                // ★ 票 21a（COMM-WIRE-01）：把"本进程是否声明 binary_hidden"告知连接，
+                //   出站帧据此决定是否走二进制体（与 python 侧同一策略：声明即双向）。
+                val helloCapabilities = capabilities()
+                opened.setBinaryHiddenEnabled(
+                    helloCapabilities["binary_hidden"] == true,
+                )
                 opened.send(TaskWorkerProtocol.buildHello(
                     nodeId = nodeId,
-                    capabilities = capabilities(),
+                    capabilities = helloCapabilities,
                     messageId = newMessageId("hello"),
                     sentAtMs = clockMs(),
                 ))
@@ -974,7 +1045,12 @@ class TaskWorkerClient(
                             },
                             refreshHello = {
                                 if (transport !== connection || machine.snapshot().connection != TaskWorkerConnectionState.READY) throw CancellationException("supply connection retired")
-                                connection.send(TaskWorkerProtocol.buildHello(nodeId, capabilities(), newMessageId("hello"), clockMs()))
+                                // ★ 票 21a：能力刷新时同步更新出站帧的二进制开关。
+                                val refreshCapabilities = capabilities()
+                                connection.setBinaryHiddenEnabled(
+                                    refreshCapabilities["binary_hidden"] == true,
+                                )
+                                connection.send(TaskWorkerProtocol.buildHello(nodeId, refreshCapabilities, newMessageId("hello"), clockMs()))
                             }, authorize = {
                                 if (transport !== connection || machine.snapshot().connection != TaskWorkerConnectionState.READY) throw CancellationException("supply connection retired")
                                 connection.requireControlAuthority()
