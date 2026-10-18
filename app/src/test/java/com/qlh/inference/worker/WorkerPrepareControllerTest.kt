@@ -494,4 +494,68 @@ class WorkerPrepareControllerTest {
         )
         bad.forEach { data -> try { WorkerPrepareRequest.parse(data); fail("accepted $data") } catch (_: WorkerPrepareException) {} }
     }
+    private fun policy(): JsonObject = JsonParser.parseString("""{
+        "schema_version":1,"device":"cpu","dtype":"artifact","quant_type":"artifact","context_size":4096,
+        "kv_device":"cpu","kv_dtype":"float16","kv_policy":"preallocated","components":["final_norm","layers","lm_head"],
+        "materialization":"gguf_segment","kv_cache_bytes":0,"batch_size":4096,"sequence_count":1
+    }""").asJsonObject
+
+    private fun boundIdentity(spec: JsonObject = policy()): JsonObject = identity().apply {
+        val bytes = com.qlh.inference.service.canonicalSupplyJson(spec).toByteArray(Charsets.UTF_8)
+        val sha = java.security.MessageDigest.getInstance("SHA-256").digest(bytes)
+            .joinToString("") { "%02x".format(it.toInt() and 255) }
+        addProperty("load_spec_digest", sha)
+    }
+
+    @Test fun `frozen policy is loaded once and actual receipt survives commit`() = runBlocking {
+        val spec = policy(); val id = boundIdentity(spec)
+        var policyLoads = 0
+        val runtime = object : Runtime() {
+            override suspend fun loadWithSpec(identity: WorkerPrepareIdentity, spec: JsonObject) {
+                assertEquals(policy(), spec); policyLoads++; super.load(identity)
+            }
+            override suspend fun receipt(identity: WorkerPrepareIdentity, spec: JsonObject): JsonObject = JsonObject().apply {
+                add("load_spec", spec.deepCopy()); addProperty("materialized_bytes", 17)
+                addProperty("memory_scope", "weight_tensors"); add("layer_range", identity.wire()["layer_range"])
+                addProperty("artifact_sha256", identity.text("artifact_sha256"))
+            }
+        }
+        val c = WorkerPrepareController(node, runtime)
+        val prepare = request("prepare", id).apply { add("load_spec", spec) }
+        val first = transact(c, prepare, this)
+        assertEquals("prepared", first["status"].asString)
+        assertEquals(17, first.getAsJsonObject("runtime_receipt")["materialized_bytes"].asInt)
+        assertEquals(first, transact(c, prepare, this)); assertEquals(1, policyLoads)
+        val committed = transact(c, request("commit", id), this)
+        assertEquals("ready", committed["status"].asString)
+        assertEquals(first["runtime_receipt"], committed["runtime_receipt"])
+        // A stage tuple with the old fields omits the frozen policy digest.
+        assertEquals("prepare_identity_mismatch", c.validateStage(offer(id)))
+    }
+
+    @Test fun `missing actual receipt aborts the newly materialized native slot`() = runBlocking {
+        val id = boundIdentity()
+        val runtime = object : Runtime() {
+            override suspend fun loadWithSpec(identity: WorkerPrepareIdentity, spec: JsonObject) { super.load(identity) }
+        }
+        val c = WorkerPrepareController(node, runtime)
+        val response = transact(c, request("prepare", id).apply { add("load_spec", policy()) }, this)
+        assertEquals("error", response["status"].asString)
+        assertEquals("prepare_runtime_receipt_missing", response["error"].asString)
+        assertFalse(runtime.hasRuntime()); assertNull(c.committedIdentity())
+    }
+
+    @Test fun `policy digest context device and duplicate components are exact`() {
+        val valid = request("prepare", boundIdentity()).apply { add("load_spec", policy()) }
+        assertNotNull(WorkerPrepareRequest.parse(valid).loadSpec)
+        val bad = listOf(
+            valid.deepCopy().apply { remove("load_spec") },
+            valid.deepCopy().apply { getAsJsonObject("load_spec").addProperty("kv_cache_bytes", 1) },
+            valid.deepCopy().apply { getAsJsonObject("load_spec").addProperty("context_size", 2048) },
+            valid.deepCopy().apply { getAsJsonObject("load_spec").addProperty("device", "cuda:0") },
+            valid.deepCopy().apply { getAsJsonObject("load_spec").add("components", JsonParser.parseString("[\"final_norm\",\"layers\",\"layers\",\"lm_head\"]")) },
+        )
+        bad.forEach { data -> try { WorkerPrepareRequest.parse(data); fail("accepted $data") } catch (_: WorkerPrepareException) {} }
+    }
+
 }

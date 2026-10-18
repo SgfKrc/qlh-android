@@ -25,7 +25,7 @@ internal class WorkerPrepareIdentity private constructor(private val value: Json
     val mode: String get() = text("segment_mode")
     val stageIdentity: Map<String, Any?> get() = value["stage_model_identity"].asJsonObject.entrySet().associate { it.key to it.value.asString }
     fun stageTuple(): JsonObject = JsonObject().apply {
-        for (key in STAGE_KEYS) add(key, value[key].deepCopy())
+        for (key in STAGE_KEYS + OPTIONAL_KEYS) if (value.has(key)) add(key, value[key].deepCopy())
     }
     override fun equals(other: Any?): Boolean = other is WorkerPrepareIdentity && exactKey == other.exactKey
     override fun hashCode(): Int = exactKey.hashCode()
@@ -41,6 +41,7 @@ internal class WorkerPrepareIdentity private constructor(private val value: Json
     }
 
     companion object {
+        val OPTIONAL_KEYS = setOf("load_spec_digest")
         private val ID = Regex("[A-Za-z0-9_.:/-]{1,256}")
         val STAGE_KEYS = setOf("operation_id", "config_id", "generation", "assignment_id", "artifact_sha256")
         private val KEYS = STAGE_KEYS + setOf("node_id", "model_id", "model_sha256", "stage_model_identity", "manifest_sha256",
@@ -59,7 +60,8 @@ internal class WorkerPrepareIdentity private constructor(private val value: Json
             return n!!
         }
         fun parse(j: JsonObject): WorkerPrepareIdentity {
-            checkPrepare(j.keySet() == KEYS, detail = "identity fields")
+            checkPrepare(j.keySet() - OPTIONAL_KEYS == KEYS, detail = "identity fields")
+            if (j.has("load_spec_digest")) checkPrepare(SHA.matches(j["load_spec_digest"].asString), detail = "load spec digest")
             for (key in STAGE_KEYS - "generation" + setOf("node_id", "model_id", "source_model_id", "model_sha256", "manifest_sha256", "source_model_sha256", "tokenizer_sha256", "segment_mode")) {
                 text(j, key, key == "manifest_sha256")
             }
@@ -84,7 +86,7 @@ internal class WorkerPrepareIdentity private constructor(private val value: Json
             return WorkerPrepareIdentity(j.deepCopy())
         }
         fun validateStageTuple(value: Map<*, *>) {
-            checkPrepare(value.keys == STAGE_KEYS, detail = "prepare_identity fields")
+            checkPrepare(value.keys - OPTIONAL_KEYS == STAGE_KEYS, detail = "prepare_identity fields")
             val j = Gson().toJsonTree(value).asJsonObject
             (STAGE_KEYS - "generation").forEach { text(j, it) }
             integer(j["generation"], 1)
@@ -96,13 +98,15 @@ internal class WorkerPrepareIdentity private constructor(private val value: Json
                 validateStageTuple(map)
                 val parsed = Gson().toJsonTree(map).asJsonObject
                 integer(parsed["generation"], 1) == identity.generation &&
-                    (STAGE_KEYS - "generation").all { parsed[it].asString == identity.text(it) }
+                    (STAGE_KEYS - "generation").all { parsed[it].asString == identity.text(it) } &&
+                    parsed.has("load_spec_digest") == identity.value.has("load_spec_digest") &&
+                    (!parsed.has("load_spec_digest") || parsed["load_spec_digest"] == identity.value["load_spec_digest"])
             } catch (_: WorkerPrepareException) { false }
         }
     }
 }
 
-internal data class WorkerPrepareRequest(val action: String, val identity: WorkerPrepareIdentity, val cleanupId: String?) {
+internal data class WorkerPrepareRequest(val action: String, val identity: WorkerPrepareIdentity, val cleanupId: String?, val loadSpec: JsonObject? = null) {
     fun ack(status: String, loaded: Boolean, error: String? = null): JsonObject = JsonObject().apply {
         addProperty("action", "ack"); addProperty("phase", action); add("identity", identity.wire())
         addProperty("status", status); addProperty("loaded", loaded)
@@ -112,7 +116,7 @@ internal data class WorkerPrepareRequest(val action: String, val identity: Worke
         fun parse(data: JsonObject): WorkerPrepareRequest {
             val action = WorkerPrepareIdentity.text(data, "action")
             checkPrepare(action in setOf("prepare", "commit", "abort", "finalize", "release"), detail = "action")
-            val fields = setOf("action", "identity") + if (action == "prepare") setOf("context_size", "middle_channel")
+            val fields = (if (data.has("load_spec")) setOf("load_spec") else emptySet()) + setOf("action", "identity") + if (action == "prepare") setOf("context_size", "middle_channel")
                 else if (action in setOf("abort", "finalize")) setOf("cleanup_id")
                 else if (action == "release" && data.has("cleanup_id")) setOf("cleanup_id") else emptySet()
             checkPrepare(data.keySet() == fields, detail = "request fields")
@@ -121,8 +125,40 @@ internal data class WorkerPrepareRequest(val action: String, val identity: Worke
                 checkPrepare(WorkerPrepareIdentity.text(data, "middle_channel") == "keep_head_layer_out", detail = "middle_channel")
             }
             checkPrepare(data["identity"].isJsonObject, detail = "identity object")
-            return WorkerPrepareRequest(action, WorkerPrepareIdentity.parse(data["identity"].asJsonObject),
-                if (data.has("cleanup_id")) WorkerPrepareIdentity.text(data, "cleanup_id") else null)
+            val identity = WorkerPrepareIdentity.parse(data["identity"].asJsonObject)
+            val spec = if (data.has("load_spec")) data["load_spec"].asJsonObject.deepCopy() else null
+            if (action == "prepare" && identity.wire().has("load_spec_digest")) {
+                checkPrepare(spec != null, "prepare_load_spec_missing", "load spec required")
+                WorkerPrepareLoadSpec.validate(requireNotNull(spec), identity, data["context_size"].asInt)
+            } else checkPrepare(spec == null, detail = "unexpected load spec")
+            return WorkerPrepareRequest(action, identity,
+                if (data.has("cleanup_id")) WorkerPrepareIdentity.text(data, "cleanup_id") else null, spec)
         }
+    }
+}
+
+/** Android's resolved CPU GGUF policy; unknown materialization never falls back. */
+internal object WorkerPrepareLoadSpec {
+    private val keys = setOf("device", "dtype", "quant_type", "context_size", "kv_device", "kv_dtype", "kv_policy",
+        "components", "materialization", "kv_cache_bytes", "batch_size", "sequence_count", "schema_version")
+    fun validate(spec: JsonObject, identity: WorkerPrepareIdentity, context: Int) {
+        checkPrepare(spec.keySet() == keys, detail = "load spec fields")
+        val expected = mutableSetOf("layers")
+        if (identity.mode == "head") expected.add("embedding")
+        if (identity.mode == "tail") expected.addAll(setOf("final_norm", "lm_head"))
+        val components = spec["components"].asJsonArray.map { it.asString }
+        checkPrepare(components == components.sorted() && components.size == expected.size && components.toSet() == expected, detail = "load spec components")
+        for ((key, value) in mapOf("device" to "cpu", "dtype" to "artifact", "quant_type" to "artifact",
+            "kv_device" to "cpu", "kv_dtype" to "float16", "kv_policy" to "preallocated", "materialization" to "gguf_segment")) {
+            checkPrepare(spec[key].asString == value, "prepare_load_spec_unsupported", "unsupported $key")
+        }
+        checkPrepare(WorkerPrepareIdentity.integer(spec["schema_version"]) == 1L &&
+            WorkerPrepareIdentity.integer(spec["context_size"]) == context.toLong() && context == 4096 &&
+            WorkerPrepareIdentity.integer(spec["batch_size"]) == context.toLong() &&
+            WorkerPrepareIdentity.integer(spec["sequence_count"]) == 1L, detail = "load spec dimensions")
+        WorkerPrepareIdentity.integer(spec["kv_cache_bytes"])
+        val sha = java.security.MessageDigest.getInstance("SHA-256")
+            .digest(canonicalSupplyJson(spec).toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it.toInt() and 255) }
+        checkPrepare(sha == identity.text("load_spec_digest"), "prepare_load_spec_digest_mismatch", "load spec digest differs")
     }
 }

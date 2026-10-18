@@ -730,6 +730,8 @@ Java_com_qlh_inference_service_LocalInferenceEngine_nativeGetModelInfo(
 
     put("name", desc);
     put("n_ctx", std::to_string(llama_n_ctx(qctx->ctx)));
+    put("materialized_bytes", std::to_string(llama_model_size(qctx->model)));
+    put("n_batch", std::to_string(llama_n_batch(qctx->ctx)));
     put("n_ctx_train", std::to_string(llama_model_n_ctx_train(qctx->model)));
     put("n_batch", std::to_string(llama_n_batch(qctx->ctx)));
     put("n_ubatch", std::to_string(llama_n_ubatch(qctx->ctx)));

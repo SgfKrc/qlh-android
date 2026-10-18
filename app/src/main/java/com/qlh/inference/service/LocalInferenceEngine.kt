@@ -579,6 +579,20 @@ class LocalInferenceEngine(private val context: Context) {
           }
     }
 
+    internal suspend fun deploymentReceipt(identity: WorkerPrepareIdentity, spec: com.google.gson.JsonObject): com.google.gson.JsonObject = modelMutex.withLock {
+        check(isLoaded && loadedPrepareIdentity == identity && loadedGpuLayers == 0)
+        val info = nativeGetModelInfo(modelPtr)
+        check(info["n_ctx"]?.toIntOrNull() == spec["context_size"].asInt)
+        check(info["n_batch"]?.toIntOrNull() == spec["batch_size"].asInt)
+        val bytes = requireNotNull(info["materialized_bytes"]?.toLongOrNull())
+        check(bytes > 0)
+        com.google.gson.JsonObject().apply {
+            add("load_spec", spec.deepCopy()); addProperty("materialized_bytes", bytes)
+            addProperty("memory_scope", "weight_tensors"); add("layer_range", identity.wire()["layer_range"].deepCopy())
+            addProperty("artifact_sha256", identity.text("artifact_sha256"))
+        }
+    }
+
     internal fun matchesPreparedIdentity(identity: WorkerPrepareIdentity): Boolean = loadedPrepareIdentity == identity
 
     /** Reopen the retained load path, not a selected document or a new inventory result. */

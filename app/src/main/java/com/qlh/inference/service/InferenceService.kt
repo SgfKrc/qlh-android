@@ -370,6 +370,7 @@ class InferenceService : Service() {
         expectedArtifactModelId: String = "",
         expectedSupplyManifestSha256: String? = null,
         prepareIdentity: com.qlh.inference.worker.WorkerPrepareIdentity? = null,
+        frozenCpuPolicy: Boolean = false,
     ): Result<Unit> = inferenceModes.worker({ settings.getInferenceMode() }) {
         androidRuntimeStatusInvalidation.afterModelChange {
             var stage = RuntimePrepareFailure.Stage.SUPPLY
@@ -388,7 +389,7 @@ class InferenceService : Service() {
                 stage = RuntimePrepareFailure.Stage.LOAD
                 loadLayerModel(
                     layerRange, contextSize, extractHidden, expectedModelSha256,
-                    expectedSourceModelId, expectedSourceModelSha256, expectedEmbeddingWidth, expectedArtifactModelId,
+                    expectedSourceModelId, expectedSourceModelSha256, expectedEmbeddingWidth, expectedArtifactModelId, frozenCpuPolicy,
                 ).getOrThrow()
                 Log.i(TAG, "worker prepare native validated range=$layerRange")
                 if (prepareIdentity != null) {
@@ -438,12 +439,13 @@ class InferenceService : Service() {
         expectedSourceModelSha256: String,
         expectedEmbeddingWidth: Int,
         expectedArtifactModelId: String,
+        frozenCpuPolicy: Boolean = false,
     ): Result<Unit> {
         val eng = engine ?: return Result.failure(IllegalStateException("Service 未初始化"))
         if (layerRange.size != 2 || layerRange[1] <= layerRange[0] || layerRange[0] < 0) {
             return Result.failure(IllegalArgumentException("invalid layer range"))
         }
-        val gpuLayers = preferredGpuLayers(eng)
+        val gpuLayers = if (frozenCpuPolicy) 0 else preferredGpuLayers(eng)
         val expectedDigest = expectedModelSha256.trim().lowercase()
         val expectedSourceDigest = expectedSourceModelSha256.trim().lowercase()
         if (eng.isLoaded && eng.loadedLayerRange == layerRange &&

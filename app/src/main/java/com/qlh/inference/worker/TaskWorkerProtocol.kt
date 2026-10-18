@@ -499,6 +499,8 @@ object TaskWorkerProtocol {
         requireExact(
             capabilities.keys,
             expectedCapabilityFields +
+                (if (capabilities.containsKey("engine_capabilities")) setOf("engine_capabilities") else emptySet()) +
+                (if (capabilities.containsKey("load_spec_version")) setOf("load_spec_version") else emptySet()) +
                 (if (capabilities.containsKey("runtime_profile")) setOf("runtime_profile") else emptySet()) +
                 (if (capabilities.containsKey("resource_gate")) setOf("resource_gate") else emptySet()) +
                 (if (capabilities.containsKey("layer_ranges")) setOf("layer_ranges") else emptySet()) +
@@ -621,6 +623,12 @@ object TaskWorkerProtocol {
                 "payload.capabilities.stage_types",
             )
         }
+        val loadSpecVersion = capabilities["load_spec_version"]
+        if (capabilities.containsKey("load_spec_version") &&
+            (!(loadSpecVersion is Int || loadSpecVersion is Long || loadSpecVersion is Short || loadSpecVersion is Byte) ||
+                (loadSpecVersion as Number).toLong() != 1L)) {
+            fail("unsupported load policy schema", "invalid_capabilities", "payload.capabilities.load_spec_version")
+        }
         val engines = stringList(capabilities, "engines")
         if (!AndroidWorkerCapabilities.areAllEnginesSupported(engines)) {
             fail(
@@ -643,6 +651,15 @@ object TaskWorkerProtocol {
                     "payload.capabilities.models[$index].model_id",
                 )
             }
+        }
+        try {
+            EngineRegistry.validateWorkerCapabilities(capabilities)
+        } catch (error: IllegalArgumentException) {
+            fail(error.message ?: "invalid engine capabilities", "invalid_capabilities",
+                "payload.capabilities.engine_capabilities")
+        } catch (error: IllegalStateException) {
+            fail(error.message ?: "invalid engine capabilities", "invalid_capabilities",
+                "payload.capabilities.engine_capabilities")
         }
         val maxConcurrency = integer(capabilities, "max_concurrency")
         if (maxConcurrency != 1) fail("Android workers support one concurrent task", "invalid_capabilities", "payload.capabilities.max_concurrency")

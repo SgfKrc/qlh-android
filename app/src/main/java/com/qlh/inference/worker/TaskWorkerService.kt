@@ -1,5 +1,7 @@
 package com.qlh.inference.worker
 
+import com.google.gson.JsonObject
+
 import android.annotation.SuppressLint
 import android.app.Notification
 import android.app.PendingIntent
@@ -538,7 +540,11 @@ class TaskWorkerService : Service() {
             localSources = modelManager.localCutSources,
         )
         val prepare = WorkerPrepareController(nodeId, object : WorkerPrepareRuntime {
-            override suspend fun load(identity: WorkerPrepareIdentity) {
+            override suspend fun loadWithSpec(identity: WorkerPrepareIdentity, spec: JsonObject) = loadFrozen(identity, spec)
+            override suspend fun receipt(identity: WorkerPrepareIdentity, spec: JsonObject): JsonObject =
+                requireNotNull(QlhApplication.instance.inferenceService?.engine).deploymentReceipt(identity, spec)
+            override suspend fun load(identity: WorkerPrepareIdentity) = loadFrozen(identity, null)
+            private suspend fun loadFrozen(identity: WorkerPrepareIdentity, spec: JsonObject?) {
                 val service = awaitInferenceService() ?: throw IllegalStateException("inference_service_unavailable")
                 service.beginForegroundWork()
                 try {
@@ -550,7 +556,7 @@ class TaskWorkerService : Service() {
                         expectedEmbeddingWidth = identity.hiddenSize,
                         expectedArtifactModelId = identity.stageIdentity["model_id"] as String,
                         expectedSupplyManifestSha256 = identity.text("manifest_sha256"),
-                        prepareIdentity = identity,
+                        prepareIdentity = identity, frozenCpuPolicy = spec != null,
                     ).getOrThrow()
                 } finally { service.endForegroundWork() }
             }

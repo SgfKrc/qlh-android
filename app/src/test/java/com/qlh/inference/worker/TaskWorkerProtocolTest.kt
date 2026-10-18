@@ -818,4 +818,15 @@ class TaskWorkerProtocolTest {
         assertTrue(TaskWorkerProtocol.hiddenWireBytes(2_048L) < budget)
         assertTrue(TaskWorkerProtocol.hiddenWireBytes(2_000_000L) > budget)
     }
+    @Test fun `hello load spec version must be exactly the negotiated schema`() {
+        fun hello(value: Any) = TaskWorkerProtocol.buildHello(
+            nodeId = "android_worker_01", messageId = "msg_hello_load_spec", sentAtMs = 1L,
+            capabilities = mapOf("stage_types" to listOf("full_inference"), "engines" to listOf("llama_cpp"),
+                "models" to listOf(model), "max_concurrency" to 1, "load_spec_version" to value))
+        assertNotNull(TaskWorkerProtocol.decode(TaskWorkerProtocol.encode(hello(1))))
+        listOf(2, true, "1", 1.0).forEach { value ->
+            try { hello(value); fail("accepted schema $value") } catch (_: TaskWorkerProtocolException) {}
+        }
+    }
+
 }

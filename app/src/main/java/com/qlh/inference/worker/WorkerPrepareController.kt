@@ -26,6 +26,8 @@ interface TaskWorkerModelPrepareHandler {
 /** load must verify the exact operation and return only after JNI succeeds; unload must join JNI. */
 internal interface WorkerPrepareRuntime {
     suspend fun load(identity: WorkerPrepareIdentity)
+    suspend fun loadWithSpec(identity: WorkerPrepareIdentity, spec: JsonObject) { throw WorkerPrepareException("prepare_load_spec_unsupported", "runtime policy unsupported") }
+    suspend fun receipt(identity: WorkerPrepareIdentity, spec: JsonObject): JsonObject { throw WorkerPrepareException("prepare_runtime_receipt_missing", "runtime observation unavailable") }
     suspend fun unload()
     fun loaded(identity: WorkerPrepareIdentity): Boolean
     fun hasRuntime(): Boolean
@@ -47,6 +49,7 @@ internal class WorkerPrepareController(
     private var previous: WorkerPrepareIdentity? = null
     @Volatile private var finalized = true
     private var highestGeneration = 0L
+    private val policies = linkedMapOf<WorkerPrepareIdentity, JsonObject>()
     private val retired = linkedSetOf<WorkerPrepareIdentity>()
     // Cancellation while awaiting the stage gate never entered native loading.
     private val neverLoaded = linkedSetOf<WorkerPrepareIdentity>()
@@ -125,11 +128,16 @@ internal class WorkerPrepareController(
                         // One-slot JNI cannot retain two contexts. The previous identity is metadata only.
                         visible = null
                         touched = true
-                        runtime.load(identity)
+                        if (request.loadSpec != null) {
+                            runtime.loadWithSpec(identity, request.loadSpec)
+                            policies[identity] = request.loadSpec.deepCopy()
+                        } else runtime.load(identity)
                         current(commandEpoch, authorize)
                         checkPrepare(runtime.loaded(identity), "prepare_native_load_failed", "native runtime not loaded")
                     }
-                    request.ack("prepared", true)
+                    request.ack("prepared", true).apply {
+                        policies[identity]?.let { add("runtime_receipt", runtime.receipt(identity, it)) }
+                    }
                 }
                 "commit" -> {
                     checkPrepare(candidate == identity || (committed == identity && candidate == null), "prepare_identity_mismatch", "no matching candidate")
@@ -142,7 +150,9 @@ internal class WorkerPrepareController(
                     }
                     touched = true
                     visible = identity
-                    request.ack("ready", true)
+                    request.ack("ready", true).apply {
+                        policies[identity]?.let { add("runtime_receipt", runtime.receipt(identity, it)) }
+                    }
                 }
                 "abort", "release" -> {
                     if (!terminalCleanup(identity)) {

@@ -112,7 +112,9 @@ object AndroidWorkerCapabilities {
      * `listOf("llama_cpp")` 做相等比较。与主仓 `CORE-KOAKUMA-ENGINE-ABC-01` 的
      * 「能力差异以能力探测表达、而非 `if engine_type`」判据对齐。
      */
-    val SUPPORTED_ENGINES: List<String> = listOf("llama_cpp")
+    val SUPPORTED_ENGINES: List<String> = listOf(
+        EngineRegistry.requireRuntime("llama_cpp", EngineRegistry.ANDROID_RUNTIME).family,
+    )
 
     /**
      * ★ 2026-10-07（DIST-NEXT-6）：能力广告里携带的工件诊断条数上限。
@@ -175,7 +177,11 @@ object AndroidWorkerCapabilities {
      *     ⇒ 要断言「APK 里的层段真的能用」，需 App 内入口或 instrumentation test。
      *     详见 `docs/安卓验证阶梯D-E层-真机Termux方案-2026-09-20.md` §2.1 / §5.1 / §9.9。
      */
-    val SUPPORTED_STAGE_TYPES: List<String> = listOf("full_inference", "layer_forward")
+    val SUPPORTED_STAGE_TYPES: List<String> = buildList {
+        val ops = EngineRegistry.requireRuntime(DEFAULT_ENGINE, EngineRegistry.ANDROID_RUNTIME).operations
+        if (EngineRegistry.FULL_REQUEST in ops) add("full_inference")
+        if (EngineRegistry.FORWARD_LAYERS in ops) add("layer_forward")
+    }
 
     /** 默认 stage 类型。 */
     val DEFAULT_STAGE_TYPE: String = SUPPORTED_STAGE_TYPES.first()
@@ -313,6 +319,9 @@ object AndroidWorkerCapabilities {
          * 才声明 —— 未声明的节点不会被主节点发二进制帧，仍走 base64。
          */
         binaryHidden: Boolean = false,
+        /** Concrete runtime; probes can only remove its static operations. */
+        runtimeKind: String = EngineRegistry.ANDROID_RUNTIME,
+        probedOperations: Set<String>? = null,
     ): Map<String, Any?> {
         require(
             layerArtifacts.map { it.startLayer to it.endLayerExclusive }.distinct().size ==
@@ -341,14 +350,23 @@ object AndroidWorkerCapabilities {
             if (model?.get("model_id") !in artifactModelIds) model?.let(::add)
             addAll(artifactModels)
         }.distinctBy { it["model_id"] }
+        val static = EngineRegistry.requireRuntime(DEFAULT_ENGINE, runtimeKind)
+        var operations = static.operations.intersect(probedOperations ?: static.operations)
+        if (!fullInferenceAvailable) operations = operations - EngineRegistry.FULL_REQUEST
+        val supportsLayers = EngineRegistry.LAYER_RANGE in operations &&
+            EngineRegistry.FORWARD_LAYERS in operations
+        require(supportsLayers || (normalizedRanges.isEmpty() && layerBudget == null)) {
+            "layer inventory requires a layer runtime"
+        }
+        val stages = buildList {
+            if (EngineRegistry.FULL_REQUEST in operations) add("full_inference")
+            if (EngineRegistry.FORWARD_LAYERS in operations &&
+                (!fullInferenceAvailable || normalizedRanges.isNotEmpty())) add("layer_forward")
+        }
         val capabilities = linkedMapOf<String, Any?>(
-            "stage_types" to if (!fullInferenceAvailable) {
-                listOf("layer_forward")
-            } else if (normalizedRanges.isEmpty()) {
-                listOf("full_inference")
-            } else {
-                SUPPORTED_STAGE_TYPES
-            },
+            "engine_capabilities" to EngineRegistry.advertisement(DEFAULT_ENGINE, runtimeKind, operations),
+            "load_spec_version" to 1,
+            "stage_types" to stages,
             "engines" to SUPPORTED_ENGINES,
             "models" to advertisedModels,
             "max_concurrency" to 1,
