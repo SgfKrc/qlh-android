@@ -1137,11 +1137,11 @@ class ApiClientContractTest {
 
     @Test
     fun `audit requests bounded server summaries and excludes content fields`() {
-        route("/api/workflows?limit=8&summary=1") { req, reply ->
+        route("/api/requests?limit=8") { req, reply ->
             assertEquals("GET", req.method)
             reply(
                 200,
-                """{"enabled":true,"available":true,"role":"master","workflows":[{"workflow_id":"wf-1","template":"chat","state":"completed","stage_count":1,"completed_stage_count":1,"attempt_count":1,"stages":[{"stage_id":"stage-1","stage_type":"llm","state":"completed","error_code":"PROVIDER_TIMEOUT","attempt_count":1,"attempts":[{"attempt_id":"a-1","provider_kind":"local","provider_node_id":"node-1","state":"completed","error_code":"PROVIDER_TIMEOUT"}]}]}],"prompt":"must-not-be-present"}""",
+                """{"schema_version":2,"revision":1,"identity":{"boot_id":"test"},"observed_at":100,"validity":"valid","requests":[{"request_id":"req-1","deployment_id":"deployment","phase":"finished","execution_state":"stopped","terminal":"completed","outcome":"completed"}],"prompt":"must-not-be-present"}""",
             )
         }
         route("/api/cluster/review/tickets?limit=8&summary=1") { req, reply ->
@@ -1153,9 +1153,9 @@ class ApiClientContractTest {
         }
 
         val audit = runBlocking { client.getAuditData() }.getOrThrow()
-        assertEquals("wf-1", audit.workflows.workflows.single().workflowId)
-        assertEquals("a-1", audit.workflows.workflows.single().stages.single().attempts.single().attemptId)
-        assertEquals("PROVIDER_TIMEOUT", audit.workflows.workflows.single().stages.single().errorCode)
+        assertEquals("req-1", audit.requests.requests.single().requestId)
+        assertEquals("stopped", audit.requests.requests.single().executionState)
+        assertEquals("completed", audit.requests.requests.single().terminal)
         assertEquals("review-1", audit.reviewTickets.tickets.single().ticketId)
         assertEquals("node-2", audit.reviewTickets.tickets.single().targetNodeId)
     }
@@ -1200,7 +1200,7 @@ class ApiClientContractTest {
     }
 
     private fun intentOperationJson(status: String = "supplying", loaded: Boolean = false, id: String = "supply_abc"): String =
-        """{"operation_id":"$id","intent":{"model_id":"qwen","engine":"auto","quant_type":"","strategy":"auto","timeout_seconds":3600},"status":"$status","reason_code":null,"reason":null,"config_id":"cfg-1","generation":7,"loaded_ready":$loaded,"nodes":{"phone":{"status":"verifying","bytes_received":3456789123,"total_bytes":4567891234,"reason_code":"SUPPLY_HASH_MISMATCH","reason":"checksum failed","layer_range":[4,8]}},"plan":{"node_count":1},"updated_at":123.5}"""
+        """{"schema_version":2,"revision":7,"identity":{"boot_id":"test"},"observed_at":100,"validity":"valid","runnable":$loaded,"operation_id":"$id","intent":{"model_id":"qwen","engine":"auto","quant_type":"","strategy":"auto","timeout_seconds":3600},"status":"$status","reason_code":null,"reason":null,"config_id":"cfg-1","generation":7,"loaded_ready":$loaded,"nodes":{"phone":{"status":"verifying","bytes_received":3456789123,"total_bytes":4567891234,"reason_code":"SUPPLY_HASH_MISMATCH","reason":"checksum failed","layer_range":[4,8]}},"plan":{"node_count":1},"updated_at":123.5}"""
 
     @Test
     fun `intent catalog is path free and includes master binding`() = runBlocking {

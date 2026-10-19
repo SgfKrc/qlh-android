@@ -38,6 +38,7 @@ class ModelIntentCapacityTest {
         reason: String = "当前在线节点无法容纳连续层段",
     ): ModelIntentOperation {
         val json = JsonParser.parseString("""{
+            "schema_version":2,"revision":7,"identity":{"boot_id":"test"},"observed_at":100,"validity":"valid",
             "operation_id":"supply_capacity", "config_id":"config_capacity", "generation":$generation,
             "intent":{"model_id":"qwen35-9b", "engine":"llama_cpp", "quant_type":"", "strategy":"auto",
                 "timeout_seconds":3600},
@@ -45,6 +46,7 @@ class ModelIntentCapacityTest {
         }""").asJsonObject.apply {
             addProperty("status", status)
             addProperty("loaded_ready", loadedReady)
+            addProperty("runnable", loadedReady)
             addProperty("reason_code", code)
             addProperty("reason", reason)
             if (diagnostic != null) add("capacity_diagnostic", diagnostic)

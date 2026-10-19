@@ -424,74 +424,23 @@ data class MasterModelFleetData(
     val verifiedGguf: List<GgufModelInfo> = emptyList(),
 )
 
-/** Content-free audit summaries returned by /api/workflows?summary=1. */
-data class AuditAttemptSummary(
-    @SerializedName("attempt_id") val attemptId: String = "",
-    @SerializedName("provider_kind") val providerKind: String = "",
-    @SerializedName("provider_node_id") val providerNodeId: String = "",
-    val state: String = "",
-    @SerializedName("error_code") val errorCode: String = "",
-    @SerializedName("started_at") val startedAt: Double = 0.0,
-    @SerializedName("finished_at") val finishedAt: Double = 0.0,
-    @SerializedName("duration_seconds") val durationSeconds: Double = 0.0,
+/** Content-free request ownership and physical cleanup observations. */
+data class AuditRequestSummary(
+    @SerializedName("request_id") val requestId: String = "",
+    @SerializedName("deployment_id") val deploymentId: String = "",
+    val phase: String = "",
+    @SerializedName("execution_state") val executionState: String = "",
+    val terminal: String? = null,
+    val outcome: String? = null,
+    @SerializedName("observed_at") val observedAt: Double = 0.0,
 )
-
-data class AuditStageSummary(
-    @SerializedName("stage_id") val stageId: String = "",
-    @SerializedName("stage_type") val stageType: String = "",
-    val state: String = "",
-    @SerializedName("started_at") val startedAt: Double = 0.0,
-    @SerializedName("finished_at") val finishedAt: Double = 0.0,
-    @SerializedName("duration_seconds") val durationSeconds: Double = 0.0,
-    @SerializedName("retry_count") val retryCount: Int = 0,
-    @SerializedName("result_rejection_count") val resultRejectionCount: Int = 0,
-    @SerializedName("error_code") val errorCode: String = "",
-    @SerializedName("attempt_count") val attemptCount: Int = 0,
-    val attempts: List<AuditAttemptSummary> = emptyList(),
-)
-
-data class AuditObservabilitySummary(
-    val state: String = "",
-    @SerializedName("result_ready") val resultReady: Boolean = false,
-    val terminal: Boolean = false,
-    @SerializedName("partial_result") val partialResult: Boolean = false,
-    @SerializedName("recovered_after_restart") val recoveredAfterRestart: Boolean = false,
-    @SerializedName("retry_count") val retryCount: Int = 0,
-    @SerializedName("same_provider_retry_count") val sameProviderRetryCount: Int = 0,
-    @SerializedName("reassignment_count") val reassignmentCount: Int = 0,
-    val retrying: Boolean = false,
-    @SerializedName("result_rejection_count") val resultRejectionCount: Int = 0,
-    @SerializedName("winner_count") val winnerCount: Int = 0,
-    @SerializedName("actual_providers") val actualProviders: List<String> = emptyList(),
-    @SerializedName("actual_nodes") val actualNodes: List<String> = emptyList(),
-)
-
-data class AuditWorkflowSummary(
-    @SerializedName("workflow_id") val workflowId: String = "",
-    val template: String = "",
-    val state: String = "",
-    @SerializedName("created_at") val createdAt: Double = 0.0,
-    @SerializedName("started_at") val startedAt: Double = 0.0,
-    @SerializedName("result_ready_at") val resultReadyAt: Double = 0.0,
-    @SerializedName("finished_at") val finishedAt: Double = 0.0,
-    @SerializedName("duration_seconds") val durationSeconds: Double = 0.0,
-    @SerializedName("stage_count") val stageCount: Int = 0,
-    @SerializedName("completed_stage_count") val completedStageCount: Int = 0,
-    @SerializedName("failed_stage_count") val failedStageCount: Int = 0,
-    @SerializedName("attempt_count") val attemptCount: Int = 0,
-    @SerializedName("retry_count") val retryCount: Int = 0,
-    @SerializedName("same_provider_retry_count") val sameProviderRetryCount: Int = 0,
-    @SerializedName("result_rejection_count") val resultRejectionCount: Int = 0,
-    @SerializedName("cancel_requested") val cancelRequested: Boolean = false,
-    val observability: AuditObservabilitySummary = AuditObservabilitySummary(),
-    val stages: List<AuditStageSummary> = emptyList(),
-)
-
-data class AuditWorkflowsResponse(
-    val enabled: Boolean = false,
-    val available: Boolean = false,
-    val role: String = "",
-    val workflows: List<AuditWorkflowSummary> = emptyList(),
+data class AuditRequestsResponse(
+    @SerializedName("schema_version") val schemaVersion: Int = 0,
+    val revision: Long? = null,
+    val identity: Map<String, String> = emptyMap(),
+    @SerializedName("observed_at") val observedAt: Double = 0.0,
+    val validity: String = "unknown",
+    val requests: List<AuditRequestSummary> = emptyList(),
 )
 
 /** Review ticket projection excludes transfer reasons, comments and voter identities. */
@@ -512,7 +461,7 @@ data class AuditReviewTicketsResponse(
 )
 
 data class AuditData(
-    val workflows: AuditWorkflowsResponse = AuditWorkflowsResponse(),
+    val requests: AuditRequestsResponse = AuditRequestsResponse(),
     val reviewTickets: AuditReviewTicketsResponse = AuditReviewTicketsResponse(),
 )
 
@@ -659,13 +608,16 @@ class ApiClient(
         "/api/cluster/android/heartbeat",
     )
 
+    private val auditCursor = ClientSnapshotCursor()
+    private val conversationClientId = "android:" + java.util.UUID.randomUUID().toString()
+
     private val client: OkHttpClient = OkHttpClient.Builder()
         .callTimeout(callTimeoutSeconds, TimeUnit.SECONDS)
         .connectTimeout(10, TimeUnit.SECONDS)
         .readTimeout(120, TimeUnit.SECONDS)   // 推理可能较慢
         .writeTimeout(30, TimeUnit.SECONDS)
         .addInterceptor { chain ->
-            val original = chain.request()
+            val original = chain.request().newBuilder().header("X-QLH-Client-ID", conversationClientId).build()
             val anonymous = anonymousPaths.contains(original.url.encodedPath)
             val token = if (!anonymous) authStore?.read()?.accessToken else null
             val request = if (!token.isNullOrBlank() && original.header("Authorization") == null) {
@@ -1424,16 +1376,17 @@ class ApiClient(
     suspend fun getAuditData(): Result<AuditData> = withContext(Dispatchers.IO) {
         try {
             val workflowRequest = Request.Builder()
-                .url("${baseUrl.trimEnd('/')}/api/workflows?limit=8&summary=1")
+                .url("${baseUrl.trimEnd('/')}/api/requests?limit=8")
                 .get()
                 .build()
             val reviewRequest = Request.Builder()
                 .url("${baseUrl.trimEnd('/')}/api/cluster/review/tickets?limit=8&summary=1")
                 .get()
                 .build()
-            val workflows = executeJson(workflowRequest, AuditWorkflowsResponse::class.java).getOrThrow()
+            val requests = executeJson(workflowRequest, AuditRequestsResponse::class.java).getOrThrow()
+            require(auditCursor.accept(requests.schemaVersion, requests.revision, requests.identity, requests.observedAt, requests.validity)) { "request_snapshot_invalid" }
             val reviews = executeJson(reviewRequest, AuditReviewTicketsResponse::class.java).getOrThrow()
-            Result.success(AuditData(workflows, reviews))
+            Result.success(AuditData(requests, reviews))
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {

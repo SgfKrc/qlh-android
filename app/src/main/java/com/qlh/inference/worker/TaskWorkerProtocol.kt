@@ -527,6 +527,8 @@ object TaskWorkerProtocol {
                 }) +
                 // ★ 2026-10-07（DIST-NEXT-2b）：大 payload 分片接收能力（可选，默认关）。
                 //   与主仓 `_validate_capabilities` 同键集；两侧必须同时放行。
+                (if (capabilities.containsKey("node_incarnation")) setOf("node_incarnation") else emptySet()) +
+                (if (capabilities.containsKey("stage_kv_cleanup")) setOf("stage_kv_cleanup") else emptySet()) +
                 (if (capabilities.containsKey("stage_chunked_input")) {
                     setOf("stage_chunked_input")
                 } else {
@@ -607,6 +609,8 @@ object TaskWorkerProtocol {
             validateLayerArtifactDiagnostics(capabilities["layer_artifact_diagnostics"])
         }
         // ★ 2026-10-07（DIST-NEXT-2b）：分片接收能力（可选，布尔）。
+        if (capabilities.containsKey("node_incarnation")) string(capabilities, "node_incarnation")
+        if (capabilities.containsKey("stage_kv_cleanup")) boolean(capabilities, "stage_kv_cleanup")
         if (capabilities.containsKey("stage_chunked_input")) {
             boolean(capabilities, "stage_chunked_input")
         }

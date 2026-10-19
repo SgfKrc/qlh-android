@@ -113,6 +113,9 @@ class AndroidFullWorkerStageExecutor(
      * 才是这个标志的正确生命周期。
      */
     private val clearExecutionAbort: () -> Unit = {},
+    private val clearLayerKv: suspend () -> Result<Unit> = {
+        Result.failure(IllegalStateException("stage_kv_cleanup_unsupported"))
+    },
 ) : TaskWorkerStageHandler {
     @Volatile private var binaryHiddenEnabled = false
 
@@ -372,6 +375,12 @@ class AndroidFullWorkerStageExecutor(
             )
         }
 
+        if (rootInput["cleanup_only"] == true) {
+            clearLayerKv().getOrElse { error ->
+                throw AndroidFullWorkerStageException("stage_kv_cleanup_failed", error.message ?: "KV cleanup failed")
+            }
+            return TaskWorkerStageExecution(output = mapOf("kv_cleared" to true), metadata = emptyMap())
+        }
         val posBase = boundedInt(rootInput["pos_base"], 0, 0, Int.MAX_VALUE - 1)
         val forwardStartedMs = System.currentTimeMillis()
         val result = layerForward(

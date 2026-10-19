@@ -130,7 +130,20 @@ internal class ModelIntentCapacityDiagnosticDeserializer : JsonDeserializer<Mode
     }
 }
 
+data class ClientReason(
+    val domain: String = "", val code: String = "", val source: String = "",
+    val retryability: String = "unknown", val details: JsonObject? = null,
+    val cause: ClientReason? = null,
+)
+
 data class ModelIntentOperation(
+    @SerializedName("schema_version") val schemaVersion: Int = 0,
+    val revision: Long? = null,
+    val identity: Map<String, String> = emptyMap(),
+    @SerializedName("observed_at") val observedAt: Double = 0.0,
+    val validity: String = "unknown",
+    val runnable: Boolean = false,
+    @SerializedName("reason_detail") val reasonDetail: ClientReason? = null,
     @SerializedName("operation_id") val operationId: String = "",
     val intent: ModelIntentRequest = ModelIntentRequest(""),
     val status: String = "queued",
@@ -144,7 +157,8 @@ data class ModelIntentOperation(
     @SerializedName("updated_at") val updatedAt: JsonElement? = null,
     @SerializedName("capacity_diagnostic") val capacityDiagnostic: ModelIntentCapacityDiagnostic? = null,
 ) {
-    val readyForChat: Boolean get() = status == "ready" && loadedReady
+    val readyForChat: Boolean get() = schemaVersion == 2 && revision != null && revision >= 0 && identity["boot_id"].orEmpty().isNotBlank() &&
+        observedAt.isFinite() && observedAt > 0 && validity == "valid" && runnable && status == "ready" && loadedReady
     val finished: Boolean get() = readyForChat || status in setOf("failed", "cancelled", "superseded")
 }
 
@@ -161,7 +175,7 @@ internal fun validateModelIntentOperationId(id: String) {
 }
 
 internal val MODEL_INTENT_STATUSES = setOf(
-    "queued", "waiting_nodes", "inspecting", "inventory", "planning", "building", "supplying",
+    "pending", "queued", "waiting_nodes", "waiting_capacity", "inspecting", "inventory", "planning", "building", "supplying",
     "verifying", "preparing", "ready", "failed", "cancelled", "superseded",
 )
 

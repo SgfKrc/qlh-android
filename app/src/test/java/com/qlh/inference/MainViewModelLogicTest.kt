@@ -11,12 +11,10 @@ import com.qlh.inference.network.ClusterStatus
 import com.qlh.inference.network.ClusterTask
 import com.qlh.inference.network.CurrentModelStatus
 import com.qlh.inference.network.CurrentModelDescriptor
-import com.qlh.inference.network.AuditAttemptSummary
+import com.qlh.inference.network.AuditRequestsResponse
+import com.qlh.inference.network.AuditRequestSummary
 import com.qlh.inference.network.AuditData
 import com.qlh.inference.network.AuditReviewTicketsResponse
-import com.qlh.inference.network.AuditStageSummary
-import com.qlh.inference.network.AuditWorkflowSummary
-import com.qlh.inference.network.AuditWorkflowsResponse
 import com.qlh.inference.network.AuthCapabilityResponse
 import com.qlh.inference.network.GgufModelInfo
 import com.qlh.inference.network.LocalModelAssetSummary
@@ -730,36 +728,10 @@ class MainViewModelLogicTest {
     @Test
     fun `audit projection is bounded and content free`() {
         val data = AuditData(
-            workflows = AuditWorkflowsResponse(
-                enabled = true,
-                available = true,
-                role = "master",
-                workflows = (1..12).map { index ->
-                    AuditWorkflowSummary(
-                        workflowId = "wf-$index",
-                        template = "chat",
-                        state = "completed",
-                        createdAt = index.toDouble(),
-                        stageCount = 20,
-                        completedStageCount = 20,
-                        attemptCount = 20,
-                        stages = (1..20).map { stage ->
-                            AuditStageSummary(
-                                stageId = "stage-$stage",
-                                stageType = "llm",
-                                attempts = (1..10).map { attempt ->
-                                    AuditAttemptSummary(
-                                        attemptId = "attempt-$attempt",
-                                        providerKind = "local",
-                                        providerNodeId = "node-$attempt",
-                                        state = "completed",
-                                    )
-                                },
-                            )
-                        },
-                    )
-                },
-            ),
+            requests = AuditRequestsResponse(schemaVersion = 2, revision = 1, validity = "valid",
+                requests = (1..12).map { index -> AuditRequestSummary(
+                    requestId = "req-$index", deploymentId = "deployment", phase = "finished",
+                    executionState = "stopped", terminal = "completed", outcome = "completed") }),
             reviewTickets = AuditReviewTicketsResponse(
                 tickets = (1..12).map { index ->
                     com.qlh.inference.network.ReviewTicketSummary(
@@ -774,10 +746,8 @@ class MainViewModelLogicTest {
         )
 
         val snapshot = toAuditSnapshot(data)
-        assertEquals(MAX_AUDIT_WORKFLOWS, snapshot.workflows.size)
+        assertEquals(MAX_AUDIT_REQUESTS, snapshot.requests.size)
         assertEquals(MAX_AUDIT_REVIEWS, snapshot.reviews.size)
-        assertEquals(MAX_AUDIT_STAGES, snapshot.workflows.first().stages.size)
-        assertEquals(MAX_AUDIT_ATTEMPTS, snapshot.workflows.first().stages.first().attempts.size)
         assertEquals(100, snapshot.reviews.first().score)
         assertEquals(100, snapshot.reviews.first().voteCount)
     }

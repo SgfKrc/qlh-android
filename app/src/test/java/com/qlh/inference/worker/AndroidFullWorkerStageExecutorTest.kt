@@ -320,6 +320,41 @@ class AndroidFullWorkerStageExecutorTest {
         assertEquals(1, generated)
     }
 
+    @Test
+    fun `cleanup returns native receipt without a forward`() = runBlocking {
+        var cleared = 0
+        val executor = AndroidFullWorkerStageExecutor(
+            expectedModelIdentity = { model },
+            ensureModelLoaded = { Result.success(Unit) },
+            generate = { _, _, _, _ -> error("unexpected full inference") },
+            layerForward = { error("cleanup must not run layers") },
+            ensureModelLoadedForLayer = { _, _, _, _, _ -> Result.success(Unit) },
+            resolveLayerModelIdentity = { _, _ -> model },
+            clearLayerKv = { cleared++; Result.success(Unit) },
+        )
+        val offer = layerForwardOffer(4).let { envelope ->
+            val root = envelope.payload["root_input"] as Map<*, *>
+            envelope.copy(payload = envelope.payload + ("root_input" to (root + ("cleanup_only" to true))))
+        }
+        assertEquals(mapOf("kv_cleared" to true), executor.execute(offer).output)
+        assertEquals(1, cleared)
+    }
+
+    @Test
+    fun `cleanup failure never returns a successful receipt`() = runBlocking {
+        val executor = layerExecutor(4)
+        val offer = layerForwardOffer(4).let { envelope ->
+            val root = envelope.payload["root_input"] as Map<*, *>
+            envelope.copy(payload = envelope.payload + ("root_input" to (root + ("cleanup_only" to true))))
+        }
+        try {
+            executor.execute(offer)
+            fail("unwired native cleanup accepted")
+        } catch (error: AndroidFullWorkerStageException) {
+            assertEquals("stage_kv_cleanup_failed", error.code)
+        }
+    }
+
     private fun layerExecutor(nEmbd: Int) = AndroidFullWorkerStageExecutor(
         expectedModelIdentity = { model },
         ensureModelLoaded = { Result.success(Unit) },

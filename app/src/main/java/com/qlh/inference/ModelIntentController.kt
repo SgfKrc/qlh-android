@@ -1,5 +1,8 @@
 package com.qlh.inference
 
+import com.google.gson.Gson
+import com.qlh.inference.network.ClientReason
+import com.qlh.inference.network.ClientSnapshotCursor
 import com.google.gson.JsonParser
 import com.qlh.inference.data.SettingsDataStore
 import com.qlh.inference.network.ApiClientHttpException
@@ -24,7 +27,7 @@ data class IntentMasterEndpoint(
     val secretEpoch: Int = 0,
 )
 
-data class ModelIntentError(val code: String, val reason: String)
+data class ModelIntentError(val code: String, val reason: String, val reasonDetail: ClientReason? = null)
 
 data class ModelIntentUiState(
     val catalog: ModelIntentCatalog? = null,
@@ -51,6 +54,8 @@ fun modelIntentAllowsChat(mode: String, state: ModelIntentUiState): Boolean =
 fun modelIntentStatusLabel(status: String): String = when (status) {
     "queued" -> "已排队"
     "waiting_nodes" -> "等待节点"
+    "waiting_capacity" -> "等待容量"
+    "pending" -> "等待一致快照"
     "inspecting" -> "检查模型"
     "inventory" -> "清点节点资源"
     "planning" -> "制定供给计划"
@@ -78,7 +83,8 @@ internal fun modelIntentError(error: Throwable): ModelIntentError {
         fun text(key: String): String? = runCatching {
             (nested?.get(key) ?: detail?.get(key))?.takeIf { it.isJsonPrimitive }?.asString
         }.getOrNull()?.takeIf { it.isNotBlank() }
-        val code = text("reason_code") ?: text("code") ?: error.errorCode.takeIf { it.isNotBlank() }
+        val typed = runCatching { Gson().fromJson(detail?.get("reason_detail"), ClientReason::class.java) }.getOrNull()
+        val code = typed?.code?.takeIf { it.isNotBlank() } ?: text("reason_code") ?: text("code") ?: error.errorCode.takeIf { it.isNotBlank() }
             ?: when (error.statusCode) {
                 401, 403 -> "master_auth_required"
                 404 -> "model_intent_api_unavailable"
@@ -89,7 +95,7 @@ internal fun modelIntentError(error: Throwable): ModelIntentError {
             404 -> "主节点尚未提供模型 intent API"
             else -> "主节点拒绝了模型请求，请刷新状态后重试"
         }
-        return ModelIntentError(code, reason)
+        return ModelIntentError(code, reason, typed)
     }
     return when (error) {
         is java.net.ConnectException -> ModelIntentError("master_unreachable", "无法连接已保存的主节点")
@@ -112,6 +118,7 @@ internal class ModelIntentController(
 ) {
     private data class Context(val mode: String, val endpoint: IntentMasterEndpoint?, val paused: Boolean)
     private var context = Context(SettingsDataStore.MODE_LOCAL, null, false)
+    private var cursor = ClientSnapshotCursor()
     private var epoch = 0L
     private var ticket = 0L
     private var work: Job? = null
@@ -121,6 +128,7 @@ internal class ModelIntentController(
     fun updateContext(mode: String, endpoint: IntentMasterEndpoint?, paused: Boolean = false) {
         val next = Context(SettingsDataStore.normalizeInferenceMode(mode), endpoint, paused)
         if (next == context) return
+        if (next.endpoint != context.endpoint) cursor = ClientSnapshotCursor()
         context = next
         epoch++
         ticket++
@@ -222,10 +230,10 @@ internal class ModelIntentController(
     }
 
     private fun publish(operation: ModelIntentOperation?) {
-        val previous = mutableState.value.operation
-        if (operation != null && previous?.operationId == operation.operationId &&
-            operation.generation < previous.generation) {
-            mutableState.value = mutableState.value.copy(loading = false, busy = false)
+        if (operation != null && !cursor.accept(operation.schemaVersion, operation.revision,
+                operation.identity, operation.observedAt, operation.validity)) {
+            mutableState.value = mutableState.value.copy(loading = false, busy = false,
+                error = ModelIntentError("snapshot_invalid_or_stale", "状态快照过期或版本不兼容，请刷新"))
             return
         }
         mutableState.value = mutableState.value.copy(

@@ -1103,6 +1103,14 @@ class LocalInferenceEngine(private val context: Context) {
      * 回调读取；被中止的 `llama_decode` 使 `nativeLayerForward*` 返回 `-4`。
      * 标志是**进程级**的（一次只有一个层段前向在跑，与 worker 单并发契约一致）。
      */
+    suspend fun clearLayerKv(): Result<Unit> = withModelContext {
+        if (modelPtr == 0L || !nativeClearLayerKv(modelPtr)) {
+            Result.failure(IllegalStateException("stage_kv_cleanup_failed"))
+        } else Result.success(Unit)
+    }
+
+    private external fun nativeClearLayerKv(modelPtr: Long): Boolean
+
     private external fun nativeSetLayerForwardAbort(abort: Boolean)
 
     /**

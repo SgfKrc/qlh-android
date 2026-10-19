@@ -13,7 +13,8 @@ class ModelIntentControllerTest {
     @After fun stop() { scope.cancel() }
 
     private fun operation(status: String = "supplying", loaded: Boolean = false, id: String = "supply_one") =
-        ModelIntentOperation(operationId = id, intent = ModelIntentRequest("qwen"), status = status,
+        ModelIntentOperation(schemaVersion = 2, revision = 4, identity = mapOf("boot_id" to "test"),
+            observedAt = 100.0, validity = "valid", runnable = loaded, operationId = id, intent = ModelIntentRequest("qwen"), status = status,
             generation = 4, loadedReady = loaded, nodes = mapOf("phone" to ModelIntentNode(
                 status = "supplying", bytesReceived = 10, totalBytes = 20)))
 
@@ -24,7 +25,7 @@ class ModelIntentControllerTest {
         var catalogCalls = 0
         var current: suspend () -> Result<ModelIntentOperation?> = { Result.success(null) }
         var post: suspend (ModelIntentRequest) -> Result<ModelIntentOperation> = {
-            Result.success(ModelIntentOperation("supply_new", it, status = "queued"))
+            Result.success(ModelIntentOperation(schemaVersion = 2, revision = 5, identity = mapOf("boot_id" to "test"), observedAt = 101.0, validity = "valid", operationId = "supply_new", intent = it, status = "queued"))
         }
         var get: suspend (String) -> Result<ModelIntentOperation> = { error("unexpected poll") }
         var delete: suspend (String) -> Result<ModelIntentOperation> = { error("unexpected delete") }
@@ -239,7 +240,7 @@ class ModelIntentControllerTest {
         withTimeout(1500) { controller.state.first { it.operation?.operationId == "supply_external" } }
         assertEquals(master.intent, controller.state.value.requestedIntent)
         assertFalse(controller.state.value.readyForChat)
-        master = master.copy(status = "ready", loadedReady = true)
+        master = master.copy(status = "ready", loadedReady = true, runnable = true)
         withTimeout(1500) { controller.state.first { it.readyForChat } }
         master = master.copy(status = "cancelled", loadedReady = false)
         withTimeout(1500) { controller.state.first { it.operation?.status == "cancelled" } }
@@ -460,6 +461,15 @@ class ModelIntentControllerTest {
         withTimeout(1500) { controller.state.first { it.operation?.operationId == "supply_user" } }
         assertFalse(controller.state.value.busy)
         assertFalse(controller.state.value.readyForChat)
+    }
+
+    @Test fun `typed error retains causal source and retryability`() {
+        val error = modelIntentError(ApiClientHttpException(409, "legacy", """{"reason_detail":{
+            "domain":"deployment","code":"fenced","source":"admission","retryability":"retry",
+            "cause":{"domain":"native","code":"draining","source":"runtime","retryability":"wait"}}}"""))
+        assertEquals("fenced", error.code)
+        assertEquals("runtime", error.reasonDetail?.cause?.source)
+        assertEquals("wait", error.reasonDetail?.cause?.retryability)
     }
 
 }

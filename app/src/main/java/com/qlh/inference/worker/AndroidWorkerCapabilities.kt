@@ -313,6 +313,7 @@ object AndroidWorkerCapabilities {
          * `stage_offer.root_input.hidden_ref`）。默认 `false`；只有接线完成的构建才声明。
          */
         stageChunkedInput: Boolean = false,
+        nodeIncarnation: String = "",
         /**
          * ★ 票 21a（COMM-WIRE-01）：是否声明能**接收二进制 hidden 帧**
          * （`format:"binary"`，帧体为原始字节）。默认 `false`；只有接线完成的构建
@@ -402,10 +403,14 @@ object AndroidWorkerCapabilities {
         }
         // ★ 2026-10-07（DIST-NEXT-2b）：声明能接收分片输入（`stage_chunk` + `hidden_ref`）。
         //   只在此接线完成的构建里开启 —— 未声明的对端不会被主节点发分片。
-        if (stageChunkedInput) capabilities["stage_chunked_input"] = true
+        if (stageChunkedInput) {
+            capabilities["stage_chunked_input"] = true
+            capabilities["stage_kv_cleanup"] = true
+        }
         // This advertises receive support. Sending additionally requires the master's
         // explicit binary_hidden acknowledgement on this connection.
         if (binaryHidden) capabilities["binary_hidden"] = true
+        if (nodeIncarnation.isNotBlank()) capabilities["node_incarnation"] = nodeIncarnation
         return capabilities
     }
 }

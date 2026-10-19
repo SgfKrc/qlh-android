@@ -48,6 +48,8 @@ import java.util.concurrent.atomic.AtomicReference
 
 /** Foreground lifecycle shell for the Android Full Worker client. */
 class TaskWorkerService : Service() {
+    private val runtimeIncarnation = java.util.UUID.randomUUID().toString()
+
     private val binder = LocalBinder()
     private val lifecycleLock = Any()
     private var destroyed = false
@@ -499,6 +501,7 @@ class TaskWorkerService : Service() {
                 // ★ 2026-10-07（DIST-NEXT-2b）：本构建已接线分片输入（`stage_chunk`
                 //   接收 + `hidden_ref` 装配）⇒ 声明给主节点。
                 stageChunkedInput = true,
+                nodeIncarnation = runtimeIncarnation,
                 // ★ 票 21a（COMM-WIRE-01）：本构建已接线二进制 hidden 帧
                 //   （`TaskWorkerBinaryHidden` 抽取/放回 + 帧层数据段）⇒ 声明给主节点。
                 binaryHidden = true,
@@ -655,6 +658,10 @@ class TaskWorkerService : Service() {
                 clearExecutionAbort = {
                     QlhApplication.instance.inferenceService?.engine
                         ?.clearLayerForwardAbort()
+                },
+                clearLayerKv = {
+                    QlhApplication.instance.inferenceService?.engine?.clearLayerKv()
+                        ?: Result.failure(IllegalStateException("prepare_runtime_lost"))
                 },
                 // Stages only inspect a committed native runtime. ensureLayerModelLoaded belongs to prepare.
                 ensureModelLoadedForLayer = { range, _, embeddingWidth, wantHidden, sha256 ->

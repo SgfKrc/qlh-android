@@ -1585,6 +1585,16 @@ Java_com_qlh_inference_service_LocalInferenceEngine_nativeLayerForwardHiddenKeep
 // `llama_decode` 会在 `qlh_layer_forward_abort_callback` 返回 true 时中止，对应
 // JNI 入口返回 -4。**只有**这些层段入口受它影响：普通 `nativeGenerate*` 不注册该回调，
 // 因此取消标志不会误伤整模型推理。
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_qlh_inference_service_LocalInferenceEngine_nativeClearLayerKv(
+    JNIEnv *, jobject, jlong model_ptr
+) {
+    auto * qctx = reinterpret_cast<QlhLlamaContext *>(model_ptr);
+    if (qctx == nullptr || qctx->ctx == nullptr) return JNI_FALSE;
+    llama_memory_clear(llama_get_memory(qctx->ctx), true);
+    return JNI_TRUE;
+}
+
 extern "C" JNIEXPORT void JNICALL
 Java_com_qlh_inference_service_LocalInferenceEngine_nativeSetLayerForwardAbort(
     JNIEnv * /* env */, jobject /* thiz */, jboolean abort

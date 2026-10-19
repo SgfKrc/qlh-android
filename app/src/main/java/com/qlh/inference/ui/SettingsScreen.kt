@@ -87,10 +87,9 @@ import androidx.compose.ui.unit.dp
 import com.qlh.inference.logging.QlhLogger
 import com.qlh.inference.AppUpdateUiState
 import com.qlh.inference.AuthControlUiState
-import com.qlh.inference.AuditAttempt
 import com.qlh.inference.AuditReviewTicket
 import com.qlh.inference.AuditUiState
-import com.qlh.inference.AuditWorkflow
+import com.qlh.inference.AuditRequest
 import com.qlh.inference.ClusterOverviewUiState
 import com.qlh.inference.clusterCapacitySummaryText
 import com.qlh.inference.clusterNodeParticipationText
@@ -853,7 +852,7 @@ private fun AuditOverviewGroup(
     val snapshot = state.snapshot
     val summary = when {
         state.loading -> "正在读取"
-        snapshot != null -> "活动 ${snapshot.workflows.size} · 复核 ${snapshot.reviews.size}"
+        snapshot != null -> "活动 ${snapshot.requests.size} · 复核 ${snapshot.reviews.size}"
         state.error != null -> "暂时无法读取"
         else -> "尚未读取"
     }
@@ -881,17 +880,17 @@ private fun AuditOverviewGroup(
         }
         snapshot?.let { value ->
             Text(
-                text = "工作流 ${value.workflows.size} 条 · 复核票 ${value.reviews.size} 条",
+                text = "请求 ${value.requests.size} 条 · 复核票 ${value.reviews.size} 条",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            value.workflows.take(8).forEach { workflow ->
-                AuditWorkflowRow(workflow)
+            value.requests.take(8).forEach { workflow ->
+                AuditRequestRow(workflow)
             }
             value.reviews.take(8).forEach { ticket ->
                 AuditReviewRow(ticket)
             }
-            if (value.workflows.isEmpty() && value.reviews.isEmpty()) {
+            if (value.requests.isEmpty() && value.reviews.isEmpty()) {
                 Text(
                     text = "暂无可显示的活动或复核摘要",
                     style = MaterialTheme.typography.bodySmall,
@@ -914,32 +913,13 @@ private fun AuditOverviewGroup(
 }
 
 @Composable
-private fun AuditWorkflowRow(workflow: AuditWorkflow) {
-    val stageSummary = "阶段 ${workflow.completedStageCount}/${workflow.stageCount} · 尝试 ${workflow.attemptCount} · 重试 ${workflow.retryCount}"
+private fun AuditRequestRow(request: AuditRequest) {
     SettingRow(
-        title = workflow.template,
-        subtitle = "$stageSummary · ${workflow.workflowId}",
-        modifier = Modifier.testTag("audit_workflow_${workflow.workflowId}"),
-        trailing = {
-            QlhSemanticStatusChip(
-                text = workflow.state,
-            )
-        },
+        title = request.outcome.ifBlank { request.phase },
+        subtitle = "${request.requestId} · 资源 ${request.executionState} · ${request.terminal}",
+        modifier = Modifier.testTag("audit_request_${request.requestId}"),
+        trailing = { QlhSemanticStatusChip(text = request.executionState) },
     )
-    workflow.stages.take(4).forEach { stage ->
-        val attemptKinds = stage.attempts.map { it.providerKind }.distinct().filter { it != "unknown" }
-        val errorCode = stage.errorCode.ifBlank { stage.attempts.firstOrNull()?.errorCode.orEmpty() }
-        SettingRow(
-            title = stage.stageType,
-            subtitle = "${stage.state} · 尝试 ${stage.attempts.size} · 重试 ${stage.retryCount}" +
-                (if (attemptKinds.isEmpty()) "" else " · ${attemptKinds.joinToString(", ")}") +
-                (if (errorCode.isBlank()) "" else " · 错误 $errorCode"),
-            modifier = Modifier.testTag("audit_stage_${workflow.workflowId}_${stage.stageId}"),
-            trailing = {
-                QlhSemanticStatusChip(text = stage.state, showDot = stage.state == "running")
-            },
-        )
-    }
 }
 
 @Composable
