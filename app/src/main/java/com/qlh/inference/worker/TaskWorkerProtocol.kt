@@ -538,6 +538,7 @@ object TaskWorkerProtocol {
                 //   声明 true 的对端才可能收到 format:"binary" 的帧；未声明者继续走
                 //   base64 内联。与主仓 `_validate_capabilities` 同键集 —— 两侧必须
                 //   同时放行，只改一边会让对端 hello 自校验失败并静默断开。
+                (if (capabilities.containsKey("multi_position_argmax")) setOf("multi_position_argmax") else emptySet()) +
                 (if (capabilities.containsKey("binary_hidden")) {
                     setOf("binary_hidden")
                 } else {
@@ -616,6 +617,9 @@ object TaskWorkerProtocol {
         }
         if (capabilities.containsKey("binary_hidden")) {
             boolean(capabilities, "binary_hidden")
+        }
+        if (capabilities.containsKey("multi_position_argmax")) {
+            boolean(capabilities, "multi_position_argmax")
         }
         val stageTypes = stringList(capabilities, "stage_types")
         if (!AndroidWorkerCapabilities.areAllStageTypesSupported(stageTypes)) {
@@ -932,6 +936,7 @@ object TaskWorkerProtocol {
                 if (payload["output_sha256"] != stageOutputSha256(output)) {
                     fail("stage output digest does not match output", "output_digest_mismatch", "payload.output_sha256")
                 }
+                MultiPositionArgmaxContract.validateResult(output)
                 objectValue(payload, "metadata")
             }
             STAGE_ERROR -> {
@@ -1069,7 +1074,7 @@ object TaskWorkerProtocol {
      * 必填集合，缺该字段的旧对端会被判 `field_mismatch`（与主仓同一坑，实测）。因此这里按
      * 「payload 里是否真的出现」动态放宽，且**仅**在 v3 + `layer_forward` 下生效。
      */
-    private val layerForwardOptionalFields = setOf("middle_channel", "seq_ids", "positions")
+    private val layerForwardOptionalFields = setOf("middle_channel", "seq_ids", "positions", "token_output")
 
     /**
      * `middle_channel` 的允许值 —— 与主仓 `_LAYER_FORWARD_MIDDLE_CHANNELS` **同集合**：
@@ -1184,6 +1189,7 @@ object TaskWorkerProtocol {
      * 属于执行侧（`AndroidFullWorkerStageExecutor` + native 的 `n_layer` 对账）。
      */
     private fun validateLayerForwardOffer(payload: Map<String, Any?>) {
+        MultiPositionArgmaxContract.validateRequest(payload)
         val range = list(payload, "layer_range")
         if (range.size != 2) {
             fail("layer_range must be [start, end)", "invalid_layer_range", "payload.layer_range")
@@ -1399,7 +1405,8 @@ object TaskWorkerProtocol {
         if (item == null || !item.isJsonPrimitive || !item.asJsonPrimitive.isNumber) {
             fail("$key must be an integer", "invalid_integer", key)
         }
-        return item.asInt
+        return item.asString.toIntOrNull()
+            ?: fail("$key must be an exact integer within Int range", "invalid_integer", key)
     }
 
     private fun requiredLong(value: JsonObject, key: String): Long {
@@ -1407,7 +1414,8 @@ object TaskWorkerProtocol {
         if (item == null || !item.isJsonPrimitive || !item.asJsonPrimitive.isNumber) {
             fail("$key must be an integer", "invalid_integer", key)
         }
-        return item.asLong
+        return item.asString.toLongOrNull()
+            ?: fail("$key must be an exact integer within Long range", "invalid_integer", key)
     }
 
     private fun requireExact(actual: Set<String>, expected: Set<String>, field: String) {

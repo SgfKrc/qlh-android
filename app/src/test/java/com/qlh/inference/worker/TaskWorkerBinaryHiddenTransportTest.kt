@@ -10,6 +10,10 @@ import java.net.Socket
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.Base64
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.*
 import org.junit.Test
@@ -27,6 +31,7 @@ class TaskWorkerBinaryHiddenTransportTest {
             val socket = MemorySocket(jsonFrame(ack(flag)))
             val transport = SocketTaskWorkerTransport(socket)
             transport.setBinaryHiddenEnabled(true)
+            sendHello(transport, socket)
             transport.send(result(raw))
             transport.receive()
             transport.send(result(raw))
@@ -47,6 +52,7 @@ class TaskWorkerBinaryHiddenTransportTest {
         val socket = MemorySocket(jsonFrame(ack(true)))
         val transport = SocketTaskWorkerTransport(socket)
         transport.setBinaryHiddenEnabled(true)
+        sendHello(transport, socket)
         transport.receive()
         transport.send(result(raw))
         val input = DataInputStream(ByteArrayInputStream(socket.written.toByteArray()))
@@ -66,6 +72,7 @@ class TaskWorkerBinaryHiddenTransportTest {
         val socket = MemorySocket(jsonFrame(ack(true)))
         val transport = SocketTaskWorkerTransport(socket)
         transport.setBinaryHiddenEnabled(true)
+        sendHello(transport, socket)
         transport.receive()
         transport.send(hello())
         transport.send(result(raw))
@@ -88,6 +95,7 @@ class TaskWorkerBinaryHiddenTransportTest {
         val socket = MemorySocket(jsonFrame(ack(true)) + binaryFrame(result, large))
         val transport = SocketTaskWorkerTransport(socket)
         transport.setBinaryHiddenEnabled(true)
+        sendHello(transport, socket)
         transport.receive()
         assertTrue("restored output must retain canonical bytes",
             TaskWorkerProtocol.canonicalBytes(result).contentEquals(TaskWorkerProtocol.canonicalBytes(transport.receive()!!)))
@@ -132,7 +140,7 @@ class TaskWorkerBinaryHiddenTransportTest {
     @Test
     fun `binary input chunks restore before protocol validation without losing the next frame`() = runBlocking {
         val chunk = chunk(TaskWorkerProtocol.STAGE_CHUNK)
-        val transport = negotiatedTransport(binaryFrame(chunk, raw) + jsonFrame(ack(null)))
+        val transport = negotiatedTransport(binaryFrame(chunk, raw) + jsonFrame(ack(null, "msg_ack_followup_12345678")))
         assertArrayEquals(TaskWorkerProtocol.canonicalBytes(chunk), TaskWorkerProtocol.canonicalBytes(transport.receive()!!))
         assertEquals(TaskWorkerProtocol.HELLO_ACK, transport.receive()!!.messageType)
         assertNull(transport.receive())
@@ -143,6 +151,7 @@ class TaskWorkerBinaryHiddenTransportTest {
         val socket = MemorySocket(jsonFrame(ack(true)))
         val transport = SocketTaskWorkerTransport(socket)
         transport.setBinaryHiddenEnabled(true)
+        sendHello(transport, socket)
         transport.receive()
         transport.send(chunk(TaskWorkerProtocol.STAGE_RESULT_CHUNK))
         val input = DataInputStream(ByteArrayInputStream(socket.written.toByteArray()))
@@ -201,6 +210,7 @@ class TaskWorkerBinaryHiddenTransportTest {
         val socket = MemorySocket(jsonFrame(ack(true)))
         val sending = SocketTaskWorkerTransport(socket, maxFrameBytes = 4096)
         sending.setBinaryHiddenEnabled(true)
+        sendHello(sending, socket)
         sending.receive()
         try { sending.send(result(body)); fail("oversized frame accepted") }
         catch (error: TaskWorkerProtocolException) { assertEquals("message_too_large", error.code) }
@@ -216,6 +226,7 @@ class TaskWorkerBinaryHiddenTransportTest {
         for (flag in listOf<Boolean?>(null, false)) {
             val legacy = SocketTaskWorkerTransport(MemorySocket(jsonFrame(ack(flag)) + frame))
             legacy.setBinaryHiddenEnabled(true)
+            legacy.send(hello())
             legacy.receive()
             expectInvalid { legacy.receive() }
         }
@@ -234,6 +245,7 @@ class TaskWorkerBinaryHiddenTransportTest {
         val socket = MemorySocket(jsonFrame(ack(true)) + frame)
         val transport = SocketTaskWorkerTransport(socket)
         transport.setBinaryHiddenEnabled(true)
+        sendHello(transport, socket)
         transport.receive()
         val restored = transport.receive()!!
         val output = restored.payload["output"] as Map<*, *>
@@ -260,10 +272,168 @@ class TaskWorkerBinaryHiddenTransportTest {
         }
     }
 
+    @Test
+    fun `unsolicited ACK cannot negotiate binary without a sent hello`() = runBlocking {
+        val socket = MemorySocket(jsonFrame(ack(true)))
+        val transport = SocketTaskWorkerTransport(socket)
+        transport.setBinaryHiddenEnabled(true)
+        transport.receive()
+        assertFalse(transport.isBinaryHiddenNegotiated)
+        transport.send(result(raw))
+        assertEquals("json", readMeta(DataInputStream(ByteArrayInputStream(socket.written.toByteArray())))
+            .get("format").asString)
+    }
+
+    @Test
+    fun `ACK without a pending hello cannot change the settled selection`() = runBlocking {
+        for (selected in listOf(false, true)) {
+            val socket = MemorySocket(jsonFrame(ack(selected)) +
+                jsonFrame(ack(!selected, "msg_ack_unsolicited")))
+            val transport = SocketTaskWorkerTransport(socket)
+            transport.setBinaryHiddenEnabled(true)
+            sendHello(transport, socket)
+            transport.receive()
+            assertEquals(selected, transport.isBinaryHiddenNegotiated)
+            transport.receive()
+            assertEquals(selected, transport.isBinaryHiddenNegotiated)
+        }
+    }
+
+    @Test
+    fun `replayed ACK cannot complete a refreshed hello or consume its fresh ACK`() = runBlocking {
+        for (selected in listOf(false, true)) {
+            val socket = MemorySocket(jsonFrame(ack(true)) + jsonFrame(ack(true)) +
+                jsonFrame(ack(selected, "msg_ack_refresh_12345678")))
+            val transport = SocketTaskWorkerTransport(socket)
+            transport.setBinaryHiddenEnabled(true)
+            sendHello(transport, socket)
+            transport.receive()
+            assertTrue(transport.isBinaryHiddenNegotiated)
+            sendHello(transport, socket)
+            assertFalse(transport.isBinaryHiddenNegotiated)
+            transport.receive()
+            assertFalse("replayed ACK must not enable binary", transport.isBinaryHiddenNegotiated)
+            transport.send(result(raw))
+            assertEquals("json", readMeta(DataInputStream(ByteArrayInputStream(socket.written.toByteArray())))
+                .get("format").asString)
+            transport.receive()
+            assertEquals("fresh ACK must still settle the refresh", selected, transport.isBinaryHiddenNegotiated)
+        }
+    }
+
+    @Test
+    fun `overlapping hellos wait for the last outstanding ACK`() = runBlocking {
+        val socket = MemorySocket(jsonFrame(ack(true)) + jsonFrame(ack(true, "msg_ack_refresh_12345678")))
+        val transport = SocketTaskWorkerTransport(socket)
+        transport.setBinaryHiddenEnabled(true)
+        sendHello(transport, socket)
+        transport.setBinaryHiddenEnabled(true)
+        sendHello(transport, socket)
+        transport.receive()
+        assertFalse("the first ACK belongs to the earlier hello", transport.isBinaryHiddenNegotiated)
+        transport.receive()
+        assertTrue(transport.isBinaryHiddenNegotiated)
+    }
+
+    @Test
+    fun `changing local support fences an already pending ACK`() = runBlocking {
+        val socket = MemorySocket(jsonFrame(ack(true)))
+        val transport = SocketTaskWorkerTransport(socket)
+        transport.setBinaryHiddenEnabled(true)
+        sendHello(transport, socket)
+        transport.setBinaryHiddenEnabled(true)
+        transport.receive()
+        assertFalse(transport.isBinaryHiddenNegotiated)
+    }
+
+    @Test
+    fun `sent hello must actually advertise binary receive support`() = runBlocking {
+        for (flag in listOf<Boolean?>(null, false)) {
+            val socket = MemorySocket(jsonFrame(ack(true)))
+            val transport = SocketTaskWorkerTransport(socket)
+            transport.setBinaryHiddenEnabled(true)
+            val caps = if (flag == null) capabilities() - "binary_hidden"
+                else capabilities() + ("binary_hidden" to flag)
+            transport.send(hello().copy(payload = hello().payload + ("capabilities" to caps)))
+            transport.receive()
+            assertFalse(transport.isBinaryHiddenNegotiated)
+        }
+    }
+
+    @Test
+    fun `close retires binary negotiation even if an old ACK arrives late`() = runBlocking {
+        val socket = MemorySocket(jsonFrame(ack(true)) + jsonFrame(ack(true, "msg_ack_late_12345678")))
+        val transport = SocketTaskWorkerTransport(socket)
+        transport.setBinaryHiddenEnabled(true)
+        sendHello(transport, socket)
+        transport.receive()
+        assertTrue(transport.isBinaryHiddenNegotiated)
+        transport.close()
+        assertFalse(transport.isBinaryHiddenNegotiated)
+        // MemorySocket deliberately keeps its fixture readable after Socket.close().
+        transport.receive()
+        assertFalse(transport.isBinaryHiddenNegotiated)
+    }
+
+    @Test
+    fun `ACK already being admitted cannot revive a concurrently closed owner`() = runBlocking {
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val fence = TcpControlFence(validate = { certificate ->
+            if (certificate.get("phase")?.asString == "late") {
+                entered.countDown()
+                check(release.await(5, TimeUnit.SECONDS)) { "late ACK was not released" }
+            }
+        })
+        fun certificate(phase: String) = JsonObject().apply { addProperty("phase", phase) }
+        fence.admit(JsonObject().apply { add("control_certificate", certificate("initial")) })
+        fun certifiedAck(message: TaskWorkerEnvelope, phase: String): ByteArray {
+            val data = JsonParser.parseString(TaskWorkerProtocol.canonicalBytes(message).toString(Charsets.UTF_8)).asJsonObject
+            data.add("control_certificate", certificate(phase))
+            return pack(JsonObject().apply {
+                addProperty("type", "task_worker"); addProperty("format", "json"); add("data", data)
+            }.toString().toByteArray())
+        }
+        val socket = MemorySocket(certifiedAck(ack(true), "initial") +
+            certifiedAck(ack(true, "msg_ack_late_12345678"), "late"))
+        val transport = SocketTaskWorkerTransport(socket, controlFence = fence)
+        transport.setBinaryHiddenEnabled(true)
+        sendHello(transport, socket)
+        transport.receive()
+        assertTrue(transport.isBinaryHiddenNegotiated)
+        sendHello(transport, socket)
+        val lateAck = async(Dispatchers.IO) { transport.receive() }
+        try {
+            assertTrue("ACK must reach the real receiveEvent admission boundary", entered.await(5, TimeUnit.SECONDS))
+            transport.close()
+            assertFalse(transport.isBinaryHiddenNegotiated)
+        } finally { release.countDown() }
+        assertEquals(TaskWorkerProtocol.HELLO_ACK, lateAck.await()!!.messageType)
+        assertFalse("late ACK must not revive the retired owner", transport.isBinaryHiddenNegotiated)
+    }
+
+    @Test
+    fun `binary restored envelope rejects fractional protocol version`() = runBlocking {
+        val transport = negotiatedTransport(binaryFrame(result(raw), raw, change = {
+            it.getAsJsonObject("data").addProperty("version", 3.5)
+        }))
+        try { transport.receive(); fail("fractional version accepted") }
+        catch (error: TaskWorkerProtocolException) { assertEquals("invalid_integer", error.code) }
+    }
+
+    private var helloSequence = 0
+
+    private suspend fun sendHello(transport: SocketTaskWorkerTransport, socket: MemorySocket) {
+        transport.send(hello().copy(messageId = "msg_hello_fixture_${++helloSequence}"))
+        socket.written.reset()
+    }
+
     private suspend fun negotiatedTransport(wire: ByteArray,
             maxFrameBytes: Int = TaskWorkerProtocol.MAX_BINARY_FRAME_BYTES): SocketTaskWorkerTransport {
-        val transport = SocketTaskWorkerTransport(MemorySocket(jsonFrame(ack(true)) + wire), maxFrameBytes)
+        val socket = MemorySocket(jsonFrame(ack(true)) + wire)
+        val transport = SocketTaskWorkerTransport(socket, maxFrameBytes)
         transport.setBinaryHiddenEnabled(true)
+        sendHello(transport, socket)
         assertEquals(TaskWorkerProtocol.HELLO_ACK, transport.receive()!!.messageType)
         return transport
     }
@@ -279,7 +449,8 @@ class TaskWorkerBinaryHiddenTransportTest {
     private fun capabilities() = mapOf("stage_types" to listOf("layer_forward"), "engines" to listOf("llama_cpp"),
         "models" to emptyList<Any>(), "max_concurrency" to 1, "binary_hidden" to true)
     private fun hello() = TaskWorkerProtocol.buildHello("android_12345678", capabilities(), "msg_hello_12345678", 1000)
-    private fun ack(binary: Boolean?) = TaskWorkerProtocol.buildHelloAck("master_12345678", true, 3, "", "msg_ack_12345678", 1000)
+    private fun ack(binary: Boolean?, messageId: String = "msg_ack_12345678") =
+        TaskWorkerProtocol.buildHelloAck("master_12345678", true, 3, "", messageId, 1000)
         .let { if (binary == null) it else it.copy(payload = it.payload + ("binary_hidden" to binary)) }
     private fun jsonFrame(envelope: TaskWorkerEnvelope) = pack(
         "{\"type\":\"task_worker\",\"format\":\"json\",\"data\":${TaskWorkerProtocol.canonicalBytes(envelope).toString(Charsets.UTF_8)}}".toByteArray())

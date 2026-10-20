@@ -8,6 +8,7 @@ import android.system.OsConstants
 import android.system.StructStat
 import com.qlh.inference.status.ReleaseProcessTree
 import com.qlh.inference.status.RuntimeProcessObservations
+import com.qlh.inference.worker.MultiPositionArgmaxContract
 import com.qlh.inference.worker.WorkerPrepareIdentity
 import com.qlh.inference.worker.WorkerPrepareException
 import com.qlh.inference.worker.GgufLayerWeightReader
@@ -746,6 +747,9 @@ class LocalInferenceEngine(private val context: Context) {
         val tokenArgmax: Int,
         /** 末位置输出 hidden（本节点为中间段时），否则为 null。 */
         val hiddenOut: FloatArray?,
+        val tokenArgmaxByPosition: List<Int>? = null,
+        val positions: List<Int>? = null,
+        val nVocab: Int? = null,
     ) {
         override fun equals(other: Any?): Boolean = this === other
         override fun hashCode(): Int = System.identityHashCode(this)
@@ -779,6 +783,7 @@ class LocalInferenceEngine(private val context: Context) {
         // ★ P3 多序列：显式 seq/pos（长度必须等于 nTokens）；都给时走 Seq 版 JNI 入口
         seqIds: IntArray? = null,
         positions: IntArray? = null,
+        tokenOutput: String? = null,
     ): Result<LayerForwardOutput> = withModelContext {
         if (!isLoaded) {
             return@withModelContext Result.failure(IllegalStateException("model_not_loaded"))
@@ -803,7 +808,25 @@ class LocalInferenceEngine(private val context: Context) {
         //   `llama_set_abort_callback` 读的就是它。
         clearLayerForwardAbort()
         try {
-            if (wantHidden) {
+            if (tokenOutput != null) {
+                MultiPositionArgmaxContract.validateRequest(mapOf(
+                    "stage_type" to "layer_forward", "token_output" to tokenOutput,
+                    "hidden_spec" to mapOf("n_tokens" to nTokens),
+                    "root_input" to mapOf("want_hidden" to wantHidden),
+                    "positions" to positions?.toList(),
+                ) + (seqIds?.let { mapOf("seq_ids" to it.toList()) } ?: emptyMap()))
+                check(supportsMultiPositionArgmax()) { "multi_position_argmax_unsupported" }
+                val tokens = IntArray(nTokens)
+                val nVocab = nativeLayerForwardTokens(modelPtr, hidden, nTokens, seqIds,
+                    requireNotNull(positions), tokens)
+                check(nVocab != -4) { "layer_forward_aborted" }
+                check(nVocab > 0) { "layer_forward_all_positions_failed ($nVocab)" }
+                val output = mapOf("token_argmax" to tokens.last(),
+                    "token_argmax_by_position" to tokens.toList(), "positions" to positions.toList(),
+                    "n_vocab" to nVocab, "n_tokens" to nTokens)
+                MultiPositionArgmaxContract.validateResult(output)
+                Result.success(LayerForwardOutput(tokens.last(), null, tokens.toList(), positions.toList(), nVocab))
+            } else if (wantHidden) {
                 val embeddingWidth = estimateEmbeddingWidth(hidden.size, nTokens)
                 val out = FloatArray(embeddingWidth * nTokens)
                 // keep-head（nextn）通道给的是末层输出（output_norm 之前）—— 与主仓接力
@@ -855,9 +878,16 @@ class LocalInferenceEngine(private val context: Context) {
                 }
                 Result.success(LayerForwardOutput(token, null))
             }
+        } catch (e: LinkageError) {
+            Result.failure(IllegalStateException("multi_position_argmax_unsupported", e))
         } catch (e: Exception) {
             Result.failure(e)
         }
+    }
+
+    /** A missing symbol in an older .so must never advertise this capability. */
+    fun supportsMultiPositionArgmax(): Boolean = nativeLoaded && probeMultiPositionArgmax {
+        nativeSupportsMultiPositionArgmax()
     }
 
     /**
@@ -1005,6 +1035,15 @@ class LocalInferenceEngine(private val context: Context) {
 
     // ------------------- 层段（layer_forward）-------------------
 
+    /** This query is available only in libraries with the all-position entry point. */
+    private external fun nativeSupportsMultiPositionArgmax(): Boolean
+
+    /** Returns positive n_vocab only after all rows succeeded; -4 means cancelled. */
+    private external fun nativeLayerForwardTokens(
+        modelPtr: Long, hidden: FloatArray, nTokens: Int,
+        seqIds: IntArray?, positions: IntArray, outTokens: IntArray,
+    ): Int
+
     /**
      * 层段前向：把上游 hidden 注入 embd 批次，从本节点的裁层 GGUF 继续算，
      * 返回**末位置 argmax token**（本节点是层流水线的**末段**时用）。
@@ -1136,4 +1175,13 @@ class LocalInferenceEngine(private val context: Context) {
 
     /** 探测某个 RPC endpoint 是否可达。 */
     fun probeRpcEndpoint(endpoint: String): Map<String, String> = nativeRpcProbe(endpoint)
+}
+
+/** Kept injectable so JVM coverage exercises compatibility with old JNI libraries. */
+internal fun probeMultiPositionArgmax(probe: () -> Boolean): Boolean = try {
+    probe()
+} catch (_: LinkageError) {
+    false
+} catch (_: Exception) {
+    false
 }

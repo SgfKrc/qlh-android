@@ -45,6 +45,7 @@ data class LayerForwardRequest(
      */
     val seqIds: IntArray? = null,
     val positions: IntArray? = null,
+    val tokenOutput: String? = null,
 ) {
     override fun equals(other: Any?): Boolean = this === other
     override fun hashCode(): Int = System.identityHashCode(this)
@@ -54,6 +55,9 @@ data class LayerForwardRequest(
 data class LayerForwardResult(
     val tokenArgmax: Int,
     val hiddenOut: FloatArray?,
+    val tokenArgmaxByPosition: List<Int>? = null,
+    val positions: List<Int>? = null,
+    val nVocab: Int? = null,
 )
 
 /**
@@ -147,6 +151,11 @@ class AndroidFullWorkerStageExecutor(
             )
         }
         val payload = offer.payload
+        try {
+            MultiPositionArgmaxContract.validateRequest(payload)
+        } catch (error: TaskWorkerProtocolException) {
+            throw AndroidFullWorkerStageException(error.code, error.message.orEmpty())
+        }
         val stageType = payload["stage_type"] as? String
         val layerOnly = allowLayerIdentityAlias()
         val supportedStageTypes = if (layerOnly) listOf("layer_forward") else
@@ -376,6 +385,9 @@ class AndroidFullWorkerStageExecutor(
         }
 
         if (rootInput["cleanup_only"] == true) {
+            if (payload.containsKey("token_output")) {
+                throw AndroidFullWorkerStageException("invalid_token_output", "cleanup cannot produce position tokens")
+            }
             clearLayerKv().getOrElse { error ->
                 throw AndroidFullWorkerStageException("stage_kv_cleanup_failed", error.message ?: "KV cleanup failed")
             }
@@ -395,6 +407,7 @@ class AndroidFullWorkerStageExecutor(
                 middleChannel = middleChannel,
                 seqIds = seqIds,
                 positions = positions,
+                tokenOutput = payload["token_output"] as? String,
             ),
         ).getOrElse { error ->
             throw AndroidFullWorkerStageException(
@@ -418,6 +431,23 @@ class AndroidFullWorkerStageExecutor(
         output["token_argmax"] = result.tokenArgmax
         output["layer_range"] = layerRange
         output["n_tokens"] = nTokens
+        val allPositions = payload["token_output"] == MultiPositionArgmaxContract.ALL_POSITIONS
+        val hasPositionResult = result.tokenArgmaxByPosition != null || result.positions != null || result.nVocab != null
+        if (allPositions || hasPositionResult) {
+            if (!allPositions || result.hiddenOut != null ||
+                result.positions != positions?.toList()) {
+                throw AndroidFullWorkerStageException("invalid_token_output",
+                    "multi-position result must match the request positions and contain no hidden")
+            }
+            output["token_argmax_by_position"] = result.tokenArgmaxByPosition
+            output["positions"] = result.positions
+            output["n_vocab"] = result.nVocab
+            try {
+                MultiPositionArgmaxContract.validateResult(output)
+            } catch (error: TaskWorkerProtocolException) {
+                throw AndroidFullWorkerStageException(error.code, error.message.orEmpty())
+            }
+        }
         result.hiddenOut?.let { out ->
             // The client passes the current connection's negotiated capability.
             // JSON peers retain their original reserve; binary metadata is measured by the transport.

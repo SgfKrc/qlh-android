@@ -505,6 +505,8 @@ class TaskWorkerService : Service() {
                 // ★ 票 21a（COMM-WIRE-01）：本构建已接线二进制 hidden 帧
                 //   （`TaskWorkerBinaryHidden` 抽取/放回 + 帧层数据段）⇒ 声明给主节点。
                 binaryHidden = true,
+                multiPositionArgmax = QlhApplication.instance.inferenceService
+                    ?.engine?.supportsMultiPositionArgmax() == true,
             )
             QlhLogger.i(
                 "TaskWorkerService",
@@ -634,10 +636,14 @@ class TaskWorkerService : Service() {
                                 // ★ 2026-09-23（A12）：多序列显式位置（协议层已校验；null = 单序列）。
                                 seqIds = req.seqIds,
                                 positions = req.positions,
+                                tokenOutput = req.tokenOutput,
                             ).map { out ->
                                 LayerForwardResult(
                                     tokenArgmax = out.tokenArgmax,
                                     hiddenOut = out.hiddenOut,
+                                    tokenArgmaxByPosition = out.tokenArgmaxByPosition,
+                                    positions = out.positions,
+                                    nVocab = out.nVocab,
                                 )
                             }
                         } finally {

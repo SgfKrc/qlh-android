@@ -196,6 +196,62 @@ class TaskWorkerClientStateTest {
         assertEquals("protocol", TaskWorkerSnapshot(lastErrorCode = "invalid_frame").failureKind)
     }
 
+    @Test
+    fun `completion requires running and cancellation wins atomically`() {
+        val machine = readyMachine()
+        assertTrue(machine.offer(identity, 20_000L, 1_000L))
+        assertFalse(machine.complete(identity, "a".repeat(64), 1_001L))
+        assertTrue(machine.markRunning(identity, 1_002L))
+        assertEquals(identity, machine.requestCancel(1_003L, identity))
+        assertFalse(machine.complete(identity, "a".repeat(64), 1_004L))
+        assertFalse(machine.fail(identity, "worker_execution_failed", true))
+        assertEquals(TaskWorkerAttemptState.CANCELLING, machine.snapshot().activeAttempt.state)
+    }
+
+    @Test
+    fun `successful attempt cannot execute twice during its lease even after reconnect`() {
+        val machine = readyMachine()
+        assertTrue(machine.offer(identity, 20_000L, 1_000L))
+        assertTrue(machine.markRunning(identity, 1_001L))
+        assertTrue(machine.complete(identity, "a".repeat(64), 1_002L))
+        assertEquals("worker_attempt_already_admitted", machine.admitOffer(identity, 20_000L, 1_003L))
+        machine.onDisconnected(1_004L, "transport_disconnected", "eof")
+        machine.retryIfDue(3_000L)
+        machine.onConnected()
+        machine.onHelloAck(true, "", "", 3_001L)
+        assertEquals("worker_attempt_already_admitted", machine.admitOffer(identity, 20_000L, 3_002L))
+    }
+
+    @Test
+    fun `attempt history never evicts an unexpired lease to admit more work`() {
+        val machine = TaskWorkerStateMachine(maxAttemptHistory = 2).also {
+            it.start(); it.onConnected(); it.onHelloAck(true, "", "", 0L)
+        }
+        val second = identity.copy(attemptId = "att_second01")
+        val third = identity.copy(attemptId = "att_third001")
+        for (attempt in listOf(identity, second)) {
+            assertTrue(machine.offer(attempt, 20_000L, 1_000L))
+            assertTrue(machine.markRunning(attempt, 1_001L))
+            assertTrue(machine.complete(attempt, "a".repeat(64), 1_002L))
+        }
+        assertEquals("worker_attempt_history_full", machine.admitOffer(third, 30_000L, 1_003L))
+        assertEquals("worker_attempt_already_admitted", machine.admitOffer(identity, 20_000L, 1_004L))
+        assertNull(machine.admitOffer(third, 30_000L, 20_000L))
+    }
+
+    @Test
+    fun `renewal retains the largest lease deadline in attempt history`() {
+        val machine = readyMachine()
+        assertTrue(machine.offer(identity, 2_000L, 1_000L))
+        assertTrue(machine.markRunning(identity, 1_001L))
+        assertTrue(machine.renew(identity, 20_000L, 1_100L))
+        assertTrue(machine.renew(identity, 5_000L, 1_200L))
+        assertTrue(machine.complete(identity, "a".repeat(64), 1_300L))
+        assertEquals("worker_attempt_already_admitted", machine.admitOffer(identity, 20_000L, 6_000L))
+        val nextEpoch = identity.copy(leaseEpoch = identity.leaseEpoch + 1)
+        assertTrue(machine.offer(nextEpoch, 20_000L, 6_001L))
+    }
+
     private fun readyMachine(): TaskWorkerStateMachine = TaskWorkerStateMachine().also {
         it.start()
         it.onConnected()

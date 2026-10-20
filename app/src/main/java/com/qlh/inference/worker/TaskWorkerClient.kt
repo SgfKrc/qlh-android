@@ -7,6 +7,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
@@ -16,8 +17,13 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlin.coroutines.resumeWithException
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.DataInputStream
@@ -98,10 +104,14 @@ class TaskWorkerStateMachine(
     private val baseBackoffMs: Long = 1_000L,
     private val maxBackoffMs: Long = 30_000L,
     private val maxConsecutiveFailures: Int = 8,
+    private val maxAttemptHistory: Int = 4096,
 ) {
-    init { require(maxConsecutiveFailures > 0) }
+    init { require(maxConsecutiveFailures > 0 && maxAttemptHistory > 0) }
 
     private var snapshot = TaskWorkerSnapshot()
+    // Identity/deadline only: no hidden/result retention and no response replay promise.
+    // Keep across reconnects; only expired leases may be removed to make room.
+    private val admittedAttempts = LinkedHashMap<TaskWorkerAttemptIdentity, Long>()
 
     @Synchronized
     fun snapshot(): TaskWorkerSnapshot = snapshot
@@ -184,11 +194,21 @@ class TaskWorkerStateMachine(
     }
 
     @Synchronized
-    fun offer(identity: TaskWorkerAttemptIdentity, leaseExpiresAtMs: Long, nowMs: Long): Boolean {
+    fun offer(identity: TaskWorkerAttemptIdentity, leaseExpiresAtMs: Long, nowMs: Long): Boolean =
+        admitOffer(identity, leaseExpiresAtMs, nowMs) == null
+
+    /** Atomically reserve both the logical slot and its bounded lease replay fence. */
+    @Synchronized
+    fun admitOffer(identity: TaskWorkerAttemptIdentity, leaseExpiresAtMs: Long, nowMs: Long): String? {
         expireActiveAttempt(nowMs)
-        if (snapshot.connection != TaskWorkerConnectionState.READY || leaseExpiresAtMs <= nowMs) return false
-        val current = snapshot.activeAttempt
-        if (current.state in ACTIVE_ATTEMPT_STATES) return false
+        admittedAttempts.entries.removeAll { it.value <= nowMs }
+        if (snapshot.connection != TaskWorkerConnectionState.READY || leaseExpiresAtMs <= nowMs) {
+            return "worker_busy_or_lease_invalid"
+        }
+        if (identity in admittedAttempts) return "worker_attempt_already_admitted"
+        if (snapshot.activeAttempt.state in ACTIVE_ATTEMPT_STATES) return "worker_busy_or_lease_invalid"
+        if (admittedAttempts.size >= maxAttemptHistory) return "worker_attempt_history_full"
+        admittedAttempts[identity] = leaseExpiresAtMs
         snapshot = snapshot.copy(
             activeAttempt = TaskWorkerAttemptSnapshot(
                 identity = identity,
@@ -196,7 +216,7 @@ class TaskWorkerStateMachine(
                 leaseExpiresAtMs = leaseExpiresAtMs,
             ),
         )
-        return true
+        return null
     }
 
     @Synchronized
@@ -227,6 +247,7 @@ class TaskWorkerStateMachine(
         val current = snapshot.activeAttempt
         if (!sameIdentity(current.identity, identity) || current.state !in ACTIVE_ATTEMPT_STATES) return false
         if (leaseExpiresAtMs <= nowMs) return false
+        admittedAttempts[identity] = maxOf(admittedAttempts[identity] ?: 0L, leaseExpiresAtMs)
         snapshot = snapshot.copy(activeAttempt = current.copy(leaseExpiresAtMs = leaseExpiresAtMs))
         return true
     }
@@ -235,7 +256,7 @@ class TaskWorkerStateMachine(
     fun complete(identity: TaskWorkerAttemptIdentity, outputSha256: String, nowMs: Long): Boolean {
         expireActiveAttempt(nowMs)
         val current = snapshot.activeAttempt
-        if (!sameIdentity(current.identity, identity) || current.state !in ACTIVE_ATTEMPT_STATES) return false
+        if (!sameIdentity(current.identity, identity) || current.state != TaskWorkerAttemptState.RUNNING) return false
         if (current.leaseExpiresAtMs <= nowMs) return false
         snapshot = snapshot.copy(
             activeAttempt = current.copy(
@@ -249,7 +270,9 @@ class TaskWorkerStateMachine(
     @Synchronized
     fun fail(identity: TaskWorkerAttemptIdentity, errorCode: String, retryable: Boolean): Boolean {
         val current = snapshot.activeAttempt
-        if (!sameIdentity(current.identity, identity) || current.state !in ACTIVE_ATTEMPT_STATES) return false
+        if (!sameIdentity(current.identity, identity) || current.state !in setOf(
+                TaskWorkerAttemptState.OFFERED, TaskWorkerAttemptState.RUNNING,
+        )) return false
         snapshot = snapshot.copy(
             activeAttempt = current.copy(
                 state = TaskWorkerAttemptState.FAILED,
@@ -364,17 +387,23 @@ internal class SocketTaskWorkerTransport(
     private val sendLock = Any()
     private val gson = GsonBuilder().disableHtmlEscaping().create()
 
-    @Volatile
+    private val binaryHiddenLock = Any()
     private var binaryHiddenEnabled: Boolean = false
-    @Volatile
     private var masterBinaryHiddenEnabled: Boolean = false
+    private var binaryHiddenGeneration = 0L
+    private var binaryHiddenClosed = false
+    private val pendingHellos = java.util.ArrayDeque<Pair<Long, Boolean>>()
+    private val helloAckReplay = TaskWorkerReplayCache()
 
     override val isBinaryHiddenNegotiated: Boolean
-        get() = binaryHiddenEnabled && masterBinaryHiddenEnabled
+        get() = synchronized(binaryHiddenLock) { binaryHiddenEnabled && masterBinaryHiddenEnabled }
 
     override fun setBinaryHiddenEnabled(enabled: Boolean) {
-        binaryHiddenEnabled = enabled
-        masterBinaryHiddenEnabled = false
+        synchronized(binaryHiddenLock) {
+            binaryHiddenEnabled = enabled && !binaryHiddenClosed
+            masterBinaryHiddenEnabled = false
+            binaryHiddenGeneration++
+        }
     }
 
     private data class OuterFrame(val value: com.google.gson.JsonObject, val binaryHidden: Boolean = false)
@@ -384,6 +413,16 @@ internal class SocketTaskWorkerTransport(
         data: Any? = null,
         binaryBody: ByteArray? = null,
     ) = withContext(Dispatchers.IO) {
+        synchronized(sendLock) { writeOuter(type, data, binaryBody) }
+    }
+
+    /** Caller holds sendLock so selection and the actual frame write share one order. */
+    private fun writeOuter(
+        type: String,
+        data: Any?,
+        binaryBody: ByteArray?,
+        beforeWrite: () -> Unit = {},
+    ) {
         val dataJson = data?.let { ",\"data\":${gson.toJson(it)}" } ?: ""
         // ★ 票 21a（COMM-WIRE-01）：二进制体独立成段，元数据里只留格式标记与长度。
         val format = if (binaryBody == null) "json" else "binary"
@@ -397,28 +436,37 @@ internal class SocketTaskWorkerTransport(
             "message_too_large",
             "message",
         )
-        synchronized(sendLock) {
-            output.writeInt(outer.size)
-            output.write(outer)
-            if (binaryBody != null) {
-                output.writeInt(binaryBody.size)
-                output.write(binaryBody)
-            }
-            output.flush()
+        beforeWrite()
+        output.writeInt(outer.size)
+        output.write(outer)
+        if (binaryBody != null) {
+            output.writeInt(binaryBody.size)
+            output.write(binaryBody)
         }
+        output.flush()
     }
 
     override suspend fun send(envelope: TaskWorkerEnvelope) = withContext(Dispatchers.IO) {
-        if (envelope.messageType == TaskWorkerProtocol.HELLO) masterBinaryHiddenEnabled = false
-        val binary = binaryHiddenEnabled && masterBinaryHiddenEnabled
-        // Validate the full envelope, but measure the actual wire representation after extraction.
-        TaskWorkerProtocol.validate(envelope)
-        val inner = JsonParser.parseString(
-            TaskWorkerProtocol.canonicalBytes(envelope).toString(StandardCharsets.UTF_8),
-        ).asJsonObject
-        val (body, binaryBody) = TaskWorkerBinaryHidden.split(inner, binary)
-        if (binaryBody == null) TaskWorkerProtocol.encode(envelope)
-        sendOuter("task_worker", controlFence.decorate(body), binaryBody)
+        synchronized(sendLock) {
+            // Validate the full envelope, but measure the wire representation after extraction.
+            TaskWorkerProtocol.validate(envelope)
+            val inner = JsonParser.parseString(
+                TaskWorkerProtocol.canonicalBytes(envelope).toString(StandardCharsets.UTF_8),
+            ).asJsonObject
+            val (body, binaryBody) = TaskWorkerBinaryHidden.split(inner, isBinaryHiddenNegotiated)
+            if (binaryBody == null) TaskWorkerProtocol.encode(envelope)
+            writeOuter("task_worker", controlFence.decorate(body), binaryBody) {
+                if (envelope.messageType == TaskWorkerProtocol.HELLO) {
+                    val capabilities = envelope.payload["capabilities"] as? Map<*, *>
+                    synchronized(binaryHiddenLock) {
+                        masterBinaryHiddenEnabled = false
+                        binaryHiddenGeneration++
+                        pendingHellos.addLast(binaryHiddenGeneration to
+                            (binaryHiddenEnabled && capabilities?.get("binary_hidden") == true))
+                    }
+                }
+            }
+        }
     }
 
     override fun requireControlAuthority() {
@@ -483,7 +531,7 @@ internal class SocketTaskWorkerTransport(
         }
         val binary = formatValue.asString == "binary"
         if (binary) {
-            if (!binaryHiddenEnabled || !masterBinaryHiddenEnabled) {
+            if (!isBinaryHiddenNegotiated) {
                 invalidFrame("binary hidden was not negotiated on this connection", "format")
             }
             if (objectValue.get("type")?.let {
@@ -623,8 +671,18 @@ internal class SocketTaskWorkerTransport(
                         throw error
                     }
                     if (decoded.messageType == TaskWorkerProtocol.HELLO_ACK) {
-                        masterBinaryHiddenEnabled = binaryHiddenEnabled &&
-                            decoded.payload["accepted"] == true && decoded.payload["binary_hidden"] == true
+                        synchronized(binaryHiddenLock) {
+                            // A replay cannot consume another HELLO's pending acknowledgement.
+                            if (helloAckReplay.replay(decoded) == null) {
+                                helloAckReplay.remember(decoded, decoded)
+                                val pending = pendingHellos.pollFirst()
+                                if (pending != null && pending.first == binaryHiddenGeneration &&
+                                    pendingHellos.isEmpty() && !binaryHiddenClosed) {
+                                    masterBinaryHiddenEnabled = binaryHiddenEnabled && pending.second &&
+                                        decoded.payload["accepted"] == true && decoded.payload["binary_hidden"] == true
+                                }
+                            }
+                        }
                     }
                     return TaskWorkerInboundEvent.Envelope(decoded)
                 }
@@ -712,6 +770,13 @@ internal class SocketTaskWorkerTransport(
     }
 
     override suspend fun close() {
+        synchronized(binaryHiddenLock) {
+            binaryHiddenClosed = true
+            binaryHiddenEnabled = false
+            masterBinaryHiddenEnabled = false
+            binaryHiddenGeneration++
+            pendingHellos.clear()
+        }
         withContext(Dispatchers.IO) {
             runCatching { socket.close() }
         }
@@ -806,17 +871,31 @@ class TaskWorkerClient(
     @Volatile private var loopJob: Job? = null
     @Volatile private var transport: TaskWorkerTransport? = null
     @Volatile private var lastHeartbeatAckMs: Long = 0L
-    private var executionJob: Job? = null
+    @Volatile private var executionJob: Job? = null
     private var heartbeatJob: Job? = null
+    private val executionLock = Any()
+    private class ExecutionSlot(val identity: TaskWorkerAttemptIdentity) {
+        @Volatile var job: Job? = null
+        @Volatile var terminalResponse: TaskWorkerEnvelope? = null
+    }
+    @Volatile private var executionSlot: ExecutionSlot? = null
+    private data class CancellationRequest(
+        val identity: TaskWorkerAttemptIdentity,
+        val reasonCode: String,
+        val providerId: String,
+    )
+    @Volatile private var cancellationRequest: CancellationRequest? = null
+    private val convergenceLock = Any()
+    private var convergenceIdentity: TaskWorkerAttemptIdentity? = null
+    private var convergenceJob: Job? = null
 
     // ★ 2026-10-07（DIST-NEXT-1）：取消 ACK 的单一事实源。
     //   `stage_cancelled` 可能发两次：先是 ACK（可能 `execution_in_flight`），
     //   执行真正停止后再补一条终态。这里记录「已发出的状态」，保证每条状态
     //   只发一次，且不会把 ACK 冒充成终态。
-    private val cancelLock = Any()
-    private var cancelAckAttemptId: String? = null
+    private val cancelAckMutex = Mutex()
+    private var cancelAckIdentity: TaskWorkerAttemptIdentity? = null
     private var cancelAckState: String? = null
-    private var cancelAckReasonCode: String = ""
 
     /** offer 里的 `provider_id`（主节点口径）；本地取消的回程必须回显它。 */
     @Volatile
@@ -849,52 +928,47 @@ class TaskWorkerClient(
     }
 
     fun cancelActive(reasonCode: String = "user_cancelled"): Boolean {
-        val identity = machine.requestCancel(clockMs()) ?: run {
+        val code = reasonCode.takeIf { it.matches(Regex("^[a-z][a-z0-9_]{0,63}$")) }
+            ?: "worker_cancelled"
+        val request = requestCancellation(code) ?: run {
             if (modelPrepareHandler?.cancelPending() != true) return false
-            // Retiring the connection provides the same join/unload barrier as disconnect;
-            // the master sees lost preparation, never an invented cleanup ACK.
             val current = transport
             scope.launch { runCatching { current?.close() } }
             return true
         }
-        val code = reasonCode.takeIf { it.matches(Regex("^[a-z][a-z0-9_]{0,63}$")) }
-            ?: "worker_cancelled"
-        // ★ 2026-10-07（DIST-NEXT-1）：本地取消同样走**唯一取消状态机** ——
-        //   回程是 `stage_cancelled`（而非 `stage_error`），并如实报告执行状态；
-        //   主节点据此区分「用户取消」「执行失败」「对端已停止」。
-        //   ⚠️ 不再取消心跳：心跳只取决于连接状态，与单个 attempt 无关；此前
-        //      在这里停掉心跳会让 worker 在取消后 120s 内被判失联。
-        stageHandler?.requestCancel(identity)
-        executionJob?.cancel()
+        val identity = request.identity
+        val providerId = request.providerId
         publish()
-        val inFlight = stageHandler?.isExecutionInFlight(identity) == true
         scope.launch {
             val current = transport ?: return@launch
-            val providerId = activeProviderId ?: nodeId
-            runCatching {
-                sendCancelledAck(
-                    current,
-                    identity,
-                    providerId,
-                    code,
-                    if (inFlight) TaskWorkerProtocol.EXECUTION_IN_FLIGHT
-                    else TaskWorkerProtocol.EXECUTION_STOPPED,
-                )
-            }.onFailure { error ->
+            try {
+                sendCancelledAck(current, identity, providerId, code,
+                    if (isExecutionInFlight(identity)) TaskWorkerProtocol.EXECUTION_IN_FLIGHT
+                    else TaskWorkerProtocol.EXECUTION_STOPPED)
+            } catch (error: Exception) {
                 machine.onDisconnected(clockMs(), "cancel_send_failed", error.message ?: "cancel send failed")
                 publish()
-            }
-            if (!inFlight) {
-                machine.cancelled(identity)
-                publish()
-            } else {
-                // ★ 2026-10-07（真机 P0）：本地取消同样要收敛（此前只依赖执行协程的取消分支，
-                //   而那条路径上的 `send` 会因协程已取消而抛 ⇒ 终态 ACK 与槽位释放一起丢失）。
+            } finally {
                 convergeCancellation(current, identity, providerId)
             }
         }
         return true
     }
+
+    private fun requestCancellation(reasonCode: String, expectedIdentity: TaskWorkerAttemptIdentity? = null): CancellationRequest? =
+        synchronized(executionLock) {
+            val identity = machine.requestCancel(clockMs(), expectedIdentity) ?: return@synchronized null
+            val request = CancellationRequest(identity, reasonCode, activeProviderId ?: nodeId)
+            cancellationRequest = request
+            stageHandler?.requestCancel(identity)
+            executionJob?.cancel()
+            request
+        }
+
+    /** Covers queued/pre-entry execution as well as a native call that outlives Job cancellation. */
+    private fun isExecutionInFlight(identity: TaskWorkerAttemptIdentity): Boolean =
+        executionSlot?.let { it.identity == identity && it.job?.isCompleted != true } == true ||
+            stageHandler?.isExecutionInFlight(identity) == true
 
     /** Non-blocking stop used by Android Service lifecycle callbacks. */
     fun stop() {
@@ -1148,7 +1222,15 @@ class TaskWorkerClient(
         //   （`remote_<node_id>`），不是本节点的裸 nodeId。此前一律回裸 nodeId，被主节点
         //   以 `attempt_identity_mismatch` 拒掉，真机表现为 Stage 响应一直等到超时。
         val providerId = (payload["provider_id"] as? String)?.takeIf { it.isNotBlank() } ?: nodeId
-        activeProviderId = providerId
+        val occupied = executionSlot
+        if (occupied != null && isExecutionInFlight(occupied.identity)) {
+            stageChunks.discard(identity.attemptId)
+            connection.send(TaskWorkerProtocol.buildStageAccept(
+                identity, providerId, false, "worker_execution_in_flight", true,
+                newMessageId("accept"), clockMs(),
+            ))
+            return
+        }
         modelPrepareHandler?.validateStage(envelope)?.let { code ->
             stageChunks.discard(identity.attemptId)
             connection.send(TaskWorkerProtocol.buildStageAccept(
@@ -1157,24 +1239,27 @@ class TaskWorkerClient(
             return
         }
         val expires = (payload["lease_expires_at_ms"] as Number).toLong()
-        if (!machine.offer(identity, expires, clockMs())) {
+        val rejection = machine.admitOffer(identity, expires, clockMs())
+        if (rejection != null) {
             // ★ 2026-10-07（真机 P0）：拒绝必须留痕。此前设备侧完全没有日志，现场只能从
             //   主节点看到 `worker_busy_or_lease_invalid`，无法区分「上一个 attempt 未释放
             //   槽位」还是「lease 过期」。
             val state = machine.snapshot()
             QlhLogger.w(
                 "TaskWorkerClient",
-                "stage offer rejected: worker_busy_or_lease_invalid " +
+                "stage offer rejected: $rejection " +
                     "stage=${identity.stageId} attempt=${identity.attemptId} " +
                     "activeAttempt=${state.activeAttempt.state} " +
                     "connection=${state.connection}",
             )
             connection.send(TaskWorkerProtocol.buildStageAccept(
-                identity, providerId, false, "worker_busy_or_lease_invalid", true,
+                identity, providerId, false, rejection, rejection != "worker_attempt_already_admitted",
                 newMessageId("accept"), clockMs(),
             ))
+            stageChunks.discard(identity.attemptId)
             return
         }
+        activeProviderId = providerId
         val handler = stageHandler
         // ★ 2026-10-08（诊断，定位后降级）：真机卡点 —— 18 片分片与 offer 都完好送达，
         //   但之后**没有任何**装配/执行/拒绝痕迹、CPU 全程空闲。下面几个分支此前完全静默，
@@ -1220,56 +1305,129 @@ class TaskWorkerClient(
         connection.send(TaskWorkerProtocol.buildStageAccept(
             identity, providerId, true, "", false, newMessageId("accept"), clockMs(),
         ))
-        machine.markRunning(identity, clockMs())
-        publish()
-        executionJob = scope.launch {
-            try {
-                handler.setBinaryHiddenEnabled(connection.isBinaryHiddenNegotiated)
-                val execution = modelPrepareHandler?.executeStage(effectiveOffer) { handler.execute(effectiveOffer) }
-                    ?: handler.execute(effectiveOffer)
-                if (isAttemptCancelling(identity)) {
-                    // ★ 2026-10-07（DIST-NEXT-1）：取消与结果竞态 —— 已进入取消的
-                    //   attempt 不得再发 `stage_result`（否则主节点会把「已取消」
-                    //   记成「已完成」）。迟到的结果由主节点吸收并单独计数。
-                    finishCancelledExecution(connection, identity, providerId)
-                } else {
-                    val output = TaskWorkerProtocol.buildStageResult(
-                        identity, providerId, execution.output, execution.metadata,
-                        newMessageId("result"), clockMs(),
-                    )
-                    val digest = output.payload["output_sha256"] as String
-                    if (machine.complete(identity, digest, clockMs())) {
-                        connection.send(output)
-                        publish()
-                    }
-                }
-            } catch (error: CancellationException) {
-                finishCancelledExecution(connection, identity, providerId)
-            } catch (error: Exception) {
-                if (isAttemptCancelling(identity)) {
-                    // ★ 2026-10-07（DIST-NEXT-1）：native 层段前向被取消标志中断后
-                    //   返回的是普通失败。那属于取消，不能报成 `stage_error`
-                    //   （会把「用户取消」写成「执行失败」）。
-                    finishCancelledExecution(connection, identity, providerId)
-                } else {
-                    val errorCode = (error as? AndroidFullWorkerStageException)?.code
-                        ?: "worker_execution_failed"
-                    if (machine.fail(identity, errorCode, retryable = true)) {
-                        // ★ 2026-10-07（真机 P0）：执行失败必须留设备侧证据（此前完全静默）。
-                        QlhLogger.e(
-                            "TaskWorkerClient",
-                            "stage execution failed: stage=${identity.stageId} " +
-                                "attempt=${identity.attemptId} code=$errorCode " +
-                                "detail=${error.message ?: error.javaClass.simpleName}",
-                        )
-                        connection.send(TaskWorkerProtocol.buildStageError(
-                            identity, providerId, errorCode, true,
-                            newMessageId("error"), clockMs(),
-                        ))
-                        publish()
+        val slot = ExecutionSlot(identity)
+        val job = synchronized(executionLock) {
+            if (!machine.markRunning(identity, clockMs())) null else {
+                executionSlot = slot
+                scope.launch(start = CoroutineStart.LAZY) {
+                    executeOffer(connection, effectiveOffer, slot, providerId, handler)
+                }.also { launched ->
+                    slot.job = launched
+                    executionJob = launched
+                    launched.invokeOnCompletion {
+                        // Retire compute ownership before a terminal write can become visible.
+                        val response = slot.terminalResponse
+                        slot.terminalResponse = null
+                        if (response != null) {
+                            scope.launch { sendTerminalResponse(connection, slot.identity, response) }
+                        } else if (transport === connection && isAttemptCancellingOrDone(identity)) {
+                            convergeCancellation(connection, identity, providerId)
+                        }
                     }
                 }
             }
+        }
+        publish()
+        if (job == null) {
+            if (isAttemptCancellingOrDone(identity)) {
+                finishCancelledExecution(connection, identity, providerId)
+            } else {
+                val code = if (machine.snapshot().activeAttempt.leaseExpiresAtMs <= clockMs())
+                    "worker_lease_expired_before_execution" else "worker_attempt_not_runnable"
+                connection.send(TaskWorkerProtocol.buildStageError(
+                    identity, providerId, code, true, newMessageId("error"), clockMs(),
+                ))
+            }
+            return
+        }
+        job.start()
+    }
+
+    private suspend fun executeOffer(
+        connection: TaskWorkerTransport,
+        effectiveOffer: TaskWorkerEnvelope,
+        slot: ExecutionSlot,
+        providerId: String,
+        handler: TaskWorkerStageHandler,
+    ) {
+        val identity = slot.identity
+        try {
+            handler.setBinaryHiddenEnabled(connection.isBinaryHiddenNegotiated)
+            val action: suspend () -> TaskWorkerStageExecution = {
+                currentCoroutineContext().ensureActive()
+                handler.execute(effectiveOffer)
+            }
+            val execution = modelPrepareHandler?.executeStage(effectiveOffer, action) ?: action()
+            if (isAttemptCancelling(identity)) {
+                // ★ 2026-10-07（DIST-NEXT-1）：取消与结果竞态 —— 已进入取消的
+                //   attempt 不得再发 `stage_result`（否则主节点会把「已取消」
+                //   记成「已完成」）。迟到的结果由主节点吸收并单独计数。
+                finishCancelledExecution(connection, identity, providerId)
+            } else {
+                val output = TaskWorkerProtocol.buildStageResult(
+                    identity, providerId, execution.output, execution.metadata,
+                    newMessageId("result"), clockMs(),
+                )
+                val digest = output.payload["output_sha256"] as String
+                if (machine.complete(identity, digest, clockMs())) {
+                    slot.terminalResponse = output
+                    publish()
+                } else if (isAttemptCancellingOrDone(identity)) {
+                    // Cancellation may win while output hashing crosses the earlier check.
+                    finishCancelledExecution(connection, identity, providerId)
+                }
+            }
+        } catch (error: CancellationException) {
+            finishCancelledExecution(connection, identity, providerId)
+        } catch (error: Exception) {
+            if (isAttemptCancelling(identity)) {
+                // ★ 2026-10-07（DIST-NEXT-1）：native 层段前向被取消标志中断后
+                //   返回的是普通失败。那属于取消，不能报成 `stage_error`
+                //   （会把「用户取消」写成「执行失败」）。
+                finishCancelledExecution(connection, identity, providerId)
+            } else {
+                val errorCode = (error as? AndroidFullWorkerStageException)?.code
+                    ?: "worker_execution_failed"
+                val response = TaskWorkerProtocol.buildStageError(
+                    identity, providerId, errorCode, true, newMessageId("error"), clockMs(),
+                )
+                if (machine.fail(identity, errorCode, retryable = true)) {
+                    slot.terminalResponse = response
+                    // ★ 2026-10-07（真机 P0）：执行失败必须留设备侧证据（此前完全静默）。
+                    QlhLogger.e(
+                        "TaskWorkerClient",
+                        "stage execution failed: stage=${identity.stageId} " +
+                            "attempt=${identity.attemptId} code=$errorCode " +
+                            "detail=${error.message ?: error.javaClass.simpleName}",
+                    )
+                    publish()
+                } else if (isAttemptCancellingOrDone(identity)) {
+                    finishCancelledExecution(connection, identity, providerId)
+                }
+            }
+        }
+    }
+
+    /** Terminal I/O is a sibling of the completed compute owner, never its physical slot. */
+    private suspend fun sendTerminalResponse(
+        connection: TaskWorkerTransport,
+        identity: TaskWorkerAttemptIdentity,
+        response: TaskWorkerEnvelope,
+    ) {
+        // A successor may already be active; preserve the captured response and connection.
+        if (transport !== connection) return
+        try {
+            withTimeout(heartbeatTimeoutMs) { connection.send(response) }
+        } catch (error: TimeoutCancellationException) {
+            QlhLogger.w("TaskWorkerClient", "stage terminal response timed out: " +
+                "stage=${identity.stageId} attempt=${identity.attemptId}")
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            // A late send failure must not fail/disconnect a successor that now owns execution.
+            QlhLogger.w("TaskWorkerClient", "stage terminal response send failed: " +
+                "stage=${identity.stageId} attempt=${identity.attemptId} " +
+                "detail=${error.message ?: error.javaClass.simpleName}")
         }
     }
 
@@ -1351,85 +1509,48 @@ class TaskWorkerClient(
         //   （协议精确字段集如此），因此优先回显 offer 时记下的那个 ——
         //   回裸 `nodeId` 会被主节点以 `attempt_identity_mismatch` 拒绝，
         //   真机表现正是「`stage_cancel_acknowledged` 恒缺席」。
-        val providerId = (envelope.payload["provider_id"] as? String)
-            ?.takeIf { it.isNotBlank() }
-            ?: activeProviderId
-            ?: nodeId
         val reasonCode = (envelope.payload["reason_code"] as? String)
             ?.takeIf { it.isNotBlank() } ?: "coordinator_cancelled"
-        if (machine.requestCancel(clockMs(), expectedIdentity = identity) != identity) return
-        // ★ 2026-10-07（DIST-NEXT-1）：取消合同。
-        //   ① 先让执行器知道要停（native 层段前向在下一个可分割边界退出）；
-        //   ② 再取消协程；
-        //   ③ ACK **立即**发出，与「执行是否已停止」解耦 —— 层段模式下
-        //      `stageHandler != null` 也必须回 ACK，且状态如实（`execution_in_flight`
-        //      / `execution_stopped`）。执行真正停止后由 finishCancelledExecution
-        //      补发终态，主节点不再需要等到租约/步骤超时。
-        val handler = stageHandler
-        // ⚠️ 必须在 `executionJob.cancel()` **之前**求值：`Job.isActive` 在取消后立即
-        //   变 false，用它判断会把「仍在跑的原子前向」误报成「已停止」。
-        val inFlight = handler?.isExecutionInFlight(identity) == true
-        handler?.requestCancel(identity)
-        executionJob?.cancel()
+        val request = requestCancellation(reasonCode, identity) ?: return
+        val providerId = request.providerId
         publish()
-        sendCancelledAck(
-            connection,
-            identity,
-            providerId,
-            reasonCode,
-            if (inFlight) TaskWorkerProtocol.EXECUTION_IN_FLIGHT
-            else TaskWorkerProtocol.EXECUTION_STOPPED,
-        )
-        if (!inFlight && machine.cancelled(identity)) publish()
-        if (inFlight) convergeCancellation(connection, identity, providerId)
+        try {
+            sendCancelledAck(connection, identity, providerId, reasonCode,
+                if (isExecutionInFlight(identity)) TaskWorkerProtocol.EXECUTION_IN_FLIGHT
+                else TaskWorkerProtocol.EXECUTION_STOPPED)
+        } finally {
+            convergeCancellation(connection, identity, providerId)
+        }
     }
 
-    /**
-     * ★ 2026-10-07（真机 P0）：等执行真正停止后补发终态、释放槽位。
-     *
-     * 必须跑在**独立且不可取消**的协程里：`executionJob.cancel()` 之后，执行协程上的任何挂起
-     * （包括 `send`）都会立刻抛 `CancellationException`，把「终态 ACK + 槽位释放」一起带走 ⇒
-     * attempt 卡在 `CANCELLING`（`ACTIVE_ATTEMPT_STATES`）⇒ 之后每个 `stage_offer` 都被拒
-     * `worker_busy_or_lease_invalid`，直到 lease 过期。协调方取消（`handleCancel`）与
-     * worker 侧主动取消（`cancelActive`）共用这一条收敛路径。
-     */
+    /** Timeout is diagnostic only: physical execution must stop before ACK/slot release. */
     private fun convergeCancellation(
         connection: TaskWorkerTransport,
         identity: TaskWorkerAttemptIdentity,
         providerId: String,
     ) {
-        scope.launch {
-            withContext(NonCancellable) {
-                val deadline = clockMs() + CANCEL_STOP_WAIT_MS
-                while (stageHandler?.isExecutionInFlight(identity) == true &&
-                    clockMs() < deadline
-                ) {
+        val job = synchronized(convergenceLock) {
+            if (!isAttemptCancellingOrDone(identity)) return
+            if (convergenceIdentity == identity && convergenceJob?.isCompleted == false) return
+            convergenceIdentity = identity
+            scope.launch(start = CoroutineStart.LAZY) {
+                val startedMs = monotonicMs()
+                var warned = false
+                // Keep waiting after 30s, but remain cancellable during connection/service retirement.
+                while (isExecutionInFlight(identity)) {
+                    if (transport !== connection || !isAttemptCancellingOrDone(identity)) return@launch
+                    if (!warned && monotonicMs() - startedMs >= CANCEL_STOP_WAIT_MS) {
+                        warned = true
+                        runCatching { QlhLogger.w("TaskWorkerClient",
+                            "cancel convergence timed out after ${CANCEL_STOP_WAIT_MS}ms " +
+                                "attempt=${identity.attemptId}: retaining the execution slot") }
+                    }
                     delay(CANCEL_STOP_POLL_MS)
                 }
-                val stopped = stageHandler?.isExecutionInFlight(identity) != true
-                // ⚠️ 先收敛、后记日志：槽位释放是这条路径上**唯一**不可省的副作用。
-                //   （日志走 `android.util.Log`，在某些环境会抛异常；顺序反了会让「取消后
-                //   worker 假死」在那些环境里复现。）
                 finishCancelledExecution(connection, identity, providerId)
-                runCatching {
-                    if (stopped) {
-                        QlhLogger.i(
-                            "TaskWorkerClient",
-                            "cancel converged: attempt=${identity.attemptId} " +
-                                "execution stopped, slot released",
-                        )
-                    } else {
-                        // 超时也要释放槽位：卡在 `CANCELLING` 会让 worker 对后续所有 stage
-                        // 假死，比「旧前向可能仍在飞」更严重（主节点侧仍有 lease/attempt 护栏）。
-                        QlhLogger.w(
-                            "TaskWorkerClient",
-                            "cancel convergence timed out after ${CANCEL_STOP_WAIT_MS}ms " +
-                                "attempt=${identity.attemptId}: releasing the attempt slot",
-                        )
-                    }
-                }
-            }
+            }.also { convergenceJob = it }
         }
+        job.start()
     }
 
     /** 该 attempt 是否已进入取消（`CANCELLING`）—— 决定是否还能发结果/错误。 */
@@ -1446,11 +1567,12 @@ class TaskWorkerClient(
      * `CANCELLED`。若终态 ACK 仍以 `CANCELLING` 为门槛，后到的那条就会**跳过发送** ——
      * 主节点因此只看到 `execution_in_flight`（现场正是如此）。重复发送由
      * [sendCancelledAck] 的同状态去重负责，所以这里放宽到 `CANCELLED` 也允许。
+     * 取消期间租约过期进入 LOST 后，同一身份仍可补真实停止回执；不能复活执行。
      */
     private fun isAttemptCancellingOrDone(identity: TaskWorkerAttemptIdentity): Boolean {
         val active = machine.snapshot().activeAttempt
-        return active.identity == identity &&
-            active.state in CANCELLING_STATES
+        return active.identity == identity && (active.state in CANCELLING_STATES ||
+            (active.state == TaskWorkerAttemptState.LOST && cancellationRequest?.identity == identity))
     }
 
     /**
@@ -1464,42 +1586,29 @@ class TaskWorkerClient(
         connection: TaskWorkerTransport,
         identity: TaskWorkerAttemptIdentity,
         providerId: String,
-    ) {
-        if (!isAttemptCancellingOrDone(identity)) return
-        val reasonCode = synchronized(cancelLock) {
-            if (cancelAckAttemptId == identity.attemptId) cancelAckReasonCode
-            else "cancelled"
-        }
+    ) = withContext(NonCancellable) {
+        if (!isAttemptCancellingOrDone(identity) || isExecutionInFlight(identity)) return@withContext
+        val reasonCode = cancellationRequest?.takeIf { it.identity == identity }?.reasonCode ?: "cancelled"
         try {
-            sendCancelledAck(
-                connection, identity, providerId, reasonCode,
-                TaskWorkerProtocol.EXECUTION_STOPPED,
-            )
+            sendCancelledAck(connection, identity, providerId, reasonCode, TaskWorkerProtocol.EXECUTION_STOPPED)
         } finally {
-            // ★ 2026-10-07（真机 P0）：槽位释放**不得**依赖 ACK 是否送达 —— 连接可能已断、
-            //   协程可能已被取消。否则 attempt 卡在 `CANCELLING` ⇒ 后续 offer 全被拒。
-            if (machine.cancelled(identity)) publish()
+            // Sending may fail, but neither a cancelled Job nor a timeout proves native has stopped.
+            if (!isExecutionInFlight(identity) && machine.cancelled(identity)) publish()
         }
     }
 
-    /**
-     * 发送 `stage_cancelled` 的唯一入口（同一 attempt 的同一状态只发一次）。
-     */
+    /** Serialize check/send/record by full identity; STOPPED can never regress to IN_FLIGHT. */
     private suspend fun sendCancelledAck(
         connection: TaskWorkerTransport,
         identity: TaskWorkerAttemptIdentity,
         providerId: String,
         reasonCode: String,
         executionState: String,
-    ) {
-        // ★ 2026-10-07（真机 P0）：去重标记必须代表「**已成功发送**」这个事实。
-        //   此前是在发送**之前**写标记：执行协程里的那次发送会抛 `CancellationException`
-        //   （协程已被 `executionJob.cancel()` 取消），标记却已置位 ⇒ 独立收敛协程被去重挡掉
-        //   ⇒ 终态 `execution_stopped` ACK 永远发不出去（现场只看到 `execution_in_flight`）。
-        val shouldSend = synchronized(cancelLock) {
-            !(cancelAckAttemptId == identity.attemptId && cancelAckState == executionState)
-        }
-        if (!shouldSend) return
+    ) = cancelAckMutex.withLock {
+        if (!isAttemptCancellingOrDone(identity)) return@withLock
+        if (executionState == TaskWorkerProtocol.EXECUTION_STOPPED && isExecutionInFlight(identity)) return@withLock
+        if (cancelAckIdentity == identity &&
+            (cancelAckState == executionState || cancelAckState == TaskWorkerProtocol.EXECUTION_STOPPED)) return@withLock
         connection.send(TaskWorkerProtocol.buildStageCancelled(
             identity = identity,
             providerId = providerId,
@@ -1508,11 +1617,9 @@ class TaskWorkerClient(
             sentAtMs = clockMs(),
             executionState = executionState,
         ))
-        synchronized(cancelLock) {
-            cancelAckAttemptId = identity.attemptId
-            cancelAckState = executionState
-            cancelAckReasonCode = reasonCode
-        }
+        // A failed/cancelled send must leave a later convergence attempt free to retry.
+        cancelAckIdentity = identity
+        cancelAckState = executionState
         publish()
     }
 
@@ -1568,8 +1675,7 @@ class TaskWorkerClient(
          *
          * native 层段前向是原子调用，`executionJob.cancel()` 打断不了它；取消到达后我们
          * **必须**在没有执行在飞时释放 attempt 槽位，否则后续每个 `stage_offer` 都被拒
-         * `worker_busy_or_lease_invalid`（真机实测：直到 lease 过期才恢复）。等待到上限仍
-         * 未停止时也会释放槽位，并留 `QlhLogger.w` 证据。
+         * `worker_busy_or_lease_invalid`。到上限只记录告警，继续保留物理槽位并等待停止。
          */
         const val CANCEL_STOP_WAIT_MS: Long = 30_000L
 

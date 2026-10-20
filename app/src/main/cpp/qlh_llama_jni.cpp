@@ -18,6 +18,7 @@
 
 #include "ggml-backend.h"
 #include "llama.h"
+#include "qlh_multi_position_argmax.h"
 #include "mtmd-helper.h"
 #include "mtmd.h"
 
@@ -1179,7 +1180,8 @@ static jint qlh_layer_forward_impl(
     jint pos_base,
     jfloatArray out_hidden,
     const jint * seq_ids,
-    const jint * positions
+    const jint * positions,
+    std::vector<jint> * all_tokens = nullptr
 ) {
     if (model_ptr == 0 || j_hidden == nullptr || n_tokens <= 0) {
         return -1;
@@ -1191,7 +1193,7 @@ static jint qlh_layer_forward_impl(
 
     const int n_embd_inp = llama_model_n_embd_inp(qctx->model);
     const jsize arr_len = env->GetArrayLength(j_hidden);
-    if (arr_len != (jsize) n_tokens * n_embd_inp) {
+    if (n_embd_inp <= 0 || (int64_t) arr_len != (int64_t) n_tokens * n_embd_inp) {
         // 形状不符：明确失败，不做静默截断/补齐
         return -1;
     }
@@ -1219,7 +1221,7 @@ static jint qlh_layer_forward_impl(
                                                : (llama_pos) (pos_base + i);
         batch.n_seq_id[i] = 1;
         batch.seq_id[i][0] = (seq_ids != nullptr) ? seq_ids[i] : 0;
-        batch.logits[i] = (out_hidden != nullptr || i + 1 == n_tokens) ? 1 : 0;
+        batch.logits[i] = (all_tokens != nullptr || out_hidden != nullptr || i + 1 == n_tokens) ? 1 : 0;
     }
     batch.n_tokens = n_tokens;
     std::memcpy(batch.embd, hidden.data(), hidden.size() * sizeof(float));
@@ -1242,16 +1244,36 @@ static jint qlh_layer_forward_impl(
         return -4;
     }
     if (rc == 0) {
-        const float * logits = llama_get_logits_ith(qctx->ctx, n_tokens - 1);
-        if (logits != nullptr) {
+        if (all_tokens != nullptr) {
             const int n_vocab = llama_vocab_n_tokens(qctx->vocab);
-            int best = 0;
-            for (int i = 1; i < n_vocab; ++i) {
-                if (logits[i] > logits[best]) {
-                    best = i;
-                }
+            if (n_vocab <= 0) {
+                llama_batch_free(batch);
+                return -1;
             }
-            result = (jint) best;
+            std::vector<jint> tokens;
+            if (!qlh_multi_position_argmax(n_tokens, n_vocab,
+                    [qctx](int32_t row) { return llama_get_logits_ith(qctx->ctx, row); }, tokens)) {
+                llama_batch_free(batch);
+                return -5;
+            }
+            if (g_layer_forward_abort.load(std::memory_order_relaxed)) {
+                llama_batch_free(batch);
+                return -4;
+            }
+            result = tokens.back();
+            all_tokens->swap(tokens);
+        } else {
+            const float * logits = llama_get_logits_ith(qctx->ctx, n_tokens - 1);
+            if (logits != nullptr) {
+                const int n_vocab = llama_vocab_n_tokens(qctx->vocab);
+                int best = 0;
+                for (int i = 1; i < n_vocab; ++i) {
+                    if (logits[i] > logits[best]) {
+                        best = i;
+                    }
+                }
+                result = (jint) best;
+            }
         }
         if (out_hidden != nullptr) {
             // ★ 2026-09-20：中间层段必须由 load 时开启 `extract_hidden_states`，
@@ -1295,6 +1317,46 @@ static jint qlh_layer_forward_impl(
     // 与 llama_batch_init 的分配方式一致（同为 malloc），故这里统一走 free 路径。
     llama_batch_free(batch);
     return result;
+}
+
+// Query the loaded library itself, independently of model lifetime. Older .so files
+// have neither this symbol nor the all-position forward entry; Kotlin catches linkage errors.
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_qlh_inference_service_LocalInferenceEngine_nativeSupportsMultiPositionArgmax(
+    JNIEnv * /* env */, jobject /* thiz */
+) {
+    return JNI_TRUE;
+}
+
+// Return n_vocab on success. out_tokens remains untouched on validation/decode/finite failure.
+extern "C" JNIEXPORT jint JNICALL
+Java_com_qlh_inference_service_LocalInferenceEngine_nativeLayerForwardTokens(
+    JNIEnv * env, jobject /* thiz */, jlong model_ptr,
+    jfloatArray j_hidden, jint n_tokens,
+    jintArray j_seq_ids, jintArray j_positions, jintArray out_tokens
+) {
+    if (n_tokens <= 0 || j_positions == nullptr || out_tokens == nullptr ||
+        env->GetArrayLength(out_tokens) != n_tokens) return -1;
+    std::vector<jint> seq_ids;
+    std::vector<jint> positions;
+    if (!qlh_read_optional_ints(env, j_seq_ids, n_tokens, seq_ids) ||
+        !qlh_read_optional_ints(env, j_positions, n_tokens, positions)) return -1;
+    if (model_ptr == 0) return -1;
+    auto * qctx = reinterpret_cast<QlhLlamaContext *>(model_ptr);
+    if (qctx->ctx == nullptr || qctx->model == nullptr || qctx->vocab == nullptr ||
+        !qlh_multi_position_positions(positions, llama_n_ctx(qctx->ctx))) return -1;
+    for (int i = 0; i < n_tokens; ++i) {
+        if (!seq_ids.empty() && seq_ids[(size_t) i] != seq_ids[0]) return -1;
+    }
+    std::vector<jint> tokens;
+    const jint last = qlh_layer_forward_impl(env, model_ptr, j_hidden, n_tokens, positions.front(),
+        nullptr, seq_ids.empty() ? nullptr : seq_ids.data(), positions.data(), &tokens);
+    if (last < 0) return last;
+    if (tokens.size() != (size_t) n_tokens) return -1;
+    const int n_vocab = llama_vocab_n_tokens(qctx->vocab);
+    if (n_vocab <= 0) return -1;
+    env->SetIntArrayRegion(out_tokens, 0, n_tokens, tokens.data());
+    return env->ExceptionCheck() ? -1 : (jint) n_vocab;
 }
 
 // 层段前向：返回末位置 argmax token（本节点是**末段**时用）。

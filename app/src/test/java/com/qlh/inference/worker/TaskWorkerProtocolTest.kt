@@ -55,6 +55,28 @@ class TaskWorkerProtocolTest {
     }
 
     @Test
+    fun `wire version must be an exact integer within Int range`() {
+        val ack = TaskWorkerProtocol.buildHelloAck("master_12345678", true, 3, "", "msg_ack_exact_version", 1000)
+        val canonical = TaskWorkerProtocol.encode(ack).toString(Charsets.UTF_8)
+        for (token in listOf("3.5", "4294967299", "3.0", "3e0")) {
+            val wire = canonical.replace("\"version\":3", "\"version\":$token")
+            expectProtocolError("invalid_integer") { TaskWorkerProtocol.decode(wire.toByteArray()) }
+        }
+    }
+
+    @Test
+    fun `wire timestamp must be an exact integer within Long range`() {
+        val ack = TaskWorkerProtocol.buildHelloAck("master_12345678", true, 3, "", "msg_ack_exact_timestamp", 1000)
+        val canonical = TaskWorkerProtocol.encode(ack).toString(Charsets.UTF_8)
+        for (token in listOf("1000.5", "1000.0", "1e3", "18446744073709552616")) {
+            val wire = canonical.replace("\"sent_at_ms\":1000", "\"sent_at_ms\":$token")
+            expectProtocolError("invalid_integer") { TaskWorkerProtocol.decode(wire.toByteArray()) }
+        }
+        val latest = ack.copy(sentAtMs = Long.MAX_VALUE)
+        assertEquals(Long.MAX_VALUE, TaskWorkerProtocol.decode(TaskWorkerProtocol.encode(latest)).sentAtMs)
+    }
+
+    @Test
     fun `stage result binds output digest and attempt idempotency`() {
         val result = TaskWorkerProtocol.buildStageResult(
             identity = identity,

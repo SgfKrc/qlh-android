@@ -323,6 +323,8 @@ object AndroidWorkerCapabilities {
         /** Concrete runtime; probes can only remove its static operations. */
         runtimeKind: String = EngineRegistry.ANDROID_RUNTIME,
         probedOperations: Set<String>? = null,
+        /** Only true after querying the loaded JNI library for this exact operation. */
+        multiPositionArgmax: Boolean = false,
     ): Map<String, Any?> {
         require(
             layerArtifacts.map { it.startLayer to it.endLayerExclusive }.distinct().size ==
@@ -410,6 +412,7 @@ object AndroidWorkerCapabilities {
         // This advertises receive support. Sending additionally requires the master's
         // explicit binary_hidden acknowledgement on this connection.
         if (binaryHidden) capabilities["binary_hidden"] = true
+        if (multiPositionArgmax && "layer_forward" in stages) capabilities["multi_position_argmax"] = true
         if (nodeIncarnation.isNotBlank()) capabilities["node_incarnation"] = nodeIncarnation
         return capabilities
     }
