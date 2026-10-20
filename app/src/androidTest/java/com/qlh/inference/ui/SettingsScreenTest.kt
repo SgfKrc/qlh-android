@@ -15,7 +15,7 @@ import com.qlh.inference.ClusterOverviewUiState
 import com.qlh.inference.AuditReviewTicket
 import com.qlh.inference.AuditSnapshot
 import com.qlh.inference.AuditUiState
-import com.qlh.inference.AuditWorkflow
+import com.qlh.inference.AuditRequest
 import com.qlh.inference.AuthAccountSnapshot
 import com.qlh.inference.AuthCapabilitySnapshot
 import com.qlh.inference.AuthControlUiState
@@ -226,22 +226,12 @@ class SettingsScreenTest {
             themeMode = "system",
             audit = AuditUiState(
                 snapshot = AuditSnapshot(
-                    enabled = true,
                     available = true,
-                    workflows = listOf(
-                        AuditWorkflow(
-                            workflowId = "wf-1",
-                            template = "chat",
-                            state = "completed",
-                            createdAt = 1.0,
-                            finishedAt = 2.0,
-                            stageCount = 1,
-                            completedStageCount = 1,
-                            failedStageCount = 0,
-                            attemptCount = 1,
-                            retryCount = 0,
-                            resultRejectionCount = 0,
-                            recoveredAfterRestart = false,
+                    requests = listOf(
+                        AuditRequest(
+                            requestId = "req-1", deploymentId = "deployment-1",
+                            phase = "completed", terminal = "completed",
+                            outcome = "completed", executionState = "stopped",
                         ),
                     ),
                     reviews = listOf(
@@ -260,7 +250,7 @@ class SettingsScreenTest {
         )
 
         composeRule.onNodeWithTag("audit_overview_details").performScrollTo().assertIsDisplayed().performClick()
-        composeRule.onNodeWithTag("audit_workflow_wf-1").performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithTag("audit_request_req-1").performScrollTo().assertIsDisplayed()
         composeRule.onNodeWithTag("audit_review_review-1").performScrollTo().assertIsDisplayed()
         composeRule.onNodeWithTag("audit_overview_refresh").performScrollTo().assertIsEnabled().performClick()
         composeRule.runOnIdle { assertTrue(refreshCalls >= 2) }
