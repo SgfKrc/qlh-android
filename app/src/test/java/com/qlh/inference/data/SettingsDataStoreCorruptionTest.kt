@@ -158,6 +158,61 @@ class SettingsDataStoreCorruptionTest {
     }
 
     @Test
+    fun bootstrapRefreshPreservesVoterOnlyForSameClusterAndCredentialEpoch() = runBlocking {
+        val source = temporaryFolder.newFile("voter-bootstrap.preferences_pb")
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val dataStore = PreferenceDataStoreFactory.create(scope = scope, produceFile = { source })
+        val storage = object : ClusterCredentialStorage {
+            var secret: String? = null
+            override fun read() = secret
+            override fun save(clusterSecret: String) { secret = clusterSecret }
+            override fun clear() { secret = null }
+        }
+        try {
+            val settings = SettingsDataStore(dataStore, storage)
+            settings.saveBootstrapConfig(
+                serverHost = "100.64.0.1", serverPort = 8001, masterTcpHost = "100.64.0.1",
+                masterTcpPort = 8889, clusterId = "cluster-a", clusterSecret = "secret-a",
+                nodeId = "android-1", modelManifestUrl = "", clusterSecretEpoch = 3,
+            )
+            val voterSet = "{\"cluster_id\":\"cluster-a\",\"voters\":{}}"
+            settings.saveQuorumVoterConfig("y700-voter", voterSet, enabled = true)
+
+            settings.saveBootstrapConfig(
+                serverHost = "100.64.0.2", serverPort = 8001, masterTcpHost = "100.64.0.2",
+                masterTcpPort = 8889, clusterId = "cluster-a", clusterSecret = "secret-a",
+                nodeId = "android-1", modelManifestUrl = "", clusterSecretEpoch = 3,
+            )
+            assertTrue(settings.isQuorumVoterEnabled())
+            assertEquals("y700-voter", settings.getQuorumVoterId())
+            assertEquals(voterSet, settings.getQuorumVoterSet())
+
+            settings.saveBootstrapConfig(
+                serverHost = "100.64.0.2", serverPort = 8001, masterTcpHost = "100.64.0.2",
+                masterTcpPort = 8889, clusterId = "cluster-a", clusterSecret = "secret-b",
+                nodeId = "android-1", modelManifestUrl = "", clusterSecretEpoch = 3,
+            )
+            assertFalse(settings.isQuorumVoterEnabled())
+
+            settings.saveQuorumVoterConfig("y700-voter", voterSet, enabled = true)
+            settings.saveBootstrapConfig(
+                serverHost = "100.64.0.2", serverPort = 8001, masterTcpHost = "100.64.0.2",
+                masterTcpPort = 8889, clusterId = "cluster-a", clusterSecret = "secret-b",
+                nodeId = "android-1", modelManifestUrl = "", clusterSecretEpoch = 4,
+            )
+            assertFalse(settings.isQuorumVoterEnabled())
+
+            settings.saveQuorumVoterConfig("y700-voter", voterSet, enabled = true)
+            settings.saveBootstrapConfig(
+                serverHost = "100.64.0.3", serverPort = 8001, masterTcpHost = "100.64.0.3",
+                masterTcpPort = 8889, clusterId = "cluster-b", clusterSecret = "secret-c",
+                nodeId = "android-1", modelManifestUrl = "", clusterSecretEpoch = 4,
+            )
+            assertFalse(settings.isQuorumVoterEnabled())
+        } finally { scope.cancel() }
+    }
+
+    @Test
     fun userSelectionRetiresBootstrapWaitingForPreferencePublication() = runBlocking {
         val source = temporaryFolder.newFile("delayed-bootstrap.preferences_pb")
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)

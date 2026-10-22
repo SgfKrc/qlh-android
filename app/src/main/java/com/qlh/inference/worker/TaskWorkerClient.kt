@@ -697,6 +697,19 @@ internal class SocketTaskWorkerTransport(
                     return TaskWorkerInboundEvent.ModelSupply(data.deepCopy().apply { remove("control_certificate") })
                 }
                 "heartbeat_ack" -> return TaskWorkerInboundEvent.HeartbeatAck
+                "error" -> {
+                    val data = objectValue.getAsJsonObject("data")
+                    val errorCode = data?.get("error_code")
+                        ?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isString }
+                        ?.asString
+                        ?.takeIf { it.matches(Regex("[a-z][a-z0-9_]{0,63}")) }
+                        ?: "coordinator_error"
+                    throw TaskWorkerProtocolException(
+                        "coordinator rejected task-worker frame ($errorCode)",
+                        errorCode,
+                        "data.error_code",
+                    )
+                }
                 "stage_chunk" -> {
                     // ★ 2026-10-08（DIST-NEXT-2b 真机回归暴露）：`stage_chunk` 是**外层帧类型**
                     //   （主仓 `build_stage_chunk` 用 `build_message("stage_chunk", …)`）。此前这里

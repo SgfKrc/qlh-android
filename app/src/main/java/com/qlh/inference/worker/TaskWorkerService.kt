@@ -1,6 +1,7 @@
 package com.qlh.inference.worker
 
 import com.google.gson.JsonObject
+import com.google.gson.JsonParser
 
 import android.annotation.SuppressLint
 import android.app.Notification
@@ -14,6 +15,9 @@ import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.qlh.inference.BuildConfig
+import com.qlh.inference.control.AndroidQuorumCertificate
+import com.qlh.inference.control.AndroidVoterSet
+import com.qlh.inference.control.validateAndroidCertificate
 import com.qlh.inference.MainActivity
 import com.qlh.inference.QlhApplication
 import com.qlh.inference.R
@@ -573,18 +577,47 @@ class TaskWorkerService : Service() {
             override fun currentPreparedIdentity(): WorkerPrepareIdentity? =
                 QlhApplication.instance.inferenceService?.engine?.loadedPreparedIdentity()
         }, participationCurrent = { participationCurrent() })
+        val controlVoterSet = runCatching {
+            settings.getQuorumVoterSet().trim().takeIf { it.isNotEmpty() }?.let { raw ->
+                AndroidVoterSet.parse(JsonParser.parseString(raw).asJsonObject).also { voterSet ->
+                    check(voterSet.clusterId == settings.getClusterId()) {
+                        "quorum voter set does not match the worker cluster"
+                    }
+                }
+            }
+        }.onFailure { error ->
+            QlhLogger.e(
+                "TaskWorkerService",
+                "control certificate authority unavailable; fenced worker traffic will fail closed",
+                error,
+            )
+        }.getOrNull()
+        val controlCertificateValidator: ((JsonObject) -> Unit)? = controlVoterSet?.let { voterSet ->
+            { value ->
+                validateAndroidCertificate(
+                    AndroidQuorumCertificate.parse(value),
+                    voterSet,
+                    System.currentTimeMillis(),
+                )
+            }
+        }
+        val registration = TaskWorkerRegistration(
+            nodeId = nodeId,
+            clusterSecret = clusterSecret,
+            clusterSecretEpoch = config.clusterSecretEpoch,
+            hostname = hostname,
+            networkType = networkType,
+            deviceInfo = deviceInfo,
+            modelSha256 = modelSha256,
+        )
         val worker = TaskWorkerClient(
             host = host,
             port = port,
             nodeId = nodeId,
-            registration = TaskWorkerRegistration(
-                nodeId = nodeId,
-                clusterSecret = clusterSecret,
-                clusterSecretEpoch = config.clusterSecretEpoch,
-                hostname = hostname,
-                networkType = networkType,
-                deviceInfo = deviceInfo,
-                modelSha256 = modelSha256,
+            registration = registration,
+            transportFactory = SocketTaskWorkerTransportFactory(
+                registration = registration,
+                controlCertificateValidator = controlCertificateValidator,
             ),
             capabilities = buildCapabilities,
             modelSupplyHandler = supply,

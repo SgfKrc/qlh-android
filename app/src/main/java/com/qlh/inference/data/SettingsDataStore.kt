@@ -410,15 +410,19 @@ class SettingsDataStore internal constructor(
             // transform is the publication point; delayed network results cannot enter it.
             synchronized(publicationLock) {
                 if (!stillCurrent()) return@synchronized
+                val nextSecretEpoch = clusterSecretEpoch.coerceAtLeast(1)
+                val voterBindingUnchanged = it[KEY_CLUSTER_ID] == clusterId &&
+                    (it[KEY_CLUSTER_SECRET_EPOCH] ?: 0) == nextSecretEpoch &&
+                    clusterSecret.isNotBlank() && credentialStore.read() == clusterSecret
                 if (clusterSecret.isNotBlank()) credentialStore.save(clusterSecret)
                 if (serverHost.isNotBlank()) it[KEY_SERVER_HOST] = serverHost
                 it[KEY_SERVER_PORT] = serverPort
                 if (masterTcpHost.isNotBlank()) it[KEY_MASTER_TCP_HOST] = masterTcpHost
                 it[KEY_MASTER_TCP_PORT] = masterTcpPort
                 it[KEY_CLUSTER_ID] = clusterId
-                it[KEY_QUORUM_VOTER_ENABLED] = false
+                if (!voterBindingUnchanged) it[KEY_QUORUM_VOTER_ENABLED] = false
                 it.remove(KEY_CLUSTER_SECRET)
-                it[KEY_CLUSTER_SECRET_EPOCH] = clusterSecretEpoch.coerceAtLeast(1)
+                it[KEY_CLUSTER_SECRET_EPOCH] = nextSecretEpoch
                 if (nodeId.isNotBlank()) it[KEY_ANDROID_NODE_ID] = nodeId
                 if (modelManifestUrl.isNotBlank()) it[KEY_MODEL_MANIFEST_URL] = modelManifestUrl
                 it[KEY_BOOTSTRAPPED] = true

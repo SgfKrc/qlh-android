@@ -55,6 +55,35 @@ class WorkerPrepareTransportTest {
         } finally { transport.close(); server.close(); peer.join(5000) }
     }
 
+    @Test fun `coordinator error frame surfaces stable rejection code`() = runBlocking {
+        val server = ServerSocket(0)
+        val peer = thread { server.accept().use { socket ->
+            val bytes = JsonObject().apply {
+                addProperty("type", "error")
+                addProperty("format", "json")
+                add("data", JsonObject().apply {
+                    addProperty("status", "rejected")
+                    addProperty("error_code", "control_certificate_not_current")
+                })
+            }.toString().toByteArray()
+            DataOutputStream(socket.getOutputStream()).apply { writeInt(bytes.size); write(bytes); flush() }
+        } }
+        val transport = SocketTaskWorkerTransport(Socket("127.0.0.1", server.localPort))
+        try {
+            try {
+                transport.receiveEvent()
+                fail("coordinator error frame must be surfaced")
+            } catch (error: TaskWorkerProtocolException) {
+                assertEquals("control_certificate_not_current", error.code)
+                assertEquals("data.error_code", error.field)
+            }
+        } finally {
+            transport.close()
+            server.close()
+            peer.join(5000)
+        }
+    }
+
     @Test fun `ACK rechecks control authority rather than trusting a received certificate`() = runBlocking {
         var expired = false
         val fence = TcpControlFence(required = true, validate = { if (expired) throw TaskWorkerProtocolException("expired", "control_certificate_expired") })

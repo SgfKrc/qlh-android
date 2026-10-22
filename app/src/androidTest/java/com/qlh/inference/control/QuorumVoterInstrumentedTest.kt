@@ -2,13 +2,16 @@ package com.qlh.inference.control
 
 import android.content.Context
 import android.os.Build
+import androidx.core.content.ContextCompat
 import androidx.test.platform.app.InstrumentationRegistry
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 import com.qlh.inference.data.AndroidQuorumVoter
 import com.qlh.inference.data.QuorumVoterLedger
+import com.qlh.inference.data.SettingsDataStore
 import com.qlh.inference.control.QuorumVoterException
 import com.qlh.inference.network.QuorumVoterRpcServer
+import com.qlh.inference.service.QuorumVoterService
 import com.qlh.inference.security.QuorumEd25519
 import com.qlh.inference.security.QuorumVoterKeyStore
 import org.junit.Assume.assumeTrue
@@ -17,7 +20,11 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
+import kotlinx.coroutines.runBlocking
+import java.net.HttpURLConnection
 import java.net.Socket
+import java.net.URL
+import java.util.Base64
 import java.util.UUID
 
 class QuorumVoterInstrumentedTest {
@@ -182,6 +189,18 @@ class QuorumVoterInstrumentedTest {
             keys.forEach { it.first.fill(0) }
             ledger.close()
         }
+    }
+
+    @Test
+    fun installPhysicalEpochTwoVoterConfiguration() {
+        val encoded = InstrumentationRegistry.getArguments().getString("voter_set_b64")
+        assumeTrue(!encoded.isNullOrBlank())
+        val voterSet = String(Base64.getUrlDecoder().decode(encoded), Charsets.UTF_8)
+        val settings = SettingsDataStore(context)
+        assertEquals("qlh-default", runBlocking { settings.getClusterId() })
+        runBlocking { settings.saveQuorumVoterConfig("y700-voter-r2", voterSet, true) }
+        ContextCompat.startForegroundService(context, QuorumVoterService.startIntent(context))
+        assertTrue(runBlocking { settings.isQuorumVoterEnabled() })
     }
 
     private fun post(port: Int, secret: String): String {
