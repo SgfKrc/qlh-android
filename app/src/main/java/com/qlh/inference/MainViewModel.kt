@@ -13,6 +13,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.core.content.ContextCompat
 import com.qlh.inference.BuildConfig
+import com.qlh.inference.control.AndroidVoterSet
 import com.qlh.inference.data.MessageEntity
 import com.qlh.inference.data.SessionEntity
 import com.qlh.inference.data.SettingsDataStore
@@ -35,6 +36,8 @@ import com.qlh.inference.service.inferenceModes
 import com.qlh.inference.service.AndroidPresenceService
 import com.qlh.inference.service.ModelManager
 import com.qlh.inference.service.ModelDirectoryGrantState
+import com.qlh.inference.service.QuorumVoterService
+import com.qlh.inference.service.QuorumVoterServiceStatus
 import com.qlh.inference.service.LayerArtifactCandidate
 import com.qlh.inference.service.toCandidate
 import com.qlh.inference.service.unambiguousLayerArtifactCandidates
@@ -44,6 +47,8 @@ import com.qlh.inference.system.WorkerBatteryPolicy
 import com.qlh.inference.system.AndroidDeviceInfoProvider
 import com.qlh.inference.security.AuthTokenStore
 import com.qlh.inference.security.StoredAuthSession
+import com.qlh.inference.security.QuorumEd25519
+import com.qlh.inference.security.QuorumVoterKeyStore
 import com.qlh.inference.update.AndroidAppUpdateManager
 import com.qlh.inference.update.AndroidUpdateCandidate
 import com.qlh.inference.network.ControlPlaneProbeResult
@@ -51,6 +56,7 @@ import com.qlh.inference.network.probeControlPlaneConnection
 import com.qlh.inference.worker.TaskWorkerSnapshot
 import com.qlh.inference.worker.TaskWorkerService
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -58,12 +64,14 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
@@ -138,6 +146,11 @@ data class MainUiState(
     val authError: String? = null,
     val presence: AndroidPresenceSnapshot = AndroidPresenceSnapshot(),
     val taskWorker: TaskWorkerSnapshot = TaskWorkerSnapshot(),
+    val quorumVoterId: String = "",
+    val quorumVoterSetJson: String = "",
+    val quorumVoterEnabled: Boolean = false,
+    val quorumVoterPublicKey: String = "",
+    val quorumVoterMessage: String? = null,
 )
 
 // ================================================================
@@ -452,6 +465,49 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             settings.themeMode.collect { mode ->
                 _uiState.value = _uiState.value.copy(themeMode = mode)
             }
+        }
+        viewModelScope.launch {
+            settings.quorumVoterId.collect { id ->
+                _uiState.value = _uiState.value.copy(quorumVoterId = id)
+            }
+        }
+        viewModelScope.launch {
+            settings.quorumVoterSet.collect { voterSet ->
+                _uiState.value = _uiState.value.copy(quorumVoterSetJson = voterSet)
+            }
+        }
+        viewModelScope.launch {
+            QuorumVoterServiceStatus.message.collect { message ->
+                _uiState.value = _uiState.value.copy(quorumVoterMessage = message)
+            }
+        }
+        viewModelScope.launch {
+            combine(
+                settings.quorumVoterEnabled,
+                settings.quorumVoterId,
+                settings.quorumVoterSet,
+                settings.quorumVoterRevision,
+            ) { enabled, voterId, _, revision -> Triple(enabled, voterId, revision) }
+                .distinctUntilChanged()
+                .collect { (enabled, _, _) ->
+                _uiState.value = _uiState.value.copy(quorumVoterEnabled = enabled)
+                val context = getApplication<Application>()
+                if (enabled) {
+                    runCatching {
+                        ContextCompat.startForegroundService(context, QuorumVoterService.startIntent(context))
+                    }.onFailure { error ->
+                        _uiState.value = _uiState.value.copy(quorumVoterMessage = error.message)
+                    }
+                } else {
+                    context.stopService(Intent(context, QuorumVoterService::class.java))
+                }
+            }
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            val publicKey = runCatching {
+                QuorumVoterKeyStore(getApplication()).readPublicKey().orEmpty()
+            }.getOrDefault("")
+            _uiState.value = _uiState.value.copy(quorumVoterPublicKey = publicKey)
         }
     }
 
@@ -1822,6 +1878,76 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             settings.setThemeMode(mode)
             _uiState.value = _uiState.value.copy(themeMode = mode)
+        }
+    }
+
+    fun generateQuorumVoterKey() {
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching {
+                check(android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+                    "Android voter requires API 33 or newer"
+                }
+                val material = QuorumVoterKeyStore(getApplication()).readOrCreate()
+                try {
+                    QuorumEd25519.encode(material.publicKey)
+                } finally {
+                    material.seed.fill(0)
+                }
+            }.onSuccess { key ->
+                _uiState.value = _uiState.value.copy(quorumVoterPublicKey = key, quorumVoterMessage = null)
+            }.onFailure { error ->
+                _uiState.value = _uiState.value.copy(
+                    quorumVoterMessage = error.message ?: error.javaClass.simpleName,
+                )
+            }
+        }
+    }
+
+    fun saveQuorumVoterConfig(voterId: String, voterSetJson: String, enabled: Boolean) {
+        viewModelScope.launch {
+            try {
+                val normalizedId = voterId.trim()
+                if (enabled) {
+                    check(android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+                        "Android voter requires API 33 or newer"
+                    }
+                    require(normalizedId.isNotBlank() && voterSetJson.isNotBlank()) {
+                        "voter ID and voter set are required"
+                    }
+                    val parsed = AndroidVoterSet.parse(
+                        com.google.gson.JsonParser.parseString(voterSetJson).asJsonObject,
+                    )
+                    require(parsed.clusterId == settings.getClusterId()) {
+                        "voter set cluster does not match the Android bootstrap cluster"
+                    }
+                    require(parsed.voters.size >= 3) { "automatic quorum requires at least three configured voters" }
+                    val identity = parsed.voters[normalizedId]
+                        ?: error("voter ID is absent from voter set")
+                    val material = withContext(Dispatchers.IO) {
+                        QuorumVoterKeyStore(getApplication()).readOrCreate()
+                    }
+                    try {
+                        require(QuorumEd25519.matches(material.seed, identity.publicKey)) {
+                            "voter set public key does not match this device key"
+                        }
+                        require(settings.getClusterSecret().isNotBlank()) { "cluster credential is unavailable" }
+                        _uiState.value = _uiState.value.copy(
+                            quorumVoterPublicKey = QuorumEd25519.encode(material.publicKey),
+                        )
+                    } finally {
+                        material.seed.fill(0)
+                    }
+                }
+                settings.saveQuorumVoterConfig(normalizedId, voterSetJson, enabled)
+                _uiState.value = _uiState.value.copy(
+                    quorumVoterMessage = if (enabled) "配置已保存，等待 voter 服务状态"
+                    else "配置已停用",
+                )
+            } catch (error: Exception) {
+                _uiState.value = _uiState.value.copy(
+                    quorumVoterMessage = error.message ?: error.javaClass.simpleName,
+                )
+            }
         }
     }
 

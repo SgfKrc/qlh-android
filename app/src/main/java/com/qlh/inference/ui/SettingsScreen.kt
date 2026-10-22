@@ -32,6 +32,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Logout
 import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.CloudDownload
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.FolderOpen
@@ -262,6 +263,13 @@ fun SettingsScreen(
     onRetryModelIntent: () -> Unit = {},
     onCancelModelIntent: () -> Unit = {},
     onPreparedChat: () -> Unit = {},
+    quorumVoterId: String = "",
+    quorumVoterSetJson: String = "",
+    quorumVoterEnabled: Boolean = false,
+    quorumVoterPublicKey: String = "",
+    quorumVoterMessage: String? = null,
+    onGenerateQuorumVoterKey: () -> Unit = {},
+    onSaveQuorumVoterConfig: (String, String, Boolean) -> Unit = { _, _, _ -> },
     modifier: Modifier = Modifier
 ) {
     val isLite = BuildConfig.IS_LITE
@@ -333,6 +341,18 @@ fun SettingsScreen(
                 state = clusterOverview,
                 onRefresh = onRefreshClusterOverview,
             )
+
+            if (!isLite) {
+                AndroidQuorumVoterGroup(
+                    voterId = quorumVoterId,
+                    voterSetJson = quorumVoterSetJson,
+                    enabled = quorumVoterEnabled,
+                    publicKey = quorumVoterPublicKey,
+                    message = quorumVoterMessage,
+                    onGenerateKey = onGenerateQuorumVoterKey,
+                    onSave = onSaveQuorumVoterConfig,
+                )
+            }
 
             ModelFleetOverviewGroup(
                 state = modelFleet,
@@ -705,6 +725,98 @@ internal fun modelFleetRuntimeLabel(snapshot: ModelFleetSnapshot): String {
         snapshot.currentLoaded -> "已加载：$name"
         snapshot.pipelinePrepared -> "已准备流水线：$name"
         else -> "主节点当前未加载模型"
+    }
+}
+
+@Composable
+private fun AndroidQuorumVoterGroup(
+    voterId: String,
+    voterSetJson: String,
+    enabled: Boolean,
+    publicKey: String,
+    message: String?,
+    onGenerateKey: () -> Unit,
+    onSave: (String, String, Boolean) -> Unit,
+) {
+    val context = LocalContext.current
+    var editedVoterId by rememberSaveable { mutableStateOf(voterId) }
+    var editedVoterSet by rememberSaveable { mutableStateOf(voterSetJson) }
+    var editedEnabled by rememberSaveable { mutableStateOf(enabled) }
+    LaunchedEffect(voterId) { editedVoterId = voterId }
+    LaunchedEffect(voterSetJson) { editedVoterSet = voterSetJson }
+    LaunchedEffect(enabled) { editedEnabled = enabled }
+
+    SettingsGroup(title = "自动选举投票节点", icon = Icons.Default.Cloud) {
+        SettingRow(
+            title = "启用 Android voter",
+            subtitle = "Ed25519 / API 33+ / RPC 8765",
+            trailing = {
+                Switch(checked = editedEnabled, onCheckedChange = { editedEnabled = it })
+            },
+        )
+        OutlinedTextField(
+            value = editedVoterId,
+            onValueChange = { editedVoterId = it },
+            modifier = Modifier.fillMaxWidth(),
+            label = { Text("Voter ID") },
+            singleLine = true,
+        )
+        Spacer(Modifier.height(8.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            OutlinedTextField(
+                value = publicKey,
+                onValueChange = {},
+                modifier = Modifier.weight(1f),
+                label = { Text("本机 Ed25519 公钥") },
+                readOnly = true,
+                maxLines = 2,
+            )
+            IconButton(
+                onClick = {
+                    if (publicKey.isNotBlank()) {
+                        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                        clipboard.setPrimaryClip(ClipData.newPlainText("QLH voter public key", publicKey))
+                    }
+                },
+                enabled = publicKey.isNotBlank(),
+            ) {
+                Icon(Icons.Default.ContentCopy, contentDescription = "复制公钥")
+            }
+        }
+        OutlinedButton(onClick = onGenerateKey, modifier = Modifier.fillMaxWidth()) {
+            Text(if (publicKey.isBlank()) "生成并安全保存密钥" else "读取本机公钥")
+        }
+        Spacer(Modifier.height(8.dp))
+        OutlinedTextField(
+            value = editedVoterSet,
+            onValueChange = { editedVoterSet = it },
+            modifier = Modifier.fillMaxWidth(),
+            label = { Text("Voter set JSON") },
+            minLines = 4,
+            maxLines = 8,
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii),
+        )
+        Text(
+            "私钥只保存在本机 Android Keystore 加密存储中。voter set 必须包含本机公钥；启用后仍需在各候选主机配置相同 voter set 和本机 RPC 地址。",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        message?.let {
+            Text(
+                it,
+                modifier = Modifier.padding(top = 8.dp),
+                style = MaterialTheme.typography.bodySmall,
+                color = if (it.contains("启用") || it.contains("停用")) MaterialTheme.colorScheme.primary
+                else MaterialTheme.colorScheme.error,
+            )
+        }
+        Button(
+            onClick = { onSave(editedVoterId, editedVoterSet, editedEnabled) },
+            modifier = Modifier.fillMaxWidth(),
+            enabled = editedVoterId.isNotBlank() && (!editedEnabled || editedVoterSet.isNotBlank()),
+        ) {
+            Text("保存投票配置")
+        }
     }
 }
 

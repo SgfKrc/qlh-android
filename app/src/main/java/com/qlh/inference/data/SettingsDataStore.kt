@@ -134,6 +134,10 @@ class SettingsDataStore internal constructor(
 
         // ---- task-worker 启动配置（系统重建恢复用）★ 2026-10-07（DIST-NEXT-5） ----
         val KEY_TASK_WORKER_STARTUP = stringPreferencesKey("task_worker_startup")
+        val KEY_QUORUM_VOTER_ID = stringPreferencesKey("quorum_voter_id")
+        val KEY_QUORUM_VOTER_SET = stringPreferencesKey("quorum_voter_set")
+        val KEY_QUORUM_VOTER_ENABLED = booleanPreferencesKey("quorum_voter_enabled")
+        val KEY_QUORUM_VOTER_REVISION = intPreferencesKey("quorum_voter_revision")
 
         /** ★ 2026-10-07（DIST-NEXT-5b）：电池优化豁免引导是否已问过（一次性，不反复打扰）。 */
         val KEY_BATTERY_EXEMPTION_ASKED = booleanPreferencesKey("battery_exemption_asked")
@@ -231,6 +235,22 @@ class SettingsDataStore internal constructor(
         prefs[KEY_THEME_MODE] ?: DEFAULT_THEME_MODE
     }
 
+    val quorumVoterId: Flow<String> = dataStore.data.map { prefs ->
+        prefs[KEY_QUORUM_VOTER_ID].orEmpty()
+    }
+
+    val quorumVoterSet: Flow<String> = dataStore.data.map { prefs ->
+        prefs[KEY_QUORUM_VOTER_SET].orEmpty()
+    }
+
+    val quorumVoterEnabled: Flow<Boolean> = dataStore.data.map { prefs ->
+        prefs[KEY_QUORUM_VOTER_ENABLED] ?: false
+    }
+
+    val quorumVoterRevision: Flow<Int> = dataStore.data.map { prefs ->
+        prefs[KEY_QUORUM_VOTER_REVISION] ?: 0
+    }
+
     /** 获取完整的服务器 base URL */
     val baseUrl: Flow<String> = dataStore.data.map { prefs ->
         val host = prefs[KEY_SERVER_HOST] ?: DEFAULT_HOST
@@ -297,6 +317,18 @@ class SettingsDataStore internal constructor(
     suspend fun getModelStorageMode(): String =
         dataStore.data.first()[KEY_MODEL_STORAGE_MODE] ?: DEFAULT_MODEL_STORAGE_MODE
     suspend fun getThemeMode(): String = dataStore.data.first()[KEY_THEME_MODE] ?: DEFAULT_THEME_MODE
+    suspend fun getQuorumVoterId(): String = dataStore.data.first()[KEY_QUORUM_VOTER_ID].orEmpty()
+    suspend fun getQuorumVoterSet(): String = dataStore.data.first()[KEY_QUORUM_VOTER_SET].orEmpty()
+    suspend fun isQuorumVoterEnabled(): Boolean = dataStore.data.first()[KEY_QUORUM_VOTER_ENABLED] ?: false
+
+    suspend fun saveQuorumVoterConfig(voterId: String, voterSetJson: String, enabled: Boolean) {
+        dataStore.edit {
+            it[KEY_QUORUM_VOTER_ID] = voterId.trim()
+            it[KEY_QUORUM_VOTER_SET] = voterSetJson.trim()
+            it[KEY_QUORUM_VOTER_ENABLED] = enabled
+            it[KEY_QUORUM_VOTER_REVISION] = (it[KEY_QUORUM_VOTER_REVISION] ?: 0) + 1
+        }
+    }
 
     suspend fun getOrCreateAndroidNodeId(): String {
         val existing = dataStore.data.first()[KEY_ANDROID_NODE_ID]
@@ -384,6 +416,7 @@ class SettingsDataStore internal constructor(
                 if (masterTcpHost.isNotBlank()) it[KEY_MASTER_TCP_HOST] = masterTcpHost
                 it[KEY_MASTER_TCP_PORT] = masterTcpPort
                 it[KEY_CLUSTER_ID] = clusterId
+                it[KEY_QUORUM_VOTER_ENABLED] = false
                 it.remove(KEY_CLUSTER_SECRET)
                 it[KEY_CLUSTER_SECRET_EPOCH] = clusterSecretEpoch.coerceAtLeast(1)
                 if (nodeId.isNotBlank()) it[KEY_ANDROID_NODE_ID] = nodeId
@@ -406,6 +439,7 @@ class SettingsDataStore internal constructor(
             it.remove(KEY_CLUSTER_SECRET_EPOCH)
             it.remove(KEY_MODEL_MANIFEST_URL)
             it.remove(KEY_TASK_WORKER_STARTUP)
+            it[KEY_QUORUM_VOTER_ENABLED] = false
         }
     }
 
