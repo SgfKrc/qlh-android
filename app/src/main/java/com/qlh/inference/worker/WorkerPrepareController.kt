@@ -31,6 +31,7 @@ internal interface WorkerPrepareRuntime {
     suspend fun unload()
     fun loaded(identity: WorkerPrepareIdentity): Boolean
     fun hasRuntime(): Boolean
+    fun currentPreparedIdentity(): WorkerPrepareIdentity? = null
 }
 
 /** One native slot. Replacement fences the old generation until global commit or abort cleanup. */
@@ -155,7 +156,7 @@ internal class WorkerPrepareController(
                     }
                 }
                 "abort", "release" -> {
-                    if (!terminalCleanup(identity)) {
+                    if (!terminalCleanup(identity, request.action)) {
                         checkPrepare(candidate == identity || (candidate == null && committed == identity), "prepare_identity_mismatch", "no matching runtime")
                         // Aborting a finalized transaction would unload a published active generation.
                         checkPrepare(request.action != "abort" || candidate == identity || !finalized,
@@ -177,7 +178,7 @@ internal class WorkerPrepareController(
                         previous = null; finalized = true
                         request.ack("finalized", true)
                     } else {
-                        checkPrepare(terminalCleanup(identity), "prepare_identity_mismatch", "no matching finalized or retired identity")
+                        checkPrepare(terminalCleanup(identity, request.action), "prepare_identity_mismatch", "no matching finalized or retired identity")
                         // A terminal proof only; this must never enable a stage or publish loaded-ready.
                         request.ack("finalized", false)
                     }
@@ -208,11 +209,25 @@ internal class WorkerPrepareController(
     }
 
     /** Old identities never own the newer slot, including native SHA reuse across generations. */
-    private fun terminalCleanup(identity: WorkerPrepareIdentity): Boolean {
+    private fun terminalCleanup(identity: WorkerPrepareIdentity, action: String): Boolean {
         if (identity in retired) return true
         val owner = candidate ?: committed
         if (owner != identity && synchronized(lifecycle) { identity in neverLoaded }) {
             remember(retired, identity)
+            return true
+        }
+        val runtimeIdentity = runtime.currentPreparedIdentity()
+        if (action == "release" && runtimeIdentity != null &&
+            runtimeIdentity.text("node_id") == identity.text("node_id") &&
+            runtimeIdentity.generation > identity.generation && runtime.loaded(runtimeIdentity)) {
+            remember(retired, identity)
+            if (previous == identity) previous = null
+            if (candidate == identity) candidate = null
+            if (committed == identity) committed = null
+            if (owner == identity) {
+                visible = null
+                finalized = true
+            }
             return true
         }
         if (previous == identity && owner != identity) {

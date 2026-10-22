@@ -570,6 +570,8 @@ class TaskWorkerService : Service() {
             override fun loaded(identity: WorkerPrepareIdentity): Boolean =
                 QlhApplication.instance.inferenceService?.isPreparedLayerLoaded(identity) == true
             override fun hasRuntime(): Boolean = QlhApplication.instance.inferenceService?.engine?.isLoaded == true
+            override fun currentPreparedIdentity(): WorkerPrepareIdentity? =
+                QlhApplication.instance.inferenceService?.engine?.loadedPreparedIdentity()
         }, participationCurrent = { participationCurrent() })
         val worker = TaskWorkerClient(
             host = host,

@@ -596,6 +596,8 @@ class LocalInferenceEngine(private val context: Context) {
 
     internal fun matchesPreparedIdentity(identity: WorkerPrepareIdentity): Boolean = loadedPrepareIdentity == identity
 
+    internal fun loadedPreparedIdentity(): WorkerPrepareIdentity? = loadedPrepareIdentity
+
     /** Reopen the retained load path, not a selected document or a new inventory result. */
     private fun runtimeReceipt(identity: WorkerPrepareIdentity?, count: Int?, check: () -> Unit): Map<String, Any?> {
         require(identity != null && identity == loadedPrepareIdentity)

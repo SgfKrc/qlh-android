@@ -54,6 +54,8 @@ class WorkerPrepareControllerTest {
         var unloads = 0
         var failLoad = false
         var failUnload = false
+        var unownedSlot = false
+        override fun currentPreparedIdentity(): WorkerPrepareIdentity? = current
         override suspend fun load(identity: WorkerPrepareIdentity) {
             verifications++
             if (failLoad) throw WorkerPrepareException("prepare_artifact_identity_mismatch", "verify/load failed")
@@ -62,7 +64,7 @@ class WorkerPrepareControllerTest {
         }
         override suspend fun unload() { unloads++; if (failUnload) throw IllegalStateException("native free failed"); current = null }
         override fun loaded(identity: WorkerPrepareIdentity): Boolean = current == identity
-        override fun hasRuntime(): Boolean = current != null
+        override fun hasRuntime(): Boolean = current != null || unownedSlot
     }
     private suspend fun transact(controller: WorkerPrepareController, request: JsonObject, scope: kotlinx.coroutines.CoroutineScope): JsonObject {
         val replies = mutableListOf<JsonObject>()
@@ -162,6 +164,33 @@ class WorkerPrepareControllerTest {
         transact(c, request("prepare", next), this); transact(c, request("commit", next), this)
         assertEquals("released", transact(c, request("release"), this)["status"].asString)
         assertNull(c.validateStage(offer(next))); assertEquals(1, runtime.unloads)
+    }
+
+    @Test fun `release for prior process identity settles without unloading newer runtime`() = runBlocking {
+        val runtime = Runtime()
+        val newer = identity(largeGeneration + 1, "new_process_assignment")
+        runtime.current = WorkerPrepareIdentity.parse(newer)
+        val restarted = WorkerPrepareController(node, runtime)
+
+        val ack = transact(restarted, request("release", identity()), this)
+
+        assertEquals("released", ack["status"].asString)
+        assertFalse(ack["loaded"].asBoolean)
+        assertEquals("cleanup:release", ack["cleanup_id"].asString)
+        assertTrue(runtime.loaded(WorkerPrepareIdentity.parse(newer)))
+        assertEquals(0, runtime.unloads)
+    }
+
+    @Test fun `release from a future generation cannot clear an older native slot`() = runBlocking {
+        val runtime = Runtime().apply { current = WorkerPrepareIdentity.parse(identity()) }
+        val restarted = WorkerPrepareController(node, runtime)
+
+        val ack = transact(restarted, request("release", identity(largeGeneration + 1, "future_assignment")), this)
+
+        assertEquals("error", ack["status"].asString)
+        assertFalse(ack["loaded"].asBoolean)
+        assertTrue(runtime.loaded(WorkerPrepareIdentity.parse(identity())))
+        assertEquals(0, runtime.unloads)
     }
 
     @Test fun `remote release refreshes the native status card only after actual unload without a mode switch`() = runBlocking {
@@ -444,10 +473,11 @@ class WorkerPrepareControllerTest {
         val unknown = identity(largeGeneration - 1, "never_known")
         for (action in listOf("release", "abort", "finalize")) {
             val ack = transact(c, request(action, unknown), this)
-            assertEquals("error", ack["status"].asString); assertFalse(ack["loaded"].asBoolean)
+            assertEquals(if (action == "finalize") "finalized" else "released", ack["status"].asString)
+            assertFalse(ack["loaded"].asBoolean)
             assertNull(c.validateStage(offer(next)))
         }
-        assertEquals(0, runtime.unloads)
+        assertEquals(0, runtime.unloads); assertTrue(runtime.loaded(WorkerPrepareIdentity.parse(next)))
     }
 
     @Test fun `old finalize while new candidate is loaded cannot finalize or unload the new candidate`() = runBlocking {
@@ -463,13 +493,13 @@ class WorkerPrepareControllerTest {
     }
 
     @Test fun `cleanup cannot claim no runtime when an unowned native slot still exists`() = runBlocking {
-        val runtime = Runtime().apply { current = WorkerPrepareIdentity.parse(identity(largeGeneration + 1, "unknown_owner")) }
+        val runtime = Runtime().apply { unownedSlot = true }
         val c = WorkerPrepareController(node, runtime)
         for (action in listOf("abort", "release", "finalize")) {
             val ack = transact(c, request(action), this)
             assertEquals("error", ack["status"].asString); assertFalse(ack["loaded"].asBoolean)
         }
-        assertEquals(0, runtime.unloads); assertNotNull(runtime.current)
+        assertEquals(0, runtime.unloads); assertNull(runtime.current); assertTrue(runtime.hasRuntime())
     }
 
     @Test fun `master source identity differs without cross-format conflation`() {
