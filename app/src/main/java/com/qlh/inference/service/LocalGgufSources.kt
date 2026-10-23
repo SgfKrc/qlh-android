@@ -28,6 +28,11 @@ internal class LocalGgufSourceRegistry(
     data class Document(val reference: String, val size: Long, val open: () -> InputStream)
     private data class Registration(val modelId: String, val reference: String, val sha: String, val tokenizer: String, val size: Long)
     private val mutex = Mutex()
+    // ★ 2026-10-24（#117）：未登记候选的**全量 sha256 代价很高**（整模 5.78 GB，
+    //   实测 70~120 s），而 `inventory()` 会被反复调用（每次 hello、每次供给）⇒
+    //   不缓存的话 master 侧直接 `SUPPLY_WORKER_TIMEOUT`（实测 112 s 超时）。
+    //   键含 reference 与 size：文件被替换（size 变化）即自动失效，语义安全。
+    private val unregisteredDigests = java.util.concurrent.ConcurrentHashMap<String, Pair<String, String>>()
     // Shared across ModelManager instances in the UI and service; writes are tiny atomic replacements.
     private companion object {
         val diskLock = Any()
@@ -113,11 +118,35 @@ internal class LocalGgufSourceRegistry(
         if (registrations.isEmpty()) {
             for (document in available.values) {
                 if (document.size <= 0) continue
-                val candidate = LocalGgufSource(modelId, "", "", document.size, document.open)
                 try {
-                    val digest = GgufSegmentCutter.hash(candidate, current)
-                    val source = candidate.copy(sha256 = digest)
+                    val cacheKey = document.reference + "|" + document.size
+                    val cached = unregisteredDigests[cacheKey]
+                    val tokenizer: String
+                    val digest: String
+                    if (cached != null) {
+                        digest = cached.first
+                        tokenizer = cached.second
+                    } else {
+                        // 与 `register()` 同一套身份核对：先读 GGUF 布局与 tokenizer 摘要
+                        // （`verify()` 要求 `source.tokenizerSha256` 与实测一致，传空串会
+                        // 直接抛 SUPPLY_TOKENIZER_DIGEST_MISMATCH 并被下面静默吞掉 ——
+                        // 这正是"能自裁却报无本地源"的那处断点）。
+                        // `use {}` 不是挂起上下文，这里与 `register()` 一致用
+                        // `ensureActive()` 表达取消。
+                        val job = currentCoroutineContext()
+                        val layout = document.open().buffered(64 * 1024).use {
+                            GgufSegmentCutter.inspect(it) { job.ensureActive() }
+                        }
+                        val scan = document.open().buffered(64 * 1024).use {
+                            GgufLayerWeightReader.scan(it, layout.blocks)
+                        }
+                        tokenizer = scan?.tokenizerSha256 ?: continue
+                        val candidate = LocalGgufSource(modelId, "", tokenizer, document.size, document.open)
+                        digest = GgufSegmentCutter.hash(candidate, current)
+                        unregisteredDigests[cacheKey] = digest to tokenizer
+                    }
                     if (sourceSha256.isNotEmpty() && digest != sourceSha256) continue
+                    val source = LocalGgufSource(modelId, digest, tokenizer, document.size, document.open)
                     GgufSegmentCutter.verify(source, current)
                     sources += source
                 } catch (cancelled: CancellationException) { throw cancelled }
