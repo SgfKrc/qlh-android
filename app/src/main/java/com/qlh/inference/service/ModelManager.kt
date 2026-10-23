@@ -116,6 +116,17 @@ class ModelManager(private val context: Context) {
         roots += runCatching { listPhysicalModels(fallbackModelsDir, ModelSource.FALLBACK, setOf(GGUF_EXTENSION, JSON_EXTENSION)) }
             .getOrDefault(emptyList())
         roots += listPhysicalModels(modelsDir, ModelSource.INTERNAL, setOf(GGUF_EXTENSION, JSON_EXTENSION))
+        // ★ 2026-10-24（#117）：`files/local-cut` 也必须纳入源枚举。本地整模 GGUF
+        //   （adb 推入、或本地工具直接放入）就落在该目录，它同时是
+        //   `localCutSources` 注册表的目录。此前只枚举 SAF 授权与 `models/`，于是
+        //   这类源永远不被认作"本地可用源"⇒ master 判
+        //   `SUPPLY_LOCAL_SOURCE_UNAVAILABLE` ⇒ worker 被迫从网络重下 GB 级段
+        //   （实测 android 要下 2.96 GB，按实测 ~0.67 MB/s 需数小时），而它明明
+        //   握着整模、本可本地秒级自裁。
+        roots += runCatching {
+            listPhysicalModels(java.io.File(context.filesDir.canonicalFile, "local-cut"),
+                               ModelSource.INTERNAL, setOf(GGUF_EXTENSION, JSON_EXTENSION))
+        }.getOrDefault(emptyList())
         roots.flatMap { documents ->
             documents.filter { document ->
                 document.name.endsWith(GGUF_EXTENSION, true) && document.sizeBytes > 0 &&
