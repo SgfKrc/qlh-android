@@ -101,9 +101,33 @@ internal class LocalGgufSourceRegistry(
     }
     override suspend fun inventory(modelId: String, sourceSha256: String, current: suspend () -> Boolean): List<LocalGgufSource> = mutex.withLock {
         val registrations = read().filter { it.modelId == modelId || (sourceSha256.isNotEmpty() && it.sha == sourceSha256) }
-        if (registrations.isEmpty()) return@withLock emptyList()
         val available = documents().associateBy { it.reference }
         val sources = mutableListOf<LocalGgufSource>()
+        // ★ 2026-10-24（#117）：注册表为空时**不能直接放弃**。本地整模 GGUF
+        //   （adb 推入或本地工具直接放入 `files/local-cut`）确实存在，只是没有经过
+        //   显式 `register()`。此前 `if (registrations.isEmpty()) return emptyList()`
+        //   会让这类源永不可见 ⇒ master 判 `SUPPLY_LOCAL_SOURCE_UNAVAILABLE` ⇒ 该节点
+        //   只能从网络重下 GB 级段（实测要下 2.96 GB），而它本可本地秒级自裁。
+        //   这里退化为"枚举候选 + 逐个核对身份（大小与 sha256）"，与显式登记走同一套
+        //   校验（`GgufSegmentCutter.verify`），安全边界不变。
+        if (registrations.isEmpty()) {
+            for (document in available.values) {
+                if (document.size <= 0) continue
+                val candidate = LocalGgufSource(modelId, "", "", document.size, document.open)
+                try {
+                    val digest = GgufSegmentCutter.hash(candidate, current)
+                    val source = candidate.copy(sha256 = digest)
+                    if (sourceSha256.isNotEmpty() && digest != sourceSha256) continue
+                    GgufSegmentCutter.verify(source, current)
+                    sources += source
+                } catch (cancelled: CancellationException) { throw cancelled }
+                catch (error: Exception) {
+                    if (error is ModelSupplyException && error.reasonCode == "SUPPLY_CANCELLED") throw error
+                    // A candidate that does not verify is not a capability.
+                }
+            }
+            return@withLock sources.distinctBy { Triple(it.modelId, it.sha256, it.tokenizerSha256) }
+        }
         for (entry in registrations) {
             val document = available[entry.reference] ?: continue
             if (entry.size != document.size || (sourceSha256.isNotEmpty() && entry.sha != sourceSha256)) continue
