@@ -26,6 +26,36 @@ class TaskWorkerBinaryHiddenTransportTest {
     private val b64 get() = Base64.getEncoder().encodeToString(raw)
 
     @Test
+    fun `task worker outer frame preserves null diagnostic layer range`() = runBlocking {
+        val socket = MemorySocket(byteArrayOf())
+        val transport = SocketTaskWorkerTransport(socket)
+        val diagnostic = mapOf(
+            "error_code" to "manifest_unreadable",
+            "manifest" to "broken.manifest.json",
+            "architecture" to "",
+            "mode" to "",
+            "layer_range" to null,
+            "artifact_present" to false,
+        )
+        val envelope = TaskWorkerProtocol.buildHello(
+            "android_12345678",
+            capabilities() + ("layer_artifact_diagnostics" to listOf(diagnostic)),
+            "msg_hello_nullrange01",
+            1000,
+        )
+
+        transport.send(envelope)
+
+        val data = readMeta(DataInputStream(ByteArrayInputStream(socket.written.toByteArray())))
+            .getAsJsonObject("data")
+        val advertised = data.getAsJsonObject("payload")
+            .getAsJsonObject("capabilities")
+            .getAsJsonArray("layer_artifact_diagnostics")[0].asJsonObject
+        assertTrue(advertised.has("layer_range"))
+        assertTrue(advertised.get("layer_range").isJsonNull)
+    }
+
+    @Test
     fun `self advertisement and accepted legacy hello keep replies JSON`() = runBlocking {
         for (flag in listOf<Boolean?>(null, false)) {
             val socket = MemorySocket(jsonFrame(ack(flag)))

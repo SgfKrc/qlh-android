@@ -30,6 +30,7 @@ import com.qlh.inference.service.ModelManager
 import com.qlh.inference.service.ModelSupplyManifest
 import com.qlh.inference.service.ModelSupplyCurrent
 import com.qlh.inference.service.ModelSupplyException
+import com.qlh.inference.service.GgufSegmentCutter
 import com.qlh.inference.network.canonicalHost
 import com.qlh.inference.service.LayerArtifactInventory
 import com.qlh.inference.service.toCandidate
@@ -450,6 +451,33 @@ class TaskWorkerService : Service() {
             } else resourceReason
             val layerRanges = layerArtifacts
                 .map { listOf(it.startLayer, it.endLayerExclusive) }
+            // ★ 2026-10-23（#117 对称修复）：持有完整 GGUF 源、能本地裁层的节点，即使
+            //   没有任何段工件，也应广告 `layer_forward` 并以 [0, total) 声明"可承担任意
+            //   连续层段"。否则 master 永不分配新段，历史上乱切的旧段就永远清不掉
+            //   （鸡生蛋）—— 与 Python 侧 `scheduler_task_worker` 的修复对称。
+            //   只读 GGUF 头（`GgufSegmentCutter.inspect` 有 HEADER_LIMIT），不解析权重。
+            val selfCutRanges: List<List<Int>>? = runCatching {
+                // Self-cutting supersedes any single pre-cut segment as the *dispatch*
+                // contract: an old segment stays a reusable artefact, but must not pin
+                // the layout forever. Only a loaded full model opts out.
+                if (fullInferenceAvailable) return@runCatching null
+                val dir = java.io.File(filesDir.canonicalFile, "local-cut")
+                if (!dir.isDirectory) return@runCatching null
+                dir.listFiles { f -> f.isFile && f.extension.equals("gguf", true) }
+                    ?.sortedBy { it.name }
+                    ?.firstNotNullOfOrNull { f ->
+                        runCatching {
+                            f.inputStream().use { GgufSegmentCutter.inspect(it).layers }
+                        }.getOrNull()?.takeIf { it > 0 }?.let { total -> listOf(listOf(0, total)) }
+                    }
+            }.getOrNull()
+            if (selfCutRanges != null) {
+                QlhLogger.i(
+                    "TaskWorkerService",
+                    "local_cut_source_available ranges=$selfCutRanges (no pre-cut segment)",
+                )
+            }
+            val effectiveLayerRanges = selfCutRanges ?: layerRanges
             val advertisedLayerArtifacts = layerArtifacts.map {
                 layerArtifactCapability(it, scansByArtifact[it])
             }
@@ -479,6 +507,12 @@ class TaskWorkerService : Service() {
                     modelFileBytes = readyArtifact?.document?.sizeBytes ?: 0L,
                     coveredLayers = readyArtifact
                         ?.let { it.endLayerExclusive - it.startLayer } ?: 0,
+                    // ★ 2026-10-23（#117）：此前这里**从未传** `localCut`，于是
+                    //   `layer_budget.local_cut` 恒为 false，master 的求解器把
+                    //   `layer_ranges` 当硬约束（`node_layer_range_not_advertised`）⇒
+                    //   预置段永久钉死切点、容量不足也无从重排。有整模源即声明
+                    //   "可按分配本地裁层"，让求解器把任意连续段分给本节点。
+                    localCut = selfCutRanges != null,
                 )
             } else {
                 null
@@ -490,9 +524,9 @@ class TaskWorkerService : Service() {
                 modelSha256 = modelSha256,
                 resourceAdmitted = verifiedAdmission,
                 resourceReason = verifiedReason,
-                layerRanges = layerRanges,
+                layerRanges = effectiveLayerRanges,
                 fullInferenceAvailable = fullInferenceAvailable,
-                layerWorker = !fullInferenceAvailable && layerRanges.isNotEmpty(),
+                layerWorker = !fullInferenceAvailable && effectiveLayerRanges.isNotEmpty(),
                 runtimeProfile = runtimeProfile,
                 middleChannel = layerForwardInfo["middle_channel"],
                 nPosPerEmbd = layerForwardInfo["n_pos_per_embd"]?.toIntOrNull(),

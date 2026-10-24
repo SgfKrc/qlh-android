@@ -386,6 +386,7 @@ internal class SocketTaskWorkerTransport(
     private val output = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
     private val sendLock = Any()
     private val gson = GsonBuilder().disableHtmlEscaping().create()
+    private val taskWorkerGson = GsonBuilder().disableHtmlEscaping().serializeNulls().create()
 
     private val binaryHiddenLock = Any()
     private var binaryHiddenEnabled: Boolean = false
@@ -423,7 +424,8 @@ internal class SocketTaskWorkerTransport(
         binaryBody: ByteArray?,
         beforeWrite: () -> Unit = {},
     ) {
-        val dataJson = data?.let { ",\"data\":${gson.toJson(it)}" } ?: ""
+        val dataSerializer = if (type == "task_worker") taskWorkerGson else gson
+        val dataJson = data?.let { ",\"data\":" + dataSerializer.toJson(it) } ?: ""
         // ★ 票 21a（COMM-WIRE-01）：二进制体独立成段，元数据里只留格式标记与长度。
         val format = if (binaryBody == null) "json" else "binary"
         val binaryJson = binaryBody?.let { ",\"binary_bytes\":${it.size}" } ?: ""

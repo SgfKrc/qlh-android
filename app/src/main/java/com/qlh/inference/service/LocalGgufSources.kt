@@ -39,6 +39,58 @@ internal class LocalGgufSourceRegistry(
         val idPattern = Regex("[A-Za-z0-9_.:-]{1,128}")
         val shaPattern = Regex("[0-9a-f]{64}")
         const val MARKER = "local-cut-sources.json"
+        // ★ 2026-10-24（#125）：把未登记候选的摘要**持久化**。实测 android 侧
+        //   `inventory` 耗时 72.7 s（返回 10 个源）—— 它对本地每个 GGUF 都做整模全量
+        //   sha256，而进程内缓存**重启即失效**。落盘后跨重启、跨供给复用，摘要本身
+        //   仍是完整的源身份证明，只是不再重算。
+        const val DIGEST_MARKER = "local-cut-digests.json"
+        const val DIGEST_SCHEMA = 1
+    }
+
+    private fun readDigestCache(): MutableMap<String, Pair<String, String>> {
+        val file = ModelSupplyPaths.child(directory, DIGEST_MARKER)
+        if (!file.isFile || file.length() > 8L * 1024 * 1024) return mutableMapOf()
+        return try {
+            val json = JsonParser.parseString(file.readText(Charsets.UTF_8)).asJsonObject
+            if (json["schema_version"]?.asInt != DIGEST_SCHEMA || json["entries"]?.isJsonObject != true) {
+                return mutableMapOf()
+            }
+            val entries = json.getAsJsonObject("entries")
+            val out = mutableMapOf<String, Pair<String, String>>()
+            for ((key, value) in entries.entrySet()) {
+                if (!value.isJsonObject) continue
+                val entry = value.asJsonObject
+                val sha = entry["sha256"]?.takeIf { it.isJsonPrimitive }?.asString ?: continue
+                val tokenizer = entry["tokenizer_sha256"]?.takeIf { it.isJsonPrimitive }?.asString ?: continue
+                if (shaPattern.matches(sha) && shaPattern.matches(tokenizer)) out[key] = sha to tokenizer
+            }
+            out
+        } catch (error: Exception) {
+            // A broken cache is never a capability; fall back to rehashing.
+            mutableMapOf()
+        }
+    }
+
+    private fun writeDigestCache(entries: Map<String, Pair<String, String>>) {
+        try {
+            val payload = JsonObject().apply {
+                addProperty("schema_version", DIGEST_SCHEMA)
+                add("entries", JsonObject().apply {
+                    for ((key, value) in entries) {
+                        add(key, JsonObject().apply {
+                            addProperty("sha256", value.first)
+                            addProperty("tokenizer_sha256", value.second)
+                        })
+                    }
+                })
+            }
+            val temp = ModelSupplyPaths.child(directory, DIGEST_MARKER + ".tmp")
+            temp.writeText(payload.toString(), Charsets.UTF_8)
+            Files.move(temp.toPath(), ModelSupplyPaths.child(directory, DIGEST_MARKER).toPath(),
+                StandardCopyOption.REPLACE_EXISTING)
+        } catch (error: Exception) {
+            // The cache is an optimization; failing to persist must not break inventory.
+        }
     }
     private fun read(): List<Registration> = synchronized(diskLock) {
         ModelSupplyPaths.check(directory)
@@ -116,16 +168,29 @@ internal class LocalGgufSourceRegistry(
         //   这里退化为"枚举候选 + 逐个核对身份（大小与 sha256）"，与显式登记走同一套
         //   校验（`GgufSegmentCutter.verify`），安全边界不变。
         if (registrations.isEmpty()) {
+            // ★ 2026-10-24（#125）：**先按 modelId 过滤**。此前这里遍历本地**全部**
+            //   GGUF 并逐个做整模全量 sha256，而 android 上存着 10 个不同模型的整模
+            //   ⇒ 实测 `supply_inventory_done` 记录 72.7 s（rog 仅 0.046 s）。文件名
+            //   规范化后不含本次 modelId 的候选，本来也不可能通过下面的摘要校验，
+            //   直接跳过不损失任何能力。
+            val modelKey = modelId.lowercase()
+            val persisted = readDigestCache()
+            var cacheDirty = false
             for (document in available.values) {
                 if (document.size <= 0) continue
+                if (modelKey.isNotEmpty()) {
+                    val normalized = document.reference.lowercase().replace('.', '-').replace('_', '-')
+                    if (!normalized.contains(modelKey)) continue
+                }
                 try {
                     val cacheKey = document.reference + "|" + document.size
-                    val cached = unregisteredDigests[cacheKey]
+                    val cached = unregisteredDigests[cacheKey] ?: persisted[cacheKey]
                     val tokenizer: String
                     val digest: String
                     if (cached != null) {
                         digest = cached.first
                         tokenizer = cached.second
+                        unregisteredDigests[cacheKey] = cached
                     } else {
                         // 与 `register()` 同一套身份核对：先读 GGUF 布局与 tokenizer 摘要
                         // （`verify()` 要求 `source.tokenizerSha256` 与实测一致，传空串会
@@ -144,6 +209,8 @@ internal class LocalGgufSourceRegistry(
                         val candidate = LocalGgufSource(modelId, "", tokenizer, document.size, document.open)
                         digest = GgufSegmentCutter.hash(candidate, current)
                         unregisteredDigests[cacheKey] = digest to tokenizer
+                        persisted[cacheKey] = digest to tokenizer
+                        cacheDirty = true
                     }
                     if (sourceSha256.isNotEmpty() && digest != sourceSha256) continue
                     val source = LocalGgufSource(modelId, digest, tokenizer, document.size, document.open)
@@ -155,6 +222,7 @@ internal class LocalGgufSourceRegistry(
                     // A candidate that does not verify is not a capability.
                 }
             }
+            if (cacheDirty) writeDigestCache(persisted)
             return@withLock sources.distinctBy { Triple(it.modelId, it.sha256, it.tokenizerSha256) }
         }
         for (entry in registrations) {
