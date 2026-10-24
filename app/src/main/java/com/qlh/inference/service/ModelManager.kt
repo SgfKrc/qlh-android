@@ -133,7 +133,9 @@ class ModelManager(private val context: Context) {
                     documents.none { it.parentId == document.parentId && it.name in ModelSupplyManifest.nativeNames(document.name) }
             }
         }.distinctBy(::physicalDocumentKey).map { document ->
-            LocalGgufSourceRegistry.Document(document.uri.toString(), document.sizeBytes) {
+            LocalGgufSourceRegistry.Document(document.uri.toString(), document.sizeBytes, version = {
+                if (android.os.Build.VERSION.SDK_INT >= 27) fileVersionToken(document.uri) else null
+            }) {
                 if (document.uri.scheme == "file") {
                     val file = File(document.uri.path.orEmpty())
                     ModelSupplyPaths.check(file)
@@ -745,6 +747,12 @@ class ModelManager(private val context: Context) {
         forceRefresh: Boolean = false,
         onLookup: (Boolean) -> Unit = {},
     ): String {
+        if (uri.scheme == "file") {
+            val file = File(uri.path.orEmpty())
+            if (file.toPath().toAbsolutePath().normalize().startsWith(suppliedSegmentsDir.toPath())) {
+                return VerifiedPrivateModelDigests.shared.verify(file, fresh = forceRefresh, onLookup = onLookup).digest
+            }
+        }
         val documentIdentity = "$storageScope|$uri"
         val epoch = verifiedModelDigestEpochs.computeIfAbsent(documentIdentity) { AtomicLong() }
         if (forceRefresh) epoch.incrementAndGet()
@@ -770,6 +778,8 @@ class ModelManager(private val context: Context) {
                 size = valid.st_size,
                 modifiedSeconds = valid.st_mtime,
                 changedSeconds = valid.st_ctime,
+                modifiedNanoseconds = valid.st_mtim.tv_nsec,
+                changedNanoseconds = valid.st_ctim.tv_nsec,
             )
         }
     }.getOrNull()

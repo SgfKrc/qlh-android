@@ -102,15 +102,15 @@ internal class ModelSupplyController(
                     val sourceSha = ModelSupplyManifest.text(data, "source_model_sha256")
                     checkSupply(sourceSha.isEmpty() || Regex("[0-9a-f]{64}").matches(sourceSha), "SUPPLY_INVALID_REQUEST", "source sha")
                     suspend fun reportInventory() {
-                        val sources = localSources?.inventory(modelId, sourceSha) {
-                            currentCoroutineContext().ensureActive()
-                            authorize()
-                            bindingCurrent() && synchronized(lock) { generation == commandGeneration }
-                        }.orEmpty()
-                        authorize()
-                        checkSupply(bindingCurrent() && synchronized(lock) { generation == commandGeneration },
-                            "SUPPLY_CANCELLED", "inventory retired")
-                        reply(JsonObject().apply {
+                        currentCoroutineContext().ensureActive()
+                        val sources = if (modelId.isNotEmpty() || sourceSha.isNotEmpty()) {
+                            localSources?.inventory(modelId, sourceSha) {
+                                currentCoroutineContext().ensureActive()
+                                authorize()
+                                bindingCurrent() && synchronized(lock) { generation == commandGeneration }
+                            }.orEmpty()
+                        } else emptyList()
+                        val response = JsonObject().apply {
                             addProperty("action", "inventory_result"); addProperty("operation_id", operation); addProperty("node_id", nodeId)
                             addProperty("distributed", distributed()); addProperty("disk_free_bytes", root.parentFile?.usableSpace ?: 0L)
                             addProperty("memory_available_bytes", memoryAvailable().coerceAtLeast(0)); addProperty("local_cut", localSources != null)
@@ -121,7 +121,13 @@ internal class ModelSupplyController(
                                 addProperty("source_model_id", source.modelId); addProperty("source_model_sha256", source.sha256)
                                 addProperty("tokenizer_sha256", source.tokenizerSha256); addProperty("size_bytes", source.size)
                             }) } })
-                        })
+                        }
+                        authorize()
+                        val bound = bindingCurrent()
+                        currentCoroutineContext().ensureActive()
+                        checkSupply(bound && synchronized(lock) { generation == commandGeneration },
+                            "SUPPLY_CANCELLED", "inventory retired")
+                        reply(response)
                     }
                     if (localSources == null) reportInventory() else {
                         val job = scope.launch(start = CoroutineStart.LAZY) {

@@ -1,5 +1,8 @@
 package com.qlh.inference.service
 
+import com.google.gson.JsonArray
+import com.google.gson.JsonElement
+import com.google.gson.JsonPrimitive
 import com.qlh.inference.worker.GgufLayerWeightReader
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
@@ -9,6 +12,7 @@ import java.io.File
 import java.io.FilterInputStream
 import java.io.InputStream
 import java.io.RandomAccessFile
+import java.security.DigestInputStream
 import java.security.MessageDigest
 
 /** Reopenable read-only source, including SAF providers that return a pipe. Never passed to JNI. */
@@ -34,9 +38,11 @@ internal object GgufSegmentCutter {
         val arrayCount: Long = 0, val arrayOffset: Long = 0)
     data class Tensor(val name: String, val dimensions: List<Long>, val type: Int, val offset: Long, val size: Long)
     data class Layout(val metadata: List<Metadata>, val tensors: List<Tensor>, val dataOffset: Long,
-        val architecture: String, val blocks: Int, val nextn: Int, val hidden: Int) {
+        val architecture: String, val blocks: Int, val nextn: Int, val hidden: Int,
+        val scan: GgufLayerWeightReader.ScanResult?) {
         val layers get() = blocks - nextn
     }
+    data class Inspection(val layout: Layout, val sha256: String, val tokenizerSha256: String)
 
     private class Header(input: InputStream, val check: () -> Unit) : FilterInputStream(input) {
         var position = 0L
@@ -108,24 +114,50 @@ internal object GgufSegmentCutter {
         val tensors = data.i64(); val fields = data.i64()
         checkSupply(tensors in 1..100_000 && fields in 1..100_000, "SUPPLY_LOCAL_CUT_UNSUPPORTED", "GGUF counts")
         val metadata = ArrayList<Metadata>()
+        val contractFields = mutableMapOf<String, JsonElement>()
+        val tokenizerFields = mutableMapOf<String, ByteArray>()
         val keys = HashSet<String>()
         repeat(fields.toInt()) {
             val start = header.position
             val name = data.string()
             checkSupply(keys.add(name) && !name.startsWith("split."), "SUPPLY_LOCAL_CUT_UNSUPPORTED", "duplicate/split GGUF")
             val type = data.i32()
+            val tokenizerDigest = if (name.startsWith("tokenizer.")) MessageDigest.getInstance("SHA-256").apply {
+                update(ByteArray(4) { index -> (type ushr (index * 8)).toByte() })
+            } else null
+            val valueInput = tokenizerDigest?.let { digest ->
+                DataInputStream(object : DigestInputStream(data, digest) {
+                    private val buffer = ByteArray(8192)
+                    override fun skip(count: Long): Long =
+                        read(buffer, 0, minOf(count, buffer.size.toLong()).toInt()).coerceAtLeast(0).toLong()
+                })
+            } ?: data
+            val contract = GgufLayerWeightReader.isContractMetadata(name)
+            if (contract) checkSupply(contractFields.size < 128, "SUPPLY_LOCAL_CUT_UNSUPPORTED", "too many GGUF contract fields")
             var value: Long? = null; var text: String? = null
             var arrayType: Int? = null; var arrayCount = 0L; var arrayOffset = 0L
             if (name == "general.architecture") {
                 checkSupply(type == 8, "SUPPLY_LOCAL_CUT_UNSUPPORTED", "GGUF architecture type")
-                text = data.string()
+                text = valueInput.string()
                 checkSupply(text.isNotBlank() && text.length <= 128, "SUPPLY_LOCAL_CUT_UNSUPPORTED", "GGUF architecture")
+                contractFields[name] = JsonPrimitive(text)
             } else if (type == 9) {
-                arrayType = data.i32(); arrayCount = data.i64(); arrayOffset = header.position
+                arrayType = valueInput.i32(); arrayCount = valueInput.i64(); arrayOffset = header.position
                 checkSupply(arrayCount in 0..1_000_000 && arrayType != 9, "SUPPLY_LOCAL_CUT_UNSUPPORTED", "GGUF array")
-                repeat(arrayCount.toInt()) { data.skipValue(arrayType) }
-            } else if (type != 8) value = data.integer(type)
-            else data.skipValue(type)
+                if (contract) {
+                    checkSupply(arrayCount <= 1024 && arrayType in setOf(0, 1, 2, 3, 4, 5, 10, 11),
+                        "SUPPLY_GGUF_METADATA_MISMATCH", "GGUF contract integer array")
+                    contractFields[name] = JsonArray().apply {
+                        repeat(arrayCount.toInt()) { add(with(GgufLayerWeightReader) { valueInput.readMetadataInteger(arrayType) }) }
+                    }
+                } else repeat(arrayCount.toInt()) { valueInput.skipValue(arrayType) }
+            } else if (contract) {
+                val field = with(GgufLayerWeightReader) { valueInput.readMetadataInteger(type) }
+                contractFields[name] = field
+                value = field.asLong
+            } else if (type != 8) value = valueInput.integer(type)
+            else valueInput.skipValue(type)
+            tokenizerDigest?.let { tokenizerFields[name] = it.digest() }
             metadata += Metadata(name, start, header.position - start, type, value, text, arrayType, arrayCount, arrayOffset)
         }
         val arch = metadata.singleOrNull { it.name == "general.architecture" }?.text
@@ -169,23 +201,54 @@ internal object GgufSegmentCutter {
                 && field.arrayType in setOf(0, 1, 2, 3, 4, 5, 6, 7, 10, 11, 12), "SUPPLY_LOCAL_CUT_UNSUPPORTED", "GGUF per-layer array")
             else checkSupply(!field.name.endsWith("attention.recurrent_layers"), "SUPPLY_LOCAL_CUT_UNSUPPORTED", "GGUF recurrent array")
         }
-        return Layout(metadata, entries, pad(header.position), arch, blocks, nextn, hidden)
+        val scan = totals.takeIf { it.all { size -> size > 0 } }?.let {
+            GgufLayerWeightReader.ScanResult(it.toList(), GgufLayerWeightReader.tokenizerSha256(tokenizerFields),
+                GgufLayerWeightReader.normalizeMetadata(contractFields))
+        }
+        return Layout(metadata, entries, pad(header.position), arch, blocks, nextn, hidden, scan)
+    }
+
+    suspend fun inspectSource(source: LocalGgufSource, stillCurrent: suspend () -> Boolean): Inspection {
+        checkCurrent(stillCurrent)
+        val job = currentCoroutineContext()
+        val digest = MessageDigest.getInstance("SHA-256")
+        var size = 0L
+        val counted = object : FilterInputStream(DigestInputStream(source.open(), digest)) {
+            override fun read(): Int = `in`.read().also { if (it >= 0) consumed(1) }
+            override fun read(buffer: ByteArray, offset: Int, length: Int): Int =
+                `in`.read(buffer, offset, length).also { if (it > 0) consumed(it) }
+            private fun consumed(count: Int) {
+                job.ensureActive()
+                size = Math.addExact(size, count.toLong())
+                checkSupply(size <= source.size, "SUPPLY_SOURCE_DIGEST_MISMATCH", "source grew")
+            }
+        }
+        val layout = counted.buffered(64 * 1024).use { input ->
+            val inspected = inspect(input) { job.ensureActive() }
+            val maximum = inspected.tensors.maxOf { Math.addExact(inspected.dataOffset, Math.addExact(it.offset, it.size)) }
+            checkSupply(maximum <= source.size, "SUPPLY_LOCAL_CUT_UNSUPPORTED", "truncated source GGUF")
+            val scan = inspected.scan
+            checkSupply(scan != null && scan.tokenizerSha256 != null &&
+                GgufMetadataContract.matches(scan.ggufMetadata, com.google.gson.JsonObject().apply {
+                    scan.ggufMetadata.forEach { (key, value) -> add(key, value) }
+                }, inspected.blocks), "SUPPLY_GGUF_METADATA_MISMATCH", "source metadata/tokenizer")
+            val buffer = ByteArray(CHUNK)
+            while (true) {
+                checkCurrent(stillCurrent)
+                if (input.read(buffer) < 0) break
+            }
+            inspected
+        }
+        checkCurrent(stillCurrent)
+        checkSupply(size == source.size, "SUPPLY_SOURCE_DIGEST_MISMATCH", "source size changed")
+        return Inspection(layout, digest.digest().joinToString("") { "%02x".format(it.toInt() and 255) }, layout.scan!!.tokenizerSha256!!)
     }
 
     suspend fun verify(source: LocalGgufSource, stillCurrent: suspend () -> Boolean): Layout {
-        checkCurrent(stillCurrent)
-        val job = currentCoroutineContext()
-        val layout = source.open().buffered(64 * 1024).use { inspect(it) { job.ensureActive() } }
-        val maximum = layout.tensors.maxOf { Math.addExact(layout.dataOffset, Math.addExact(it.offset, it.size)) }
-        checkSupply(maximum <= source.size, "SUPPLY_LOCAL_CUT_UNSUPPORTED", "truncated source GGUF")
-        val scan = source.open().buffered(64 * 1024).use { GgufLayerWeightReader.scan(it, layout.blocks) }
-        checkSupply(scan != null && scan.tokenizerSha256 != null &&
-            GgufMetadataContract.matches(scan.ggufMetadata, com.google.gson.JsonObject().apply {
-                scan.ggufMetadata.forEach { (key, value) -> add(key, value) }
-            }, layout.blocks), "SUPPLY_GGUF_METADATA_MISMATCH", "source metadata/tokenizer")
-        checkSupply(scan!!.tokenizerSha256 == source.tokenizerSha256, "SUPPLY_TOKENIZER_DIGEST_MISMATCH", "source tokenizer")
-        checkSupply(hash(source, stillCurrent) == source.sha256, "SUPPLY_SOURCE_DIGEST_MISMATCH", "source changed")
-        return layout
+        val inspected = inspectSource(source, stillCurrent)
+        checkSupply(inspected.tokenizerSha256 == source.tokenizerSha256, "SUPPLY_TOKENIZER_DIGEST_MISMATCH", "source tokenizer")
+        checkSupply(inspected.sha256 == source.sha256, "SUPPLY_SOURCE_DIGEST_MISMATCH", "source changed")
+        return inspected.layout
     }
 
     suspend fun hash(source: LocalGgufSource, stillCurrent: suspend () -> Boolean): String {

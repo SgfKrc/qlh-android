@@ -88,6 +88,112 @@ class ModelSupplyDedupGcTest {
                 .body(fixture.files.getValue(path).toResponseBody()).build()
         }.build()
 
+    @Test fun `download verification survives rename and shares hashes with warm receive and registration`() = runBlocking {
+        val root = root()
+        val first = fixture()
+        val files = PrivateDigestTestFiles(temp.newFolder())
+        val requests = mutableListOf<String>()
+        val initial = ModelSupplyReceiver(root, "127.0.0.1", client = client(first, requests),
+            digests = files.digests, createLink = files::link).receive(
+            first.manifest, 1, "secret", { true }, {}, { it() })
+        assertEquals(first.files.size, files.reads.size)
+        assertTrue(files.reads.all { it.name.endsWith(".part") })
+        ModelSupplyReceiver(root, "unused", digests = files.digests).validateFiles(initial, first.manifest)
+        assertEquals(first.manifest.weight.sha256, files.digests.verify(initial.resolve(first.manifest.weight.path)).digest)
+        assertEquals(first.files.size, files.reads.size)
+        requests.clear()
+        val next = fixture(2)
+        val progress = mutableListOf<ModelSupplyProgress>()
+        val received = ModelSupplyReceiver(root, "127.0.0.1", client = client(next, requests),
+            digests = files.digests, createLink = files::link).receive(
+            next.manifest, 1, "secret", { true }, { progress += it }, { it() })
+        ModelSupplyReceiver(root, "unused", digests = files.digests).validateFiles(received, next.manifest)
+        assertEquals(next.manifest.weight.sha256, files.digests.verify(received.resolve(next.manifest.weight.path)).digest)
+        assertTrue(requests.isEmpty())
+        assertEquals(0L, progress.last().actualDownloadedBytes)
+        assertEquals(next.manifest.files.sumOf { it.size }, progress.last().reusedBytes)
+        assertTrue(Files.isSameFile(initial.resolve(first.manifest.weight.path).toPath(),
+            received.resolve(next.manifest.weight.path).toPath()))
+        assertEquals(first.files.size, files.reads.size)
+    }
+
+    @Test fun `cold donor is read once across hardlink target verification and final validation`() = runBlocking {
+        val root = root()
+        val first = fixture()
+        publish(root, first)
+        val next = fixture(2)
+        val files = PrivateDigestTestFiles(temp.newFolder())
+        val requests = mutableListOf<String>()
+        val received = ModelSupplyReceiver(root, "127.0.0.1", client = client(next, requests),
+            digests = files.digests, createLink = files::link).receive(
+            next.manifest, 1, "secret", { true }, {}, { it() })
+        ModelSupplyReceiver(root, "unused", digests = files.digests).validateFiles(received, next.manifest)
+        assertTrue(requests.isEmpty())
+        assertEquals(first.files.size, files.reads.size)
+        assertEquals(1, files.reads.count { it.name == first.manifest.weight.path })
+    }
+
+    @Test fun `copy fallback always hashes new target bytes and later validation reuses that verification`() = runBlocking {
+        val root = root()
+        val first = fixture()
+        publish(root, first)
+        val next = fixture(2)
+        val files = PrivateDigestTestFiles(temp.newFolder())
+        val requests = mutableListOf<String>()
+        val received = ModelSupplyReceiver(root, "127.0.0.1", client = client(next, requests),
+            digests = files.digests, createLink = { _, _ -> throw UnsupportedOperationException("no links") }).receive(
+            next.manifest, 1, "secret", { true }, {}, { it() })
+        assertEquals(first.files.size * 2, files.reads.size)
+        assertEquals(next.files.size, files.reads.count { it.parentFile?.name?.startsWith(".receive-") == true })
+        ModelSupplyReceiver(root, "unused", digests = files.digests).validateFiles(received, next.manifest)
+        assertEquals(first.files.size * 2, files.reads.size)
+        assertTrue(requests.isEmpty())
+    }
+
+    @Test fun `copy fallback rejects corrupted copied bytes and downloads a verified replacement`() = runBlocking {
+        val root = root()
+        val first = fixture()
+        val donor = publish(root, first)
+        val files = PrivateDigestTestFiles(temp.newFolder())
+        ModelSupplyReceiver(root, "unused", digests = files.digests).validateFiles(donor, first.manifest)
+        val next = fixture(2)
+        val requests = mutableListOf<String>()
+        val received = ModelSupplyReceiver(root, "127.0.0.1", client = client(next, requests), digests = files.digests,
+            createLink = { source, _ ->
+                if (source.name == first.manifest.weight.path) {
+                    val modified = Files.getLastModifiedTime(source.toPath())
+                    source.writeBytes(source.readBytes().also { it[0] = (it[0].toInt() xor 1).toByte() })
+                    Files.setLastModifiedTime(source.toPath(), modified)
+                    files.changed(source)
+                }
+                throw UnsupportedOperationException("no links")
+            }).receive(next.manifest, 1, "secret", { true }, {}, { it() })
+        assertEquals(listOf(next.manifest.weight.path), requests)
+        assertArrayEquals(next.files.getValue(next.manifest.weight.path), received.resolve(next.manifest.weight.path).readBytes())
+        assertEquals(1, files.reads.count {
+            it.name == next.manifest.weight.path && it.parentFile?.name?.startsWith(".receive-") == true
+        })
+        ModelSupplyReceiver(root, "unused", digests = files.digests).validateFiles(received, next.manifest)
+    }
+
+    @Test fun `GC ignores an unchanged hot digest and freshly rejects corrupted retirement bytes`() = runBlocking {
+        val root = root()
+        val first = fixture()
+        val old = publish(root, first)
+        val files = PrivateDigestTestFiles(temp.newFolder())
+        ModelSupplyReceiver(root, "unused", digests = files.digests).validateFiles(old, first.manifest)
+        val next = fixture(2)
+        publish(root, next)
+        select(root, next)
+        val weight = old.resolve(first.manifest.weight.path)
+        val modified = Files.getLastModifiedTime(weight.toPath())
+        weight.writeBytes(weight.readBytes().also { it[0] = (it[0].toInt() xor 1).toByte() })
+        Files.setLastModifiedTime(weight.toPath(), modified)
+        assertEquals(first.manifest.weight.sha256, files.digests.verify(weight).digest)
+        assertEquals(0, ModelSupplyGc(root).collect(node).deleted)
+        assertTrue(old.exists())
+    }
+
     @Test fun `restart and new operation reuse all bytes with a fresh bound manifest and zero HTTP`() = runBlocking {
         val root = root(); val first = fixture(); val requests = mutableListOf<String>()
         val old = ModelSupplyReceiver(root, "127.0.0.1", client = client(first, requests)).receive(

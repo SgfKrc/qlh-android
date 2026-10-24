@@ -98,6 +98,8 @@ internal class ModelSupplyReceiver(
     private val client: OkHttpClient = OkHttpClient.Builder().followRedirects(false).followSslRedirects(false)
         .connectTimeout(15, TimeUnit.SECONDS).readTimeout(readTimeoutMillis, TimeUnit.MILLISECONDS).build(),
     private val nanoTime: () -> Long = System::nanoTime,
+    private val digests: VerifiedPrivateModelDigests = VerifiedPrivateModelDigests.shared,
+    private val createLink: (File, File) -> Unit = { source, target -> Files.createLink(target.toPath(), source.toPath()) },
 ) {
     init { require(checkpointIntervalBytes > 0 && readTimeoutMillis > 0) }
     private val call = AtomicReference<Call?>()
@@ -171,26 +173,28 @@ internal class ModelSupplyReceiver(
                     try {
                         val candidate = runCatching { safeFile(directory, entry.path) }.getOrNull() ?: continue
                         transfer.report("verifying_reuse")
-                        if (!matches(candidate, file)) continue
+                        val verified = verifyFile(candidate, file) ?: continue
                         currentCoroutineContext().ensureActive()
                         checkSupply(stillCurrent(), "SUPPLY_CANCELLED", "binding changed")
                         // Never truncate a target that may already be a link to a published file.
                         Files.deleteIfExists(target.toPath())
-                        try {
-                            Files.createLink(target.toPath(), candidate.toPath())
+                        val linked = try {
+                            digests.linkVerified(candidate, target, verified, createLink)
                         } catch (_: IOException) {
                             copyReusable(candidate, partial, file.size, stillCurrent)
                             currentCoroutineContext().ensureActive()
                             checkSupply(stillCurrent(), "SUPPLY_CANCELLED", "binding changed")
                             Files.move(partial.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
+                            false
                         } catch (_: UnsupportedOperationException) {
                             copyReusable(candidate, partial, file.size, stillCurrent)
                             currentCoroutineContext().ensureActive()
                             checkSupply(stillCurrent(), "SUPPLY_CANCELLED", "binding changed")
                             Files.move(partial.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
+                            false
                         }
                         // Recheck live bytes after link/copy, including changes during verification.
-                        if (!matches(target, file)) {
+                        if (!matches(target, file, fresh = !linked)) {
                             Files.deleteIfExists(target.toPath())
                             continue
                         }
@@ -209,11 +213,12 @@ internal class ModelSupplyReceiver(
                 var prefix = trustedPrefix(journal, file, partial, stillCurrent)
                 prefix = importPrefix(inventory.prefixes[fileKey(file)].orEmpty(), file, partial, prefix, journal, stillCurrent)
                 val offset = prefix.length
-                if (file.size > 0 && offset == file.size && matches(partial, file)) {
+                val completedPrefix = if (file.size > 0 && offset == file.size) verifyFile(partial, file) else null
+                if (completedPrefix != null) {
                     currentCoroutineContext().ensureActive()
                     checkSupply(stillCurrent(), "SUPPLY_CANCELLED", "binding changed")
                     journal.recordSource()
-                    Files.move(partial.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
+                    digests.moveVerified(partial, target, completedPrefix)
                     transfer.completed += file.size; transfer.reused += file.size
                     transfer.report("reusing")
                     continue
@@ -250,14 +255,15 @@ internal class ModelSupplyReceiver(
                     downloadFile(manifest, file, partial, prefix, journal, apiPort, token, stillCurrent, transfer)
                 }
                 transfer.report("verifying", transfer.completed + file.size)
-                if (!matches(partial, file)) {
+                val verified = verifyFile(partial, file, fresh = true)
+                if (verified == null) {
                     Files.deleteIfExists(partial.toPath())
                     throw ModelSupplyException("SUPPLY_ARTIFACT_DIGEST_MISMATCH", "file digest mismatch")
                 }
                 currentCoroutineContext().ensureActive()
                 checkSupply(stillCurrent(), "SUPPLY_CANCELLED", "binding changed")
                 journal.recordSource()
-                Files.move(partial.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
+                digests.moveVerified(partial, target, verified)
                 transfer.completed += file.size
             }
             validateFiles(stage, manifest)
@@ -652,20 +658,19 @@ internal class ModelSupplyReceiver(
             "SUPPLY_TOKENIZER_DIGEST_MISMATCH", "GGUF tokenizer differs")
     }
 
-    private suspend fun matches(file: File, expected: ModelSupplyManifest.SupplyFile): Boolean {
+    private suspend fun matches(file: File, expected: ModelSupplyManifest.SupplyFile, fresh: Boolean = false): Boolean =
+        verifyFile(file, expected, fresh) != null
+
+    private suspend fun verifyFile(
+        file: File,
+        expected: ModelSupplyManifest.SupplyFile,
+        fresh: Boolean = false,
+    ): VerifiedPrivateModelDigests.Verification? {
         val before = try { Files.readAttributes(file.toPath(), BasicFileAttributes::class.java, LinkOption.NOFOLLOW_LINKS) }
-            catch (_: IOException) { return false }
-        if (!before.isRegularFile || before.size() != expected.size) return false
-        val digest = MessageDigest.getInstance("SHA-256")
-        Files.newInputStream(file.toPath(), java.nio.file.StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS).use { input ->
-            val buffer = ByteArray(1024 * 1024)
-            while (true) { currentCoroutineContext().ensureActive(); val n = input.read(buffer); if (n < 0) break; digest.update(buffer, 0, n) }
-        }
-        val after = try { Files.readAttributes(file.toPath(), BasicFileAttributes::class.java, LinkOption.NOFOLLOW_LINKS) }
-            catch (_: IOException) { return false }
-        if (!after.isRegularFile || before.size() != after.size() || before.lastModifiedTime() != after.lastModifiedTime() ||
-            before.fileKey() != after.fileKey()) return false
-        return digest.digest().joinToString("") { "%02x".format(it.toInt() and 255) } == expected.sha256
+            catch (_: IOException) { return null }
+        if (!before.isRegularFile || before.size() != expected.size) return null
+        val verified = try { digests.verify(file, fresh = fresh) } catch (_: IOException) { return null }
+        return verified.takeIf { it.digest == expected.sha256 }
     }
     private fun confined(name: String) = safeFile(root, name)
     private fun safeFile(directory: File, name: String): File = ModelSupplyPaths.child(directory, name)

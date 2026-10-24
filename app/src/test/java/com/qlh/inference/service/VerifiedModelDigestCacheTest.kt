@@ -11,11 +11,54 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertThrows
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class VerifiedModelDigestCacheTest {
     private val original = ModelFileFingerprint(1, 2, 1024, 10, 10)
+
+    @Test
+    fun `nanosecond changes invalidate a digest within the same second`() = runBlocking {
+        val cache = VerifiedModelDigestCache({ 0L })
+        var fingerprint = original
+        var reads = 0
+        suspend fun digest(): String = cache.digest("artifact", { fingerprint }) { (++reads).toString() }
+        assertEquals("1", digest())
+        fingerprint = original.copy(modifiedNanoseconds = 100)
+        assertEquals("2", digest())
+        fingerprint = fingerprint.copy(changedNanoseconds = 200)
+        assertEquals("3", digest())
+        assertEquals("3", digest())
+    }
+
+    @Test
+    fun `controlled ctime migration keeps the original verification lease and rejects changed content versions`() = runBlocking {
+        var time = 0L
+        val cache = VerifiedModelDigestCache({ time }, maxAgeMs = 100)
+        assertEquals("verified", cache.digest("artifact", { original }) { "verified" })
+        val linked = original.copy(changedNanoseconds = 100)
+        time = 90
+        assertTrue(cache.rebind("artifact", original, linked))
+        assertEquals("verified", cache.digest("artifact", { linked }) { "unexpected read" })
+        assertFalse(cache.rebind("artifact", original, linked))
+        assertFalse(cache.rebind("artifact", linked, linked.copy(inode = 3)))
+        assertFalse(cache.rebind("artifact", linked, linked.copy(modifiedNanoseconds = 100)))
+        time = 100
+        assertEquals("fresh", cache.digest("artifact", { linked }) { "fresh" })
+    }
+
+    @Test
+    fun `explicit fresh verification invalidates a hot entry even when verification then fails`() = runBlocking {
+        val cache = VerifiedModelDigestCache({ 0L })
+        assertEquals("old", cache.digest("artifact", { original }) { "old" })
+        assertThrows(IOException::class.java) {
+            runBlocking { cache.digest("artifact", { original }, fresh = true) { throw IOException("unreadable") } }
+        }
+        assertFalse(cache.rebind("artifact", original, original.copy(changedNanoseconds = 1)))
+        assertEquals("new", cache.digest("artifact", { original }) { "new" })
+    }
 
     @Test
     fun `unchanged reconnect reuses digest but file identity and expiry force a rehash`() = runBlocking {

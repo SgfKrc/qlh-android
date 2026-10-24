@@ -29,6 +29,7 @@ internal class VerifiedModelDigestCache(
         key: String,
         fingerprint: () -> ModelFileFingerprint?,
         onLookup: (reused: Boolean) -> Unit = {},
+        fresh: Boolean = false,
         hash: suspend () -> String,
     ): String {
         currentCoroutineContext().ensureActive()
@@ -43,7 +44,7 @@ internal class VerifiedModelDigestCache(
             val before = fingerprint()
             val now = clockMs()
             val cached = entry.digest
-            if (before != null && cached != null && entry.fingerprint == before &&
+            if (!fresh && before != null && cached != null && entry.fingerprint == before &&
                 now >= entry.verifiedAtMs && now - entry.verifiedAtMs < maxAgeMs
             ) {
                 onLookup(true)
@@ -68,6 +69,24 @@ internal class VerifiedModelDigestCache(
             entry.mutex.unlock()
         }
     }
+
+    suspend fun rebind(key: String, before: ModelFileFingerprint, after: ModelFileFingerprint): Boolean {
+        currentCoroutineContext().ensureActive()
+        if (!before.sameContentVersion(after)) return false
+        val entry = synchronized(entries) { entries[key] } ?: return false
+        entry.mutex.lock()
+        try {
+            currentCoroutineContext().ensureActive()
+            val now = clockMs()
+            if (entry.digest == null || entry.fingerprint != before ||
+                now < entry.verifiedAtMs || now - entry.verifiedAtMs >= maxAgeMs
+            ) return false
+            entry.fingerprint = after
+            return true
+        } finally {
+            entry.mutex.unlock()
+        }
+    }
 }
 
 /** Inode and change time supplement size/mtime; a short lease still bounds spoofed metadata. */
@@ -77,4 +96,10 @@ internal data class ModelFileFingerprint(
     val size: Long,
     val modifiedSeconds: Long,
     val changedSeconds: Long,
-)
+    val modifiedNanoseconds: Long = 0,
+    val changedNanoseconds: Long = 0,
+) {
+    fun sameContentVersion(other: ModelFileFingerprint): Boolean =
+        device == other.device && inode == other.inode && size == other.size &&
+            modifiedSeconds == other.modifiedSeconds && modifiedNanoseconds == other.modifiedNanoseconds
+}

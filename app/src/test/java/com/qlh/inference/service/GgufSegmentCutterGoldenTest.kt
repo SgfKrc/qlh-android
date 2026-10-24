@@ -49,6 +49,7 @@ class GgufSegmentCutterGoldenTest(private val kind: String, private val mode: St
         assertFalse(layout.tensors.any { it.name.contains("nextn") })
         assertTrue("unknown non-block tensors must survive", layout.tensors.any { it.name == "unknown.support.weight" })
         val scan = output.inputStream().use { GgufLayerWeightReader.scan(it, manifest.end - manifest.start) }!!
+        assertEquals(scan, layout.scan)
         assertEquals(source.tokenizerSha256, scan.tokenizerSha256)
     }
 }

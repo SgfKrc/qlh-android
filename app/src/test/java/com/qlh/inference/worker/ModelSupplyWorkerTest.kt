@@ -8,6 +8,10 @@ import androidx.datastore.preferences.core.mutablePreferencesOf
 import com.qlh.inference.data.SettingsDataStore
 import com.qlh.inference.security.ClusterCredentialStorage
 import com.qlh.inference.service.ModelSupplyException
+import com.qlh.inference.service.LocalGgufSource
+import com.qlh.inference.service.LocalGgufSources
+import com.qlh.inference.service.supplyBindingSha256
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.CompletableDeferred
@@ -124,6 +128,143 @@ class ModelSupplyWorkerTest {
         ensure.add("manifest", invalidManifest)
         controller.command(ensure, this, { replies += it }, { fail("invalid manifest refresh") })
         assertEquals("SUPPLY_INVALID_MANIFEST", replies.last()["reason_code"].asString)
+    }
+
+    private fun inventory(modelId: String = "", sourceSha: String = "") = JsonObject().apply {
+        addProperty("action", "inventory"); addProperty("operation_id", operation)
+        addProperty("model_id", modelId); addProperty("source_model_sha256", sourceSha)
+    }
+
+    private fun inventorySources(
+        read: suspend (String, String, suspend () -> Boolean) -> List<LocalGgufSource> = { _, _, _ ->
+            error("budget inventory must not inspect local sources")
+        },
+    ) = object : LocalGgufSources {
+        override suspend fun inventory(modelId: String, sourceSha256: String, current: suspend () -> Boolean) =
+            read(modelId, sourceSha256, current)
+        override suspend fun resolve(manifest: ModelSupplyManifest, current: suspend () -> Boolean): LocalGgufSource =
+            error("inventory must not resolve a source")
+    }
+
+    @Test fun `empty inventory samples fresh budgets without reading sources or changing registered segments`() = runBlocking {
+        var disk = 1024L
+        var diskReads = 0
+        val storage = object : File(temp.newFolder().absolutePath) {
+            override fun getUsableSpace(): Long { diskReads++; return disk }
+        }
+        val root = object : File(storage, "supply") {
+            override fun getParentFile(): File = storage
+        }.apply { mkdir() }
+        val parsed = ModelSupplyManifest.parse(published(root, operation))
+        val binding = supplyBindingSha256("", "bound-master", 0, 0)
+        val selected = ModelSupplyCurrent(root)
+        selected.complete(selected.select(parsed, binding))
+        fun snapshot() = root.walkTopDown().filter { it.isFile }.associate {
+            it.relativeTo(root).path to (it.lastModified() to it.readBytes().toList())
+        }
+        val previous = snapshot()
+        var enabled = true
+        var memory = 0L
+        var modeReads = 0
+        var memoryReads = 0
+        var authorizations = 0
+        val replies = mutableListOf<JsonObject>()
+        val controller = ModelSupplyController(node, "bound-master", root,
+            distributed = { modeReads++; enabled }, bindingCurrent = { true },
+            memoryAvailable = { memoryReads++; memory }, publicationGate = { fail("inventory publication") },
+            available = { fail("inventory registration") }, localSources = inventorySources())
+        for ((index, budget) in listOf(4096L, -1L, 8192L).withIndex()) {
+            memory = budget
+            disk = 1024L * (index + 1)
+            enabled = index != 1
+            val done = CompletableDeferred<JsonObject>()
+            controller.command(inventory(), this, { replies += it; done.complete(it) }, { fail("inventory hello") },
+                authorize = { authorizations++ })
+            val response = withTimeout(3000) { done.await() }
+            assertEquals(response.toString(), "inventory_result", response["action"].asString)
+            assertEquals(enabled, response["distributed"].asBoolean)
+            assertEquals(budget.coerceAtLeast(0), response["memory_available_bytes"].asLong)
+            assertEquals(disk, response["disk_free_bytes"].asLong)
+            assertTrue(response["sources"].asJsonArray.isEmpty)
+            assertTrue(response["local_cut"].asBoolean)
+            assertEquals("llama_cpp", response["engines"].asJsonArray.single().asString)
+            assertFalse(response.has("status"))
+            assertEquals(index + 1, modeReads)
+            assertEquals(index + 1, memoryReads)
+            assertEquals(index + 1, diskReads)
+            assertTrue(authorizations >= (index + 1) * 2)
+            assertEquals(previous, snapshot())
+            assertEquals(parsed.manifestSha256, selected.read(binding)!!.manifestSha256)
+        }
+        assertEquals(3, replies.size)
+        controller.cancelAll()
+        assertEquals(previous, snapshot())
+    }
+
+    @Test fun `model or source hash selection still inventories matching sources`() = runBlocking {
+        val source = LocalGgufSource("source", "a".repeat(64), "b".repeat(64), 123L) {
+            error("controller must not open source contents")
+        }
+        val reads = mutableListOf<Pair<String, String>>()
+        val sources = inventorySources { modelId, sourceSha, current ->
+            assertTrue(current())
+            reads += modelId to sourceSha
+            listOf(source)
+        }
+        val controller = ModelSupplyController(node, "bound-master", temp.newFolder(), { true }, { true }, { 123L },
+            { fail("inventory publication") }, { fail("inventory registration") }, localSources = sources)
+        val selections = listOf("source" to "", "" to source.sha256, "source" to source.sha256)
+        for ((index, selection) in selections.withIndex()) {
+            val done = CompletableDeferred<JsonObject>()
+            controller.command(inventory(selection.first, selection.second), this, { done.complete(it) }, { fail("inventory hello") })
+            val response = withTimeout(3000) { done.await() }
+            assertEquals("inventory_result", response["action"].asString)
+            assertEquals(selections.take(index + 1), reads)
+            val advertised = response["sources"].asJsonArray.single().asJsonObject
+            assertEquals(source.modelId, advertised["source_model_id"].asString)
+            assertEquals(source.sha256, advertised["source_model_sha256"].asString)
+            assertEquals(source.tokenizerSha256, advertised["tokenizer_sha256"].asString)
+            assertEquals(source.size, advertised["size_bytes"].asLong)
+        }
+        controller.cancelAll()
+    }
+
+    @Test fun `empty inventory rejects unauthorized requests before sampling budgets`() = runBlocking {
+        val replies = mutableListOf<JsonObject>()
+        val controller = ModelSupplyController(node, "bound-master", temp.newFolder(), { error("unauthorized mode read") },
+            { true }, { error("unauthorized memory read") }, { fail("inventory publication") },
+            { fail("inventory registration") }, localSources = inventorySources())
+        controller.command(inventory(), this, { replies += it }, { fail("inventory hello") },
+            authorize = { throw ModelSupplyException("SUPPLY_TEST_UNAUTHORIZED", "denied") })
+        assertEquals("SUPPLY_TEST_UNAUTHORIZED", replies.single()["reason_code"].asString)
+        controller.cancelAll()
+    }
+
+    @Test fun `empty inventory cannot publish budgets after binding retirement generation change or cancellation`() = runBlocking {
+        for (change in listOf("binding", "generation", "cancel")) {
+            val entered = CompletableDeferred<Unit>()
+            val release = CompletableDeferred<Unit>()
+            val replies = mutableListOf<JsonObject>()
+            var bound = true
+            val controller = ModelSupplyController(node, "bound-master", temp.newFolder(),
+                { entered.complete(Unit); release.await(); true }, { bound }, { 123L },
+                { fail("inventory publication") }, { fail("inventory registration") }, localSources = inventorySources())
+            withTimeout(3000) {
+                coroutineScope {
+                    controller.command(inventory(), this, { replies += it }, { fail("inventory hello") })
+                    try {
+                        entered.await()
+                        when (change) {
+                            "binding" -> bound = false
+                            "generation" -> controller.cancelAll()
+                            "cancel" -> controller.command(cancel(), this, { replies += it }, { fail("cancel hello") })
+                        }
+                    } finally { release.complete(Unit) }
+                }
+            }
+            assertFalse(change, replies.any { it["action"].asString == "inventory_result" })
+            controller.cancelAll()
+        }
     }
 
 

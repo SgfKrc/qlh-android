@@ -57,6 +57,29 @@ internal object GgufLayerWeightReader {
     fun matchesTokenizerSha256(declared: String?, scan: ScanResult?): Boolean =
         declared == null || scan?.tokenizerSha256?.equals(declared, ignoreCase = true) == true
 
+    fun isContractMetadata(key: String): Boolean =
+        !key.startsWith("tokenizer.") && metadataSuffixes.values.any { key.endsWith(".$it") }
+
+    fun tokenizerSha256(fields: Map<String, ByteArray>): String? = fields.takeIf { it.isNotEmpty() }?.let {
+        val digest = MessageDigest.getInstance("SHA-256")
+        fields.keys.sorted().forEach { key ->
+            digest.update(key.toByteArray(Charsets.UTF_8))
+            digest.update(0.toByte())
+            digest.update(requireNotNull(fields[key]))
+        }
+        digest.digest().joinToString("") { byte -> "%02x".format(byte.toInt() and 0xff) }
+    }
+
+    fun normalizeMetadata(fields: Map<String, JsonElement>): Map<String, JsonElement> =
+        linkedMapOf<String, JsonElement>().apply {
+            fields["general.architecture"]?.let { architecture ->
+                put("architecture", architecture)
+                for ((key, suffix) in metadataSuffixes) {
+                    put(key, fields["${architecture.asString}.$suffix"] ?: JsonNull.INSTANCE)
+                }
+            }
+        }
+
     fun scan(input: InputStream, layerCount: Int): ScanResult? {
         if (layerCount <= 0 || layerCount > 1024) return null
         return try {
@@ -82,7 +105,7 @@ internal object GgufLayerWeightReader {
                     val architecture = data.readString()
                     if (architecture.isEmpty() || architecture.length > 128) throw IOException("invalid GGUF architecture")
                     metadataFields[key] = JsonPrimitive(architecture)
-                } else if (!key.startsWith("tokenizer.") && metadataSuffixes.values.any { key.endsWith(".$it") }) {
+                } else if (isContractMetadata(key)) {
                     if (metadataFields.size >= 128) throw IOException("too many GGUF contract fields")
                     metadataFields[key] = data.readMetadataInteger(data.intLE())
                 } else if (key.startsWith("tokenizer.")) {
@@ -95,25 +118,8 @@ internal object GgufLayerWeightReader {
                     data.skipValue(data.intLE(), false, scratch)
                 }
             }
-            val tokenizerSha256 = tokenizerFields.takeIf { it.isNotEmpty() }?.let { fields ->
-                val digest = MessageDigest.getInstance("SHA-256")
-                fields.keys.sorted().forEach { key ->
-                    digest.update(key.toByteArray(Charsets.UTF_8))
-                    digest.update(0.toByte())
-                    digest.update(requireNotNull(fields[key]))
-                }
-                digest.digest().joinToString("") { byte ->
-                    "%02x".format(byte.toInt() and 0xff)
-                }
-            }
-            val metadata = linkedMapOf<String, JsonElement>()
-            metadataFields["general.architecture"]?.let { architecture ->
-                metadata["architecture"] = architecture
-                for ((key, suffix) in metadataSuffixes) {
-                    // Explicit null is absence in this architecture's header, never a wildcard.
-                    metadata[key] = metadataFields["${architecture.asString}.$suffix"] ?: JsonNull.INSTANCE
-                }
-            }
+            val tokenizerSha256 = tokenizerSha256(tokenizerFields)
+            val metadata = normalizeMetadata(metadataFields)
             val totals = LongArray(layerCount)
             val names = HashSet<String>()
             repeat(tensorCount.toInt()) {
@@ -185,7 +191,7 @@ internal object GgufLayerWeightReader {
         }
     }
 
-    private fun DataInputStream.readMetadataInteger(type: Int): JsonElement = when (type) {
+    internal fun DataInputStream.readMetadataInteger(type: Int): JsonElement = when (type) {
         0 -> JsonPrimitive(readUnsignedByte())
         1 -> JsonPrimitive(readByte())
         2 -> JsonPrimitive(java.lang.Short.reverseBytes(readShort()).toInt() and 0xffff)
