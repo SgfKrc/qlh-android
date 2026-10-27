@@ -1,5 +1,6 @@
 package com.qlh.inference.worker
 
+import com.google.gson.JsonArray
 import com.google.gson.JsonObject
 import com.qlh.inference.logging.QlhLogger
 import com.qlh.inference.service.ModelSupplyException
@@ -7,6 +8,7 @@ import com.qlh.inference.service.ModelSupplyManifest
 import com.qlh.inference.service.ModelSupplyReceiver
 import com.qlh.inference.service.ModelSupplyCurrent
 import com.qlh.inference.service.ModelSupplyGc
+import com.qlh.inference.service.ModelSupplyPaths
 import com.qlh.inference.service.ModelSupplyProgress
 import com.qlh.inference.service.supplyBindingSha256
 import com.qlh.inference.service.checkSupply
@@ -60,6 +62,37 @@ internal class ModelSupplyController(
         while (cancelledOperations.size > MAX_CANCELLED_OPERATIONS) {
             cancelledOperations.remove(cancelledOperations.first())
         }
+    }
+
+    /**
+     * #135：报出「**此刻磁盘上真实存在**」的已注册段，供 master 判定能否复用。
+     *
+     * master 侧曾只用 hello 上报的 capabilities 快照做复用判定。运维清掉段缓存后
+     * （磁盘满、迁移、手工回收——都是正常操作），快照在下一次重扫前仍持有旧清单 ⇒
+     * master 误判「可复用」⇒ 改判 `distribute` ⇒ 接收端找不到文件 ⇒ 退化成真下载，
+     * 反而比本地裁层更慢（Python 侧实测卡在 11.5 MB / 1.98 GB 超过 7 分钟）。
+     *
+     * 策略：指针与磁盘每次都重新读，**只有全部段文件都真实存在**才报告；任一项缺失
+     * （或被删除、或被换成链接）就报空数组，master 会立刻回落到 `local_cut`。
+     */
+    private fun registeredArtifacts(): JsonArray {
+        val result = JsonArray()
+        val manifest = runCatching { currentSupply.read(bindingSha256) }.getOrNull() ?: return result
+        val directory = runCatching {
+            ModelSupplyPaths.child(root, "segment-${manifest.manifestSha256}")
+        }.getOrNull() ?: return result
+        val present = manifest.files.all { file ->
+            runCatching { ModelSupplyPaths.child(directory, file.path).isFile }.getOrDefault(false)
+        }
+        if (!present) return result
+        result.add(JsonObject().apply {
+            add("layer_range", JsonArray().apply { add(manifest.start); add(manifest.end) })
+            addProperty("artifact_sha256", manifest.artifactSha256)
+            addProperty("source_model_id", manifest.sourceModelId)
+            addProperty("source_model_sha256", manifest.sourceSha256)
+            addProperty("tokenizer_sha256", manifest.json["tokenizer_sha256"]?.asString ?: "")
+        })
+        return result
     }
 
     private fun retireLocked(): Active? {
@@ -117,6 +150,8 @@ internal class ModelSupplyController(
                             addProperty("local_cut_tool", if (localSources != null) com.qlh.inference.service.GgufSegmentCutter.TOOL else "")
                             addProperty("local_cut_reason", if (localSources == null) "SUPPLY_LOCAL_CUT_UNAVAILABLE" else if (sources.isEmpty()) "SUPPLY_LOCAL_SOURCE_UNAVAILABLE" else "")
                             add("engines", com.google.gson.JsonArray().apply { add("llama_cpp") })
+                            // #135：只有段文件此刻真实存在时才报告，缺失即报空数组。
+                            add("artifacts", registeredArtifacts())
                             add("sources", com.google.gson.JsonArray().apply { sources.forEach { source -> add(JsonObject().apply {
                                 addProperty("source_model_id", source.modelId); addProperty("source_model_sha256", source.sha256)
                                 addProperty("tokenizer_sha256", source.tokenizerSha256); addProperty("size_bytes", source.size)

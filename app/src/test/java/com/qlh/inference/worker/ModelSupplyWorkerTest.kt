@@ -67,6 +67,50 @@ class ModelSupplyWorkerTest {
         assertEquals(ensure["manifest"].asJsonObject["manifest_sha256"],replies.last()["manifest_sha256"])
         assertFalse(refreshed)
     }
+    @Test fun `inventory reports registered artifact only while its files exist`()=runBlocking {
+        // #135：master 曾只依据 hello 上报的 capabilities 快照判断「段可复用」。运维清掉
+        // 段缓存后快照仍持旧清单 ⇒ 误判可复用 ⇒ 改判 distribute ⇒ 接收端找不到文件 ⇒
+        // 退化成真下载（比本地裁层更慢）。清点必须每次重读磁盘，文件没了就报空。
+        val replies=mutableListOf<JsonObject>()
+        val root=temp.newFolder()
+        val binding=supplyBindingSha256("","bound-master",0,0)
+        val controller=ModelSupplyController(node,"bound-master",root,{true},{true},{123L},{it()},{})
+        val manifest=ModelSupplyManifest.parse(manifest().toString())
+        val directory=File(root,"segment-${manifest.manifestSha256}").apply{mkdirs()}
+        File(directory,"supply.manifest.json").writeText(canonicalSupplyJson(manifest.json),Charsets.UTF_8)
+        File(directory,"segment.gguf").writeBytes(ByteArray(10))
+        File(directory,"segment.manifest.json").writeBytes(ByteArray(10))
+        val registration=ModelSupplyCurrent(root).select(manifest,binding)
+        try {
+            val inventory=JsonParser.parseString("""{"action":"inventory","operation_id":"$operation","model_id":"source","source_model_sha256":"${"a".repeat(64)}"}""").asJsonObject
+
+            controller.command(inventory,this,{replies+=it},{})
+            val reported=replies.last()["artifacts"].asJsonArray
+            assertEquals(1,reported.size())
+            val item=reported[0].asJsonObject
+            // 逐字段等于 supply manifest —— 正是 master 侧复用判据的输入。
+            assertEquals(listOf(2,4),item["layer_range"].asJsonArray.map{it.asInt})
+            assertEquals("c".repeat(64),item["artifact_sha256"].asString)
+            assertEquals("source",item["source_model_id"].asString)
+            assertEquals("a".repeat(64),item["source_model_sha256"].asString)
+            assertEquals("b".repeat(64),item["tokenizer_sha256"].asString)
+
+            // 模拟运维清理：删掉段权重，指针与 manifest 原样留着。
+            assertTrue(File(directory,"segment.gguf").delete())
+            replies.clear()
+            controller.command(inventory,this,{replies+=it},{})
+            assertTrue("段文件已消失时必须报空，否则 master 会误判可复用",
+                replies.last()["artifacts"].asJsonArray.isEmpty)
+        } finally { ModelSupplyCurrent(root).rollback(registration,binding) }
+    }
+    @Test fun `inventory reports no artifact before any registration`()=runBlocking {
+        val replies=mutableListOf<JsonObject>()
+        val controller=ModelSupplyController(node,"bound-master",temp.newFolder(),{true},{true},{123L},{it()},{})
+        controller.command(JsonParser.parseString("""{"action":"inventory","operation_id":"$operation","model_id":"","source_model_sha256":""}""").asJsonObject,
+            this,{replies+=it},{})
+        assertEquals("inventory_result",replies.last()["action"].asString)
+        assertTrue(replies.last()["artifacts"].asJsonArray.isEmpty)
+    }
     @Test fun `stale binding refuses commands before network or registration`()=runBlocking {
         val replies=mutableListOf<JsonObject>()
         val controller=ModelSupplyController(node,"bound-master",temp.newFolder(),{true},{false},{0L},{it()},{fail("stale registration")})
