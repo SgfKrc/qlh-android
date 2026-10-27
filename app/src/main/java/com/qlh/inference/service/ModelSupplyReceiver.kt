@@ -100,6 +100,7 @@ internal class ModelSupplyReceiver(
     private val nanoTime: () -> Long = System::nanoTime,
     private val digests: VerifiedPrivateModelDigests = VerifiedPrivateModelDigests.shared,
     private val createLink: (File, File) -> Unit = { source, target -> Files.createLink(target.toPath(), source.toPath()) },
+    private val ggufScans: ModelSupplyGgufScans = ModelSupplyGgufScans.shared,
 ) {
     init { require(checkpointIntervalBytes > 0 && readTimeoutMillis > 0) }
     private val call = AtomicReference<Call?>()
@@ -650,7 +651,7 @@ internal class ModelSupplyReceiver(
             descriptor.startLayer == manifest.start && descriptor.endLayerExclusive == manifest.end &&
             descriptor.hiddenSize == manifest.json["hidden_size"].asInt,
             "SUPPLY_NATIVE_MANIFEST_MISMATCH", "native catalog identity mismatch")
-        val scan = safeFile(directory, manifest.weight.path).inputStream().use { GgufLayerWeightReader.scan(it, manifest.end - manifest.start) }
+        val scan = ggufScans.scan(safeFile(directory, manifest.weight.path), manifest.end - manifest.start)
         checkSupply(scan != null && scan.layerWeightBytes == manifest.localLayerBytes, "SUPPLY_LAYER_BYTES_MISMATCH", "GGUF layer bytes differ")
         val metadataDifferences = GgufMetadataContract.differences(scan?.ggufMetadata, native["gguf_metadata"], manifest.end - manifest.start)
         checkSupply(metadataDifferences.isEmpty(), "SUPPLY_GGUF_METADATA_MISMATCH", metadataDifferences.joinToString("; "))

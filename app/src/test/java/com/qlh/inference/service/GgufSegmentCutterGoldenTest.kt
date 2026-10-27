@@ -47,10 +47,31 @@ class GgufSegmentCutterGoldenTest(private val kind: String, private val mode: St
         assertEquals(manifest.end - manifest.start, layout.layers)
         assertEquals(0, layout.nextn)
         assertFalse(layout.tensors.any { it.name.contains("nextn") })
+        assertTrue(layout.tensors.any { it.name == "token_embd.weight" })
+        assertTrue(layout.tensors.any { it.name == "output_norm.weight" })
+        assertEquals(kind != "hybrid" || mode == "tail",
+            layout.tensors.any { it.name == "output.weight" })
         assertTrue("unknown non-block tensors must survive", layout.tensors.any { it.name == "unknown.support.weight" })
+        assertEquals("writer-sized artifact", manifest.weight.size, output.length())
         val scan = output.inputStream().use { GgufLayerWeightReader.scan(it, manifest.end - manifest.start) }!!
         assertEquals(scan, layout.scan)
         assertEquals(source.tokenizerSha256, scan.tokenizerSha256)
+    }
+
+    @Test fun `qwen35 non-tail cut omits output head and matches manifest size`() = runBlocking {
+        val manifest = CutFixture.manifest("hybrid", "middle")
+        val source = CutFixture.source("hybrid", "middle")
+        val output = temp.newFile("qwen35-middle.gguf")
+
+        GgufSegmentCutter.cut(source, manifest, output, { true }, {})
+
+        val layout = output.inputStream().use { GgufSegmentCutter.inspect(it) }
+        assertEquals("qwen35", layout.architecture)
+        assertFalse(layout.tensors.any { it.name == "output.weight" })
+        assertTrue(layout.tensors.any { it.name == "token_embd.weight" })
+        assertTrue(layout.tensors.any { it.name == "output_norm.weight" })
+        assertEquals(manifest.weight.size, output.length())
+        assertEquals(manifest.artifactSha256, supplySha256(output.readBytes()))
     }
 }
 

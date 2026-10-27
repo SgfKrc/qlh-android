@@ -33,7 +33,7 @@ internal class PrivateDigestTestFiles(private val anchors: File) {
         identities += it
     }
 
-    private fun fingerprint(file: File): ModelFileFingerprint? {
+    fun fingerprint(file: File): ModelFileFingerprint? {
         if (!reliable || !file.isFile) return null
         val observed = Files.readAttributes(file.toPath(), BasicFileAttributes::class.java, LinkOption.NOFOLLOW_LINKS)
         val identity = identity(file)
@@ -86,6 +86,25 @@ class VerifiedPrivateModelDigestsTest {
         Files.move(replacement.toPath(), source.toPath(), StandardCopyOption.REPLACE_EXISTING)
         assertNotEquals(changed.digest, files.digests.verify(source).digest)
         assertEquals(3, files.reads.size)
+    }
+
+    @Test
+    fun `runtime stamp refresh reuses a verified hardlink but rejects same size same mtime tampering`() = runBlocking {
+        val files = files()
+        val source = temp.newFile("source.gguf").apply { writeText("original") }
+        val verified = files.digests.verify(source)
+        val previous = requireNotNull(verified.fingerprint)
+        assertTrue(files.digests.linkVerified(source, File(temp.root, "next.gguf"), verified, files::link))
+        val linked = files.digests.reuseContentVersion(source, previous, verified.digest)
+        assertNotNull(linked)
+        assertNotEquals(previous, linked)
+        assertEquals(1, files.reads.size)
+        val modified = Files.getLastModifiedTime(source.toPath())
+        source.writeText("modified")
+        Files.setLastModifiedTime(source.toPath(), modified)
+        files.changed(source)
+        assertNull(files.digests.reuseContentVersion(source, requireNotNull(linked), verified.digest))
+        assertEquals(2, files.reads.size)
     }
 
     @Test

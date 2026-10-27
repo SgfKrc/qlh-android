@@ -88,6 +88,7 @@ class ModelManager(private val context: Context) {
             clockMs = { android.os.SystemClock.elapsedRealtime() },
         )
         private val verifiedModelDigestEpochs = ConcurrentHashMap<String, AtomicLong>()
+        private val layerArtifactScans = ModelSupplyScanFlights<List<String>, Result<LayerArtifactInventory>>()
     }
 
     private val settings = SettingsDataStore(context)
@@ -462,7 +463,7 @@ class ModelManager(private val context: Context) {
     }
 
     /** Resolve the exact prepare identity before a native reuse/load; inventory alone is insufficient. */
-    internal suspend fun verifyWorkerPrepare(identity: com.qlh.inference.worker.WorkerPrepareIdentity) = withContext(Dispatchers.IO) {
+    internal suspend fun verifyWorkerPrepare(identity: com.qlh.inference.worker.WorkerPrepareIdentity): LayerArtifact = withContext(Dispatchers.IO) {
         val pendingSupply = ModelSupplyStorage.pending(suppliedSegmentsDir)
         try {
             val manifest = currentSupply()
@@ -495,14 +496,13 @@ class ModelManager(private val context: Context) {
                 com.qlh.inference.worker.checkPrepare(artifact.document.uri.toString() == expectedReference,
                     "prepare_manifest_mismatch", "exact selected supply required")
             }
-            val scan = context.contentResolver.openInputStream(artifact.document.uri)?.use {
-                com.qlh.inference.worker.GgufLayerWeightReader.scan(it, identity.range[1] - identity.range[0])
-            }
+            val scan = scanLayerArtifactMetadata(artifact)
             com.qlh.inference.worker.checkPrepare(scan != null &&
                 com.qlh.inference.worker.GgufLayerWeightReader.matchesTokenizerSha256(identity.text("tokenizer_sha256"), scan),
                 "prepare_gguf_shape_mismatch", "proper decoder segment and tokenizer required before native load")
             com.qlh.inference.worker.checkPrepare(currentSupply()?.manifestSha256.orEmpty() == expectedManifest,
                 "prepare_manifest_mismatch", "supply selection changed during verification")
+            artifact
         } finally { pendingSupply.close() }
     }
 
@@ -533,6 +533,27 @@ class ModelManager(private val context: Context) {
         verifyArtifactDigest: Boolean = false,
     ): Result<LayerArtifactInventory> = withContext(Dispatchers.IO) {
         try {
+            val selection = currentSupply()?.manifestSha256.orEmpty()
+            val key = listOf(context.filesDir.canonicalPath, getSavedTreeUri()?.toString().orEmpty(),
+                currentSupplyBinding(), selection, expectedModelSha256.trim().lowercase(), verifyArtifactDigest.toString())
+            val result = layerArtifactScans.run(key) { scanLayerArtifactsNow(expectedModelSha256, verifyArtifactDigest) }
+            checkSupply(currentSupply()?.manifestSha256.orEmpty() == selection,
+                "SUPPLY_CURRENT_CHANGED", "current changed during artifact scan")
+            lastLayerArtifactInventory = if (verifyArtifactDigest) result.getOrNull() else null
+            result
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            Log.e(TAG, "layer artifact scan failed", error)
+            Result.failure(error)
+        }
+    }
+
+    private suspend fun scanLayerArtifactsNow(
+        expectedModelSha256: String,
+        verifyArtifactDigest: Boolean,
+    ): Result<LayerArtifactInventory> {
+        try {
             val scanStartedAtMs = android.os.SystemClock.elapsedRealtime()
             var digestReused = 0
             var digestStreamed = 0
@@ -540,22 +561,26 @@ class ModelManager(private val context: Context) {
             val roots = mutableListOf<Triple<String, List<ModelDocument>, List<ModelDocument>>>()
             if (treeUri != null && hasPersistedPermission(treeUri)) {
                 runCatching {
-                    Triple("saf", listSafModels(treeUri), listSafFiles(treeUri, setOf(JSON_EXTENSION)))
+                    val documents = listSafFiles(treeUri, setOf(GGUF_EXTENSION, JSON_EXTENSION))
+                    Triple("saf", documents.filter { it.name.endsWith(GGUF_EXTENSION, true) },
+                        documents.filter { it.name.endsWith(JSON_EXTENSION, true) })
                 }.onSuccess { roots += it }
                     .onFailure { Log.w(TAG, "authorized layer directory is unavailable", it) }
             }
             runCatching {
+                val documents = listPhysicalModels(fallbackModelsDir, ModelSource.FALLBACK, setOf(GGUF_EXTENSION, JSON_EXTENSION))
                 Triple(
                     "fallback",
-                    listPhysicalModels(fallbackModelsDir, ModelSource.FALLBACK),
-                    listPhysicalModels(fallbackModelsDir, ModelSource.FALLBACK, setOf(JSON_EXTENSION)),
+                    documents.filter { it.name.endsWith(GGUF_EXTENSION, true) },
+                    documents.filter { it.name.endsWith(JSON_EXTENSION, true) },
                 )
             }.onSuccess { roots += it }
                 .onFailure { Log.w(TAG, "default layer directory is unavailable", it) }
+            val internalDocuments = listPhysicalModels(modelsDir, ModelSource.INTERNAL, setOf(GGUF_EXTENSION, JSON_EXTENSION))
             roots += Triple(
                 "internal",
-                listPhysicalModels(modelsDir, ModelSource.INTERNAL),
-                listPhysicalModels(modelsDir, ModelSource.INTERNAL, setOf(JSON_EXTENSION)),
+                internalDocuments.filter { it.name.endsWith(GGUF_EXTENSION, true) },
+                internalDocuments.filter { it.name.endsWith(JSON_EXTENSION, true) },
             )
             val current = currentSupply()
             val currentDirectory = current?.let { ModelSupplyCurrent(suppliedSegmentsDir).directory(it) }
@@ -572,10 +597,9 @@ class ModelManager(private val context: Context) {
                         "SUPPLY_MANIFEST_DIGEST_MISMATCH", "current marker differs")
                     // Recovery uses the same complete SHA/native/GGUF/tokenizer checks as receipt.
                     if (verifyArtifactDigest) ModelSupplyReceiver(suppliedSegmentsDir, "unused").validateFiles(currentDirectory, current)
-                    val documents = listPhysicalModels(currentDirectory, ModelSource.INTERNAL)
-                    val native = listPhysicalModels(currentDirectory, ModelSource.INTERNAL, setOf(JSON_EXTENSION))
-                        .filter { it.name == current.native.path }
-                    roots += Triple("internal-supply", documents, native)
+                    val documents = listPhysicalModels(currentDirectory, ModelSource.INTERNAL, setOf(GGUF_EXTENSION, JSON_EXTENSION))
+                    roots += Triple("internal-supply", documents.filter { it.name.endsWith(GGUF_EXTENSION, true) },
+                        documents.filter { it.name == current.native.path })
                 } catch (cancelled: CancellationException) { throw cancelled }
                 catch (error: Exception) {
                     currentFailure = LayerArtifactDiagnostic(
@@ -709,7 +733,6 @@ class ModelManager(private val context: Context) {
                 manifestCount = roots.sumOf { it.third.size },
                 artifactFileCount = roots.sumOf { it.second.size },
             )
-            lastLayerArtifactInventory = if (verifyArtifactDigest) inventory else null
             for (diagnostic in diagnostics) {
                 Log.i(
                     TAG,
@@ -732,13 +755,28 @@ class ModelManager(private val context: Context) {
                     "manifests=${inventory.manifestCount} files=${inventory.artifactFileCount} " +
                     "usable=${inventory.artifacts.size} failures=${inventory.failureCounts()}",
             )
-            Result.success(inventory)
+            return Result.success(inventory)
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (error: Exception) {
             Log.e(TAG, "layer artifact scan failed", error)
-            Result.failure(error)
+            return Result.failure(error)
         }
+    }
+
+    internal suspend fun scanLayerArtifactMetadata(artifact: LayerArtifact): com.qlh.inference.worker.GgufLayerWeightReader.ScanResult? {
+        val uri = artifact.document.uri
+        val layerCount = artifact.endLayerExclusive - artifact.startLayer
+        if (uri.scheme == "file") {
+            val file = File(uri.path.orEmpty())
+            if (file.toPath().toAbsolutePath().normalize().startsWith(suppliedSegmentsDir.toPath())) {
+                return ModelSupplyGgufScans.shared.scan(file, layerCount)
+            }
+        }
+        val storageScope = getSavedTreeUri()?.toString().orEmpty()
+        return ModelSupplyGgufScans.shared.scan("$storageScope|$uri", layerCount,
+            version = { fileVersionToken(uri) },
+            open = { context.contentResolver.openInputStream(uri) ?: throw IOException("model artifact is unavailable") })
     }
 
     private suspend fun verifiedSha256(

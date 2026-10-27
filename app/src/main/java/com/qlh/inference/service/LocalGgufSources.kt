@@ -13,6 +13,7 @@ import java.io.FileOutputStream
 import java.io.InputStream
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
+import java.util.concurrent.ConcurrentHashMap
 
 internal interface LocalGgufSources {
     suspend fun inventory(modelId: String, sourceSha256: String, current: suspend () -> Boolean): List<LocalGgufSource>
@@ -26,10 +27,11 @@ internal class LocalGgufSourceRegistry(
 ) : LocalGgufSources {
     data class Document(val reference: String, val size: Long, val version: () -> String? = { null }, val open: () -> InputStream)
     private data class Registration(val modelId: String, val reference: String, val sha: String, val tokenizer: String, val size: Long)
-    private val mutex = Mutex()
+    private val mutex get() = registryMutexes.computeIfAbsent(directory.canonicalPath) { Mutex() }
     // Shared across ModelManager instances in the UI and service; writes are tiny atomic replacements.
     private companion object {
         val diskLock = Any()
+        val registryMutexes = ConcurrentHashMap<String, Mutex>()
         val idPattern = Regex("[A-Za-z0-9_.:-]{1,128}")
         val shaPattern = Regex("[0-9a-f]{64}")
         const val MARKER = "local-cut-sources.json"

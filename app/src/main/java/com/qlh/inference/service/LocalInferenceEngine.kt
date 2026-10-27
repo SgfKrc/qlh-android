@@ -79,16 +79,14 @@ class LocalInferenceEngine(private val context: Context) {
     // Native model pointers and retained handles must outlive every native call.
     private val modelMutex = Mutex()
     private var closed = false
-    private data class ArtifactStamp(val device: Long, val inode: Long, val size: Long,
-        val mtimeSeconds: Long, val mtimeNanos: Long, val ctimeSeconds: Long, val ctimeNanos: Long)
-    private fun artifactStamp(stat: StructStat): ArtifactStamp {
+    private fun artifactStamp(stat: StructStat): ModelFileFingerprint {
         require(OsConstants.S_ISREG(stat.st_mode) && stat.st_size > 0)
-        return if (Build.VERSION.SDK_INT >= 27) ArtifactStamp(stat.st_dev, stat.st_ino, stat.st_size,
-            stat.st_mtim.tv_sec, stat.st_mtim.tv_nsec, stat.st_ctim.tv_sec, stat.st_ctim.tv_nsec)
-        else ArtifactStamp(stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime, 0, stat.st_ctime, 0)
+        return if (Build.VERSION.SDK_INT >= 27) ModelFileFingerprint(stat.st_dev, stat.st_ino, stat.st_size,
+            stat.st_mtim.tv_sec, stat.st_ctim.tv_sec, stat.st_mtim.tv_nsec, stat.st_ctim.tv_nsec)
+        else ModelFileFingerprint(stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime, stat.st_ctime)
     }
-    private fun artifactStamp(path: String): ArtifactStamp? = runCatching { artifactStamp(Os.stat(path)) }.getOrNull()
-    private var loadedArtifactStamp: ArtifactStamp? = null
+    private fun artifactStamp(path: String): ModelFileFingerprint? = runCatching { artifactStamp(Os.stat(path)) }.getOrNull()
+    private var loadedArtifactStamp: ModelFileFingerprint? = null
     @Volatile private var loadedPrepareIdentity: WorkerPrepareIdentity? = null
     private var loadedPreparedMetadata: ReleaseRuntimeProbe.PreparedMetadata? = null
 
@@ -554,12 +552,34 @@ class LocalInferenceEngine(private val context: Context) {
         }
     }
 
+    internal suspend fun canReusePreparedModel(identity: WorkerPrepareIdentity): Boolean = withModelContext {
+        canReusePreparedModelLocked(identity)
+    }
+
+    private suspend fun canReusePreparedModelLocked(identity: WorkerPrepareIdentity): Boolean {
+        val previous = loadedPrepareIdentity ?: return false
+        val metadata = loadedPreparedMetadata ?: return false
+        val stamp = loadedArtifactStamp ?: return false
+        if (!isLoaded || !previous.sameLoadedArtifact(identity) ||
+            metadata.sha256 != identity.text("artifact_sha256")
+        ) return false
+        if (stamp == artifactStamp(loadedModelPath)) return true
+        val refreshed = try {
+            VerifiedPrivateModelDigests.shared.reuseContentVersion(File(loadedModelPath), stamp, metadata.sha256)
+        } catch (cancelled: CancellationException) { throw cancelled }
+          catch (_: Exception) { return false }
+        if (refreshed == null || refreshed != artifactStamp(loadedModelPath)) return false
+        loadedArtifactStamp = refreshed
+        return true
+    }
+
     /** Called only after ModelManager verified this exact artifact and JNI load succeeded. */
     internal suspend fun bindPreparedRuntime(identity: WorkerPrepareIdentity, sourceUri: String,
         artifactName: String, nativeManifest: String): Result<Unit> = withModelContext {
         var stage = RuntimePrepareFailure.Stage.STATE
         try {
-            require(isLoaded && loadedModelSourceUri == sourceUri && loadedLayerRange == identity.range)
+            require(isLoaded && loadedLayerRange == identity.range)
+            require(loadedModelSourceUri == sourceUri || canReusePreparedModelLocked(identity))
             require(loadedExtractHidden == (identity.mode != "tail"))
             stage = RuntimePrepareFailure.Stage.STAMP
             require(loadedArtifactStamp != null && loadedArtifactStamp == artifactStamp(loadedModelPath))

@@ -27,6 +27,16 @@ internal class WorkerPrepareIdentity private constructor(private val value: Json
     fun stageTuple(): JsonObject = JsonObject().apply {
         for (key in STAGE_KEYS + OPTIONAL_KEYS) if (value.has(key)) add(key, value[key].deepCopy())
     }
+    fun sameLoadedArtifact(other: WorkerPrepareIdentity): Boolean {
+        val stableKeys = listOf("node_id", "model_id", "model_sha256", "source_model_id",
+            "source_model_sha256", "tokenizer_sha256", "artifact_sha256")
+        if (stableKeys.any { text(it) != other.text(it) } || stageIdentity != other.stageIdentity ||
+            range != other.range || totalLayers != other.totalLayers || hiddenSize != other.hiddenSize || mode != other.mode
+        ) return false
+        val specKey = "load_spec_digest"
+        return value.has(specKey) == other.value.has(specKey) &&
+            (!value.has(specKey) || text(specKey) == other.text(specKey))
+    }
     override fun equals(other: Any?): Boolean = other is WorkerPrepareIdentity && exactKey == other.exactKey
     override fun hashCode(): Int = exactKey.hashCode()
 

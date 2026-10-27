@@ -108,6 +108,39 @@ class WorkerPrepareControllerTest {
         assertNull(c.validateStage(offer(next)))
     }
 
+    @Test fun `same loaded artifact contract permits a new generation but fences changed content or load spec`() {
+        val loaded = WorkerPrepareIdentity.parse(identity())
+        val nextWire = identity(largeGeneration + 1, "supply_two").apply {
+            addProperty("manifest_sha256", "e".repeat(64))
+        }
+        val next = WorkerPrepareIdentity.parse(nextWire)
+        assertTrue(loaded.sameLoadedArtifact(next))
+
+        val changedArtifact = nextWire.deepCopy().apply {
+            addProperty("artifact_sha256", "f".repeat(64))
+            getAsJsonObject("stage_model_identity").addProperty("sha256", "f".repeat(64))
+        }
+        assertFalse(loaded.sameLoadedArtifact(WorkerPrepareIdentity.parse(changedArtifact)))
+
+        val changedSpec = identity(largeGeneration + 1, "supply_two").apply {
+            addProperty("load_spec_digest", "f".repeat(64))
+        }
+        assertFalse(loaded.sameLoadedArtifact(WorkerPrepareIdentity.parse(changedSpec)))
+        val loadedWithSpec = WorkerPrepareIdentity.parse(identity().apply {
+            addProperty("load_spec_digest", "f".repeat(64))
+        })
+        assertTrue(loadedWithSpec.sameLoadedArtifact(WorkerPrepareIdentity.parse(changedSpec)))
+        assertFalse(loadedWithSpec.sameLoadedArtifact(WorkerPrepareIdentity.parse(changedSpec.deepCopy().apply {
+            addProperty("load_spec_digest", "e".repeat(64))
+        })))
+        for ((key, changed) in mapOf("source_model_sha256" to "e".repeat(64),
+            "tokenizer_sha256" to "e".repeat(64), "node_id" to "other_node")) {
+            assertFalse(key, loaded.sameLoadedArtifact(WorkerPrepareIdentity.parse(nextWire.deepCopy().apply {
+                addProperty(key, changed)
+            })))
+        }
+    }
+
     @Test fun `native failure emits error no prepared and fences prior runtime`() = runBlocking {
         val runtime = Runtime(); val c = WorkerPrepareController(node, runtime)
         transact(c, request("prepare"), this); transact(c, request("commit"), this); transact(c, request("finalize"), this)

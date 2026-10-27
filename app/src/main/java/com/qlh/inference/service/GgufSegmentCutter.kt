@@ -279,6 +279,9 @@ internal object GgufSegmentCutter {
         checkSupply(start < end && end <= layout.layers && end - start < layout.layers,
             "SUPPLY_FULL_MODEL_FORBIDDEN", "proper decoder segment required")
         val selected = layout.tensors.mapNotNull { tensor ->
+            if (layout.architecture == "qwen35" && end < layout.layers && tensor.name == "output.weight") {
+                return@mapNotNull null
+            }
             val match = blockName.matchEntire(tensor.name)
             if (match == null) tensor else {
                 val index = match.groupValues[1].toInt()

@@ -375,6 +375,7 @@ class InferenceService : Service() {
         androidRuntimeStatusInvalidation.afterModelChange {
             var stage = RuntimePrepareFailure.Stage.SUPPLY
             try {
+                var verifiedArtifact: ModelManager.LayerArtifact? = null
                 Log.i(TAG, "worker prepare begin range=$layerRange hidden=$extractHidden context=$contextSize")
                 if (expectedSupplyManifestSha256 != null &&
                     modelManager.currentSupply()?.manifestSha256.orEmpty() != expectedSupplyManifestSha256
@@ -383,18 +384,19 @@ class InferenceService : Service() {
                 }
                 if (prepareIdentity != null) {
                     stage = RuntimePrepareFailure.Stage.VERIFY
-                    modelManager.verifyWorkerPrepare(prepareIdentity)
+                    verifiedArtifact = modelManager.verifyWorkerPrepare(prepareIdentity)
                     Log.i(TAG, "worker prepare artifact verified range=$layerRange")
                 }
                 stage = RuntimePrepareFailure.Stage.LOAD
                 loadLayerModel(
                     layerRange, contextSize, extractHidden, expectedModelSha256,
-                    expectedSourceModelId, expectedSourceModelSha256, expectedEmbeddingWidth, expectedArtifactModelId, frozenCpuPolicy,
+                    expectedSourceModelId, expectedSourceModelSha256, expectedEmbeddingWidth, expectedArtifactModelId,
+                    frozenCpuPolicy, prepareIdentity,
                 ).getOrThrow()
                 Log.i(TAG, "worker prepare native validated range=$layerRange")
                 if (prepareIdentity != null) {
                     stage = RuntimePrepareFailure.Stage.BIND
-                    bindPreparedLayer(prepareIdentity).getOrThrow()
+                    bindPreparedLayer(prepareIdentity, requireNotNull(verifiedArtifact)).getOrThrow()
                 }
                 Result.success(Unit)
             } catch (cancelled: CancellationException) { throw cancelled }
@@ -405,22 +407,46 @@ class InferenceService : Service() {
         }
     }
 
-    private suspend fun bindPreparedLayer(identity: com.qlh.inference.worker.WorkerPrepareIdentity): Result<Unit> {
+    private suspend fun bindPreparedLayer(
+        identity: com.qlh.inference.worker.WorkerPrepareIdentity,
+        artifact: ModelManager.LayerArtifact,
+    ): Result<Unit> {
         val eng = engine ?: return Result.failure(IllegalStateException("engine_missing"))
         var stage = RuntimePrepareFailure.Stage.RESOLVE
         return try {
-            val inventory = modelManager.listLayerArtifacts(identity.text("source_model_sha256"), verifyArtifactDigest = false).getOrThrow()
-            val matching = inventory.filter { it.document.uri.toString() == eng.loadedModelSourceUri &&
-                it.artifactSha256 == identity.text("artifact_sha256") &&
-                listOf(it.startLayer, it.endLayerExclusive) == identity.range }
-            Log.i(TAG, "worker prepare receipt inventory=${inventory.size} loaded_matches=${matching.size}")
-            require(matching.size == 1)
-            val artifact = matching.single()
+            val selected = modelManager.currentSupply()
+            if (identity.text("manifest_sha256").isNotEmpty()) {
+                com.qlh.inference.worker.checkPrepare(selected != null,
+                    "prepare_manifest_missing", "no selected supply")
+                identity.verifyManifest(requireNotNull(selected))
+            } else {
+                com.qlh.inference.worker.checkPrepare(selected == null,
+                    "prepare_manifest_mismatch", "supply cannot be treated as legacy SAF")
+            }
+            val selectedUri = selected?.let { manifest ->
+                android.net.Uri.fromFile(java.io.File(
+                    ModelSupplyCurrent(modelManager.suppliedSegmentsDir).directory(manifest), manifest.weight.path,
+                )).toString()
+            }
+            com.qlh.inference.worker.checkPrepare(
+                (selectedUri == null || artifact.document.uri.toString() == selectedUri) &&
+                    artifact.artifactSha256 == identity.text("artifact_sha256") &&
+                    artifact.sourceModelId == identity.text("source_model_id") &&
+                    artifact.sourceModelSha256 == identity.text("source_model_sha256") &&
+                    artifact.tokenizerSha256 == identity.text("tokenizer_sha256") &&
+                    artifact.hiddenSize == identity.hiddenSize && artifact.mode == identity.mode &&
+                    com.qlh.inference.worker.AndroidWorkerCapabilities.artifactModelId(artifact.document.name, artifact.artifactSha256) ==
+                        identity.stageIdentity["model_id"] &&
+                    listOf(artifact.startLayer, artifact.endLayerExclusive) == identity.range,
+                "prepare_artifact_identity_mismatch", "verified artifact differs from current prepare",
+            )
             stage = RuntimePrepareFailure.Stage.MANIFEST
             val stream = if (artifact.manifest.uri.scheme == "file") java.io.File(artifact.manifest.uri.path!!).inputStream()
                 else contentResolver.openInputStream(artifact.manifest.uri) ?: error("native_manifest_unavailable")
             val raw = ReleaseRuntimeProbe.boundedText(stream, 4 * 1024 * 1024)
             Log.i(TAG, "worker prepare receipt manifest read")
+            com.qlh.inference.worker.checkPrepare(modelManager.currentSupply()?.manifestSha256 == selected?.manifestSha256,
+                "prepare_manifest_mismatch", "supply selection changed during receipt verification")
             stage = RuntimePrepareFailure.Stage.BIND
             eng.bindPreparedRuntime(identity, artifact.document.uri.toString(), artifact.document.name, raw)
         } catch (cancelled: CancellationException) { throw cancelled }
@@ -440,6 +466,7 @@ class InferenceService : Service() {
         expectedEmbeddingWidth: Int,
         expectedArtifactModelId: String,
         frozenCpuPolicy: Boolean = false,
+        prepareIdentity: com.qlh.inference.worker.WorkerPrepareIdentity? = null,
     ): Result<Unit> {
         val eng = engine ?: return Result.failure(IllegalStateException("Service 未初始化"))
         if (layerRange.size != 2 || layerRange[1] <= layerRange[0] || layerRange[0] < 0) {
@@ -448,11 +475,12 @@ class InferenceService : Service() {
         val gpuLayers = if (frozenCpuPolicy) 0 else preferredGpuLayers(eng)
         val expectedDigest = expectedModelSha256.trim().lowercase()
         val expectedSourceDigest = expectedSourceModelSha256.trim().lowercase()
+        val preparedReuse = prepareIdentity == null || eng.canReusePreparedModel(prepareIdentity)
         if (eng.isLoaded && eng.loadedLayerRange == layerRange &&
             eng.loadedExtractHidden == extractHidden && eng.loadedGpuLayers == gpuLayers &&
             loadedLayerContextSize == contextSize && expectedDigest.isNotBlank() && loadedLayerArtifactSha256 == expectedDigest &&
             (expectedArtifactModelId.isBlank() || loadedLayerArtifactModelId == expectedArtifactModelId) &&
-            expectedSourceDigest.isNotBlank() && loadedLayerSourceSha256 == expectedSourceDigest
+            expectedSourceDigest.isNotBlank() && loadedLayerSourceSha256 == expectedSourceDigest && preparedReuse
         ) {
             return validateLayerModel(eng, layerRange, expectedEmbeddingWidth)
         }

@@ -2,10 +2,13 @@ package com.qlh.inference.service
 
 import com.google.gson.JsonParser
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.async
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
@@ -78,6 +81,33 @@ class LocalGgufInventoryTest {
         }
         assertEquals(CutFixture.manifest().sourceSha256, registry.inventory("golden", "", { true }).single().sha256)
         assertEquals(1, reads)
+    }
+
+    @Test fun `different registry instances share one cold inventory for the same directory`() = runBlocking {
+        val source = Source()
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        var enumerations = 0
+        var readBytes = 0L
+        fun registry() = LocalGgufSourceRegistry(source.directory) {
+            enumerations++
+            if (enumerations == 1) { entered.complete(Unit); release.await() }
+            listOf(LocalGgufSourceRegistry.Document("content://test/golden.gguf", source.bytes.size.toLong(), { "stable" }) {
+                object : ByteArrayInputStream(source.bytes) {
+                    override fun read(buffer: ByteArray, offset: Int, length: Int): Int =
+                        super.read(buffer, offset, length).also { if (it > 0) readBytes += it }
+                }
+            })
+        }
+        val first = async { registry().inventory("golden", "", { true }) }
+        entered.await()
+        val second = async(start = CoroutineStart.UNDISPATCHED) { registry().inventory("golden", "", { true }) }
+        assertEquals(1, enumerations)
+        assertFalse(second.isCompleted)
+        release.complete(Unit)
+        assertEquals(first.await().single().sha256, second.await().single().sha256)
+        assertEquals(source.bytes.size.toLong(), readBytes)
+        assertEquals(2, enumerations)
     }
 
     @Test fun `cold registration reads once and registered inventory shares its verified identity`() = runBlocking {

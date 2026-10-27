@@ -133,6 +133,41 @@ class ModelSupplyDedupGcTest {
         assertEquals(1, files.reads.count { it.name == first.manifest.weight.path })
     }
 
+    @Test fun `receiver publication hello and prepare share versioned metadata while changed weights are rehashed`() = runBlocking {
+        val root = root()
+        val first = fixture()
+        val files = PrivateDigestTestFiles(temp.newFolder())
+        var scans = 0
+        val cache = ModelSupplyGgufScans(fingerprint = files::fingerprint, scanner = { input, count ->
+            scans++
+            GgufLayerWeightReader.scan(input, count)
+        })
+        val requests = mutableListOf<String>()
+        val receiver = ModelSupplyReceiver(root, "127.0.0.1", client = client(first, requests),
+            digests = files.digests, ggufScans = cache)
+        val received = receiver.receive(first.manifest, 1, "secret", { true }, {}, { it() })
+        val weight = received.resolve(first.manifest.weight.path)
+        val metadata = cache.scan(weight, 2)
+        assertNotNull(metadata)
+        receiver.validateFiles(received, first.manifest)
+        assertEquals(metadata, cache.scan(weight, 2))
+        assertEquals(1, scans)
+        assertEquals(first.files.size, files.reads.size)
+        val modified = Files.getLastModifiedTime(weight.toPath())
+        weight.writeBytes(weight.readBytes().also { it[0] = 0 })
+        Files.setLastModifiedTime(weight.toPath(), modified)
+        files.changed(weight)
+        try {
+            receiver.validateFiles(received, first.manifest)
+            fail("mutated weight accepted through cached metadata")
+        } catch (error: ModelSupplyException) {
+            assertEquals("SUPPLY_ARTIFACT_DIGEST_MISMATCH", error.reasonCode)
+        }
+        assertEquals(first.files.size + 1, files.reads.size)
+        assertNull(cache.scan(weight, 2))
+        assertEquals(2, scans)
+    }
+
     @Test fun `copy fallback always hashes new target bytes and later validation reuses that verification`() = runBlocking {
         val root = root()
         val first = fixture()

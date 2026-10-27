@@ -73,6 +73,19 @@ internal class VerifiedPrivateModelDigests(
         return cache.rebind(before.key(), before, after)
     }
 
+    suspend fun reuseContentVersion(
+        file: File,
+        previous: ModelFileFingerprint,
+        expectedSha256: String,
+    ): ModelFileFingerprint? {
+        val current = fingerprint(file) ?: return null
+        if (!previous.sameContentVersion(current)) return null
+        val verified = verify(file)
+        return verified.fingerprint?.takeIf {
+            it == current && previous.sameContentVersion(it) && verified.digest == expectedSha256
+        }
+    }
+
     suspend fun moveVerified(source: File, target: File, verified: Verification): Boolean {
         currentCoroutineContext().ensureActive()
         ModelSupplyPaths.check(source)
@@ -96,7 +109,7 @@ internal class VerifiedPrivateModelDigests(
     }
 }
 
-private fun privateModelFingerprint(file: File): ModelFileFingerprint? = runCatching {
+internal fun privateModelFingerprint(file: File): ModelFileFingerprint? = runCatching {
     if (Build.VERSION.SDK_INT < 27) return@runCatching null
     val stat = Os.lstat(file.absolutePath)
     if (!OsConstants.S_ISREG(stat.st_mode) || stat.st_dev < 0L || stat.st_ino <= 0L || stat.st_size < 0L ||

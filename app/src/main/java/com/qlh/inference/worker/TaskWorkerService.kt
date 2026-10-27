@@ -407,11 +407,7 @@ class TaskWorkerService : Service() {
             val scansByArtifact = mutableMapOf<ModelManager.LayerArtifact, GgufLayerWeightReader.ScanResult?>()
             val checkedArtifacts = eligibleArtifacts.filter { artifact ->
                 val scan = try {
-                    contentResolver.openInputStream(artifact.document.uri)?.use { input ->
-                        GgufLayerWeightReader.scan(
-                            input, artifact.endLayerExclusive - artifact.startLayer,
-                        )
-                    }
+                    modelManager.scanLayerArtifactMetadata(artifact)
                 } catch (cancelled: CancellationException) {
                     throw cancelled
                 } catch (error: Exception) {
