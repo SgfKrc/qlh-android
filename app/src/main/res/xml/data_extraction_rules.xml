@@ -1,17 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
 <data-extraction-rules>
     <cloud-backup>
-        <exclude domain="sharedpref" path="qlh_auth_session.xml" />
         <exclude domain="sharedpref" path="qlh_cluster_credential.xml" />
-        <exclude domain="sharedpref" path="qlh_quorum_voter_key.xml" />
         <exclude domain="file" path="datastore/" />
         <exclude domain="file" path="logs/" />
         <exclude domain="database" path="." />
     </cloud-backup>
     <device-transfer>
-        <exclude domain="sharedpref" path="qlh_auth_session.xml" />
         <exclude domain="sharedpref" path="qlh_cluster_credential.xml" />
-        <exclude domain="sharedpref" path="qlh_quorum_voter_key.xml" />
         <exclude domain="file" path="datastore/" />
         <exclude domain="file" path="logs/" />
         <exclude domain="database" path="." />

@@ -355,13 +355,13 @@ class WorkerPrepareControllerTest {
         assertEquals("released", replies.single()["status"].asString); assertNull(runtime.current)
     }
 
-    @Test fun `expired authority after JNI suppresses all ACK and reclaims candidate`() = runBlocking {
-        val runtime = Runtime(); var authority = true
+    @Test fun `retired connection after JNI suppresses all ACK and reclaims candidate`() = runBlocking {
+        val runtime = Runtime(); var connectionCurrent = true
         val c = WorkerPrepareController(node, object : WorkerPrepareRuntime by runtime {
-            override suspend fun load(identity: WorkerPrepareIdentity) { runtime.load(identity); authority = false }
+            override suspend fun load(identity: WorkerPrepareIdentity) { runtime.load(identity); connectionCurrent = false }
         })
         val replies = mutableListOf<JsonObject>()
-        c.command(request("prepare"), this, { replies += it }, { if (!authority) throw TaskWorkerProtocolException("expired", "control_certificate_expired") })
+        c.command(request("prepare"), this, { replies += it }, { if (!connectionCurrent) throw IllegalStateException("connection retired") })
         c.awaitIdle(); assertTrue(replies.isEmpty()); assertNull(runtime.current)
     }
 

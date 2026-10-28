@@ -14,8 +14,6 @@ import com.qlh.inference.network.CurrentModelDescriptor
 import com.qlh.inference.network.AuditRequestsResponse
 import com.qlh.inference.network.AuditRequestSummary
 import com.qlh.inference.network.AuditData
-import com.qlh.inference.network.AuditReviewTicketsResponse
-import com.qlh.inference.network.AuthCapabilityResponse
 import com.qlh.inference.network.GgufModelInfo
 import com.qlh.inference.network.LocalModelAssetSummary
 import com.qlh.inference.network.LocalModelAssetsResponse
@@ -132,34 +130,6 @@ class MainViewModelLogicTest {
     @Test
     fun `network type other when no transport`() {
         assertEquals("other", networkTypeFromTransports(false, false, false, false))
-    }
-
-    @Test
-    fun `management projection is bounded and only allows manager roles`() {
-        val user = com.qlh.inference.network.AuthUser(
-            userId = "u-1",
-            username = "alice",
-            displayName = "Alice",
-            role = "admin",
-            status = "active",
-            aggregateVersion = 4,
-        )
-        val binding = com.qlh.inference.network.TailscaleBinding(
-            bindingId = "b-1",
-            userId = "u-1",
-            tailnetId = "tailnet-a",
-            tailscaleUserId = "ts-a",
-            nodeId = "node-a",
-            state = "active",
-        )
-        val snapshot = user.toManagedUserSnapshot(listOf(binding.toManagedBindingSnapshot("u-1")))
-        assertEquals("Alice", snapshot.displayName)
-        assertEquals(4, snapshot.aggregateVersion)
-        assertEquals("tailnet-a", snapshot.bindings.single().tailnetId)
-        assertTrue(managementRoleAllowed("owner"))
-        assertTrue(managementRoleAllowed("admin"))
-        assertFalse(managementRoleAllowed("member"))
-        assertFalse(managementRoleAllowed(null))
     }
 
     // ---- buildAndroidPresencePayload ----
@@ -726,30 +696,16 @@ class MainViewModelLogicTest {
     // ---- 聊天与会话状态机 ----
 
     @Test
-    fun `audit projection is bounded and content free`() {
+    fun `audit projection is bounded to content-free workflow requests`() {
         val data = AuditData(
             requests = AuditRequestsResponse(schemaVersion = 2, revision = 1, validity = "valid",
                 requests = (1..12).map { index -> AuditRequestSummary(
                     requestId = "req-$index", deploymentId = "deployment", phase = "finished",
                     executionState = "stopped", terminal = "completed", outcome = "completed") }),
-            reviewTickets = AuditReviewTicketsResponse(
-                tickets = (1..12).map { index ->
-                    com.qlh.inference.network.ReviewTicketSummary(
-                        ticketId = "review-$index",
-                        status = "pending",
-                        targetNodeId = "node-$index",
-                        score = 300,
-                        voteCount = 500,
-                    )
-                },
-            ),
         )
 
         val snapshot = toAuditSnapshot(data)
         assertEquals(MAX_AUDIT_REQUESTS, snapshot.requests.size)
-        assertEquals(MAX_AUDIT_REVIEWS, snapshot.reviews.size)
-        assertEquals(100, snapshot.reviews.first().score)
-        assertEquals(100, snapshot.reviews.first().voteCount)
     }
 
     @Test
@@ -757,35 +713,6 @@ class MainViewModelLogicTest {
         assertEquals("无法连接主节点", formatAuditError(java.net.ConnectException("100.90.76.108")))
         assertEquals("读取审计资料超时", formatAuditError(java.net.SocketTimeoutException("Bearer secret")))
         assertEquals("读取审计资料失败", formatAuditError(IllegalStateException("C:/secret")))
-    }
-
-    @Test
-    fun `auth capability normalizes gateway and standalone shapes`() {
-        val gateway = AuthCapabilityResponse(
-            required = true,
-            enforced = true,
-            mode = "local_totp",
-            bootstrapAvailable = true,
-        ).toSnapshot()
-        assertTrue(gateway.canAuthenticate)
-        assertEquals("local_totp", gateway.mode)
-
-        val standalone = AuthCapabilityResponse(
-            required = false,
-            available = false,
-            mode = "local_primary_node",
-            reasonCode = "auth_control_plane_unavailable",
-        ).toSnapshot()
-        assertFalse(standalone.canAuthenticate)
-        assertEquals("auth_control_plane_unavailable", standalone.reasonCode)
-    }
-
-    @Test
-    fun `auth errors never disclose response details`() {
-        assertEquals("无法连接认证控制面", formatAuthError(java.net.ConnectException("100.90.76.108")))
-        assertEquals("认证控制面响应超时", formatAuthError(java.net.SocketTimeoutException("Bearer secret")))
-        assertEquals("认证会话无效或已过期", formatAuthError(IllegalStateException("HTTP 401: secret")))
-        assertEquals("认证服务不可用", formatAuthError(IllegalStateException("C:/secret")))
     }
 
     @Test
@@ -838,7 +765,7 @@ class MainViewModelLogicTest {
 
     @Test
     fun `send error formatting keeps actionable network and fallback messages`() {
-        assertEquals("远程推理需要先在账户页完成 Auth App 登录", formatMessageSendError(com.qlh.inference.network.ApiClientHttpException(401, "", "{}")))
+        assertEquals("主节点拒绝远程推理，请检查服务端访问策略", formatMessageSendError(com.qlh.inference.network.ApiClientHttpException(401, "", "{}")))
         assertEquals("主节点暂时拒绝远程推理，请检查分布式节点连接与模型准入", formatMessageSendError(com.qlh.inference.network.ApiClientHttpException(503, "", "{}")))
         assertEquals(
             "无法连接主节点，请检查地址和网络",

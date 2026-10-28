@@ -86,12 +86,12 @@ internal fun modelIntentError(error: Throwable): ModelIntentError {
         val typed = runCatching { Gson().fromJson(detail?.get("reason_detail"), ClientReason::class.java) }.getOrNull()
         val code = typed?.code?.takeIf { it.isNotBlank() } ?: text("reason_code") ?: text("code") ?: error.errorCode.takeIf { it.isNotBlank() }
             ?: when (error.statusCode) {
-                401, 403 -> "master_auth_required"
+                401, 403 -> "master_access_denied"
                 404 -> "model_intent_api_unavailable"
                 else -> "model_intent_http_${error.statusCode}"
             }
         val reason = text("reason") ?: text("message") ?: when (error.statusCode) {
-            401, 403 -> "请先在账户设置完成主节点登录"
+            401, 403 -> "主节点拒绝访问，请检查连接状态和节点信任配置"
             404 -> "主节点尚未提供模型 intent API"
             else -> "主节点拒绝了模型请求，请刷新状态后重试"
         }

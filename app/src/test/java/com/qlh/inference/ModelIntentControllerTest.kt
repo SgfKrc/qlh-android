@@ -196,7 +196,7 @@ class ModelIntentControllerTest {
         assertEquals("模型段已供给，等待准备", modelIntentStatusLabel("available"))
         assertEquals("模型段已加载，等待提交", modelIntentStatusLabel("prepared"))
         assertEquals("model_intent_api_unavailable", modelIntentError(ApiClientHttpException(404, "", "{}")).code)
-        assertEquals("master_auth_required", modelIntentError(ApiClientHttpException(403, "", "{}")).code)
+        assertEquals("master_access_denied", modelIntentError(ApiClientHttpException(403, "", "{}")).code)
         assertEquals(1f, ModelIntentNode(bytesReceived = 30, totalBytes = 20).progress!!, 0f)
         assertEquals(0f, ModelIntentNode(bytesReceived = -1, totalBytes = 20).progress!!, 0f)
         assertNull(ModelIntentNode(bytesReceived = 1).progress)

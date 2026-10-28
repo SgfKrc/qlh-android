@@ -13,7 +13,6 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.core.content.ContextCompat
 import com.qlh.inference.BuildConfig
-import com.qlh.inference.control.AndroidVoterSet
 import com.qlh.inference.data.MessageEntity
 import com.qlh.inference.data.SessionEntity
 import com.qlh.inference.data.SettingsDataStore
@@ -36,8 +35,6 @@ import com.qlh.inference.service.inferenceModes
 import com.qlh.inference.service.AndroidPresenceService
 import com.qlh.inference.service.ModelManager
 import com.qlh.inference.service.ModelDirectoryGrantState
-import com.qlh.inference.service.QuorumVoterService
-import com.qlh.inference.service.QuorumVoterServiceStatus
 import com.qlh.inference.service.LayerArtifactCandidate
 import com.qlh.inference.service.toCandidate
 import com.qlh.inference.service.unambiguousLayerArtifactCandidates
@@ -45,10 +42,6 @@ import com.qlh.inference.status.AndroidRuntimeStatus
 import com.qlh.inference.status.androidRuntimeStatusInvalidation
 import com.qlh.inference.system.WorkerBatteryPolicy
 import com.qlh.inference.system.AndroidDeviceInfoProvider
-import com.qlh.inference.security.AuthTokenStore
-import com.qlh.inference.security.StoredAuthSession
-import com.qlh.inference.security.QuorumEd25519
-import com.qlh.inference.security.QuorumVoterKeyStore
 import com.qlh.inference.update.AndroidAppUpdateManager
 import com.qlh.inference.update.AndroidUpdateCandidate
 import com.qlh.inference.network.ControlPlaneProbeResult
@@ -58,9 +51,6 @@ import com.qlh.inference.worker.TaskWorkerService
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -132,25 +122,14 @@ data class MainUiState(
     val modelIntent: ModelIntentUiState = ModelIntentUiState(),
     val masterDiscoveryBusy: Boolean = false,
     val audit: AuditUiState = AuditUiState(),
-    val authControl: AuthControlUiState = AuthControlUiState(),
-    val management: ManagementUiState = ManagementUiState(),
     val appUpdate: AppUpdateUiState = AppUpdateUiState(),
 
     // 上次发送的消息（用于重试）
     val lastSentMessage: String? = null,
     val lastSentImageDataUrls: List<String> = emptyList(),
 
-    // Local control-plane authentication
-    val authSession: StoredAuthSession? = null,
-    val authBusy: Boolean = false,
-    val authError: String? = null,
     val presence: AndroidPresenceSnapshot = AndroidPresenceSnapshot(),
     val taskWorker: TaskWorkerSnapshot = TaskWorkerSnapshot(),
-    val quorumVoterId: String = "",
-    val quorumVoterSetJson: String = "",
-    val quorumVoterEnabled: Boolean = false,
-    val quorumVoterPublicKey: String = "",
-    val quorumVoterMessage: String? = null,
 )
 
 // ================================================================
@@ -214,7 +193,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val database = QlhApplication.instance.database
     private val settings = SettingsDataStore(application)
     private val modelManager = ModelManager(application)
-    private val authStore = AuthTokenStore(application)
     private val appUpdateManager = AndroidAppUpdateManager(application)
     private var downloadedUpdateFile: File? = null
 
@@ -234,7 +212,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var intentEndpoint: IntentMasterEndpoint? = null
     private var discoveryJob: Job? = null
     private val modelIntentController = ModelIntentController(viewModelScope, { endpoint ->
-        ApiClient(httpBaseUrl(endpoint.host, endpoint.port), authStore = authStore)
+        ApiClient(httpBaseUrl(endpoint.host, endpoint.port))
     })
 
     private fun syncModelIntentContext() {
@@ -254,7 +232,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun apiClient(state: MainUiState = _uiState.value): ApiClient =
-        ApiClient(httpBaseUrl(state.serverHost, state.serverPort), authStore = authStore)
+        ApiClient(httpBaseUrl(state.serverHost, state.serverPort))
 
     // ---- 仓库（根据模式动态创建 ApiClient 或使用本地引擎） ----
     private val repository = ChatRepository(
@@ -320,10 +298,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     themeMode = themeMode,
                     selectedModelName = selectedModel?.name.orEmpty(),
                     selectedModelSizeBytes = selectedModel?.sizeBytes ?: 0L,
-                    authSession = authStore.read(),
-                    authControl = AuthControlUiState(
-                        localSessionPresent = authStore.read() != null,
-                    ),
                 )
                 QlhApplication.instance.inferenceService?.modelContextSize = contextSize
                 intentEndpoint = settings.getIntentMasterEndpoint()
@@ -334,7 +308,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 ensureAndroidTaskWorker()
                 refreshModels(showMessage = false)
                 refreshRuntimeStatus()
-                refreshManagement()
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -465,49 +438,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             settings.themeMode.collect { mode ->
                 _uiState.value = _uiState.value.copy(themeMode = mode)
             }
-        }
-        viewModelScope.launch {
-            settings.quorumVoterId.collect { id ->
-                _uiState.value = _uiState.value.copy(quorumVoterId = id)
-            }
-        }
-        viewModelScope.launch {
-            settings.quorumVoterSet.collect { voterSet ->
-                _uiState.value = _uiState.value.copy(quorumVoterSetJson = voterSet)
-            }
-        }
-        viewModelScope.launch {
-            QuorumVoterServiceStatus.message.collect { message ->
-                _uiState.value = _uiState.value.copy(quorumVoterMessage = message)
-            }
-        }
-        viewModelScope.launch {
-            combine(
-                settings.quorumVoterEnabled,
-                settings.quorumVoterId,
-                settings.quorumVoterSet,
-                settings.quorumVoterRevision,
-            ) { enabled, voterId, _, revision -> Triple(enabled, voterId, revision) }
-                .distinctUntilChanged()
-                .collect { (enabled, _, _) ->
-                _uiState.value = _uiState.value.copy(quorumVoterEnabled = enabled)
-                val context = getApplication<Application>()
-                if (enabled) {
-                    runCatching {
-                        ContextCompat.startForegroundService(context, QuorumVoterService.startIntent(context))
-                    }.onFailure { error ->
-                        _uiState.value = _uiState.value.copy(quorumVoterMessage = error.message)
-                    }
-                } else {
-                    context.stopService(Intent(context, QuorumVoterService::class.java))
-                }
-            }
-        }
-        viewModelScope.launch(Dispatchers.IO) {
-            val publicKey = runCatching {
-                QuorumVoterKeyStore(getApplication()).readPublicKey().orEmpty()
-            }.getOrDefault("")
-            _uiState.value = _uiState.value.copy(quorumVoterPublicKey = publicKey)
         }
     }
 
@@ -684,132 +614,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.value = clearMessageError(_uiState.value)
     }
 
-    /** Authenticate the Android client; the token is persisted only in Android Keystore-backed storage. */
-    fun login(username: String, code: String? = null, recoveryCode: String? = null) {
-        viewModelScope.launch {
-            _uiState.value = _uiState.value.copy(
-                authBusy = true,
-                authError = null,
-                authControl = _uiState.value.authControl.copy(busy = true, error = null),
-            )
-            val result = apiClient().login(username, code, recoveryCode)
-            val session = result.getOrNull()
-            val error = result.exceptionOrNull()?.let(::formatAuthError)
-            _uiState.value = _uiState.value.copy(
-                authBusy = false,
-                authSession = session ?: authStore.read(),
-                authError = error,
-                authControl = _uiState.value.authControl.copy(
-                    busy = false,
-                    account = session?.toAccountSnapshot(),
-                    localSessionPresent = session != null || authStore.read() != null,
-                    error = error,
-                ),
-            )
-            if (session != null) refreshManagement()
-            else _uiState.value = _uiState.value.copy(management = ManagementUiState())
-        }
-    }
-
-    /** Refresh capability first, then validate a stored session; failure never shows a stale account. */
-    fun refreshAuthControl() {
-        viewModelScope.launch {
-            val current = _uiState.value
-            _uiState.value = current.copy(
-                authControl = current.authControl.copy(
-                    loading = true,
-                    error = null,
-                    account = null,
-                    localSessionPresent = authStore.read() != null,
-                ),
-            )
-            val capabilityResult = apiClient().getAuthCapability()
-            if (capabilityResult.isFailure) {
-                val error = formatAuthError(capabilityResult.exceptionOrNull()!!)
-                _uiState.value = _uiState.value.copy(
-                    authBusy = false,
-                    authError = error,
-                    management = ManagementUiState(),
-                    authControl = _uiState.value.authControl.copy(
-                        capability = null,
-                        loading = false,
-                        account = null,
-                        error = error,
-                    ),
-                )
-                return@launch
-            }
-
-            val capability = capabilityResult.getOrThrow().toSnapshot()
-            val localSession = authStore.read()
-            if (!capability.canAuthenticate || localSession == null) {
-                _uiState.value = _uiState.value.copy(
-                    authBusy = false,
-                    authError = null,
-                    management = ManagementUiState(),
-                    authControl = _uiState.value.authControl.copy(
-                        capability = capability,
-                        loading = false,
-                        account = null,
-                        localSessionPresent = localSession != null,
-                        error = null,
-                    ),
-                )
-                return@launch
-            }
-
-            val sessionResult = apiClient().getAuthSession()
-            val error = sessionResult.exceptionOrNull()?.let(::formatAuthError)
-            _uiState.value = _uiState.value.copy(
-                authBusy = false,
-                authError = error,
-                authSession = if (sessionResult.isSuccess) localSession else authStore.read(),
-                authControl = _uiState.value.authControl.copy(
-                    capability = capability,
-                    loading = false,
-                    account = sessionResult.getOrNull()?.toAccountSnapshot(),
-                    localSessionPresent = authStore.read() != null,
-                    error = error,
-                ),
-            )
-            if (sessionResult.isSuccess && managementRoleAllowed(sessionResult.getOrNull()?.user?.role)) {
-                refreshManagement()
-            } else {
-                _uiState.value = _uiState.value.copy(management = ManagementUiState())
-            }
-        }
-    }
-
-    /** Revalidate the local session against the control plane without exposing credentials to UI code. */
-    fun refreshAuthSession() {
-        refreshAuthControl()
-    }
-
-    /** Clear local credentials even when the control plane is offline. */
-    fun logout() {
-        viewModelScope.launch {
-            _uiState.value = _uiState.value.copy(
-                authBusy = true,
-                authError = null,
-                authControl = _uiState.value.authControl.copy(busy = true, account = null, error = null),
-            )
-            val result = apiClient().logout()
-            val error = result.exceptionOrNull()?.let(::formatAuthError)
-            _uiState.value = _uiState.value.copy(
-                authBusy = false,
-                authSession = null,
-                authError = error,
-                authControl = _uiState.value.authControl.copy(
-                    busy = false,
-                    account = null,
-                    localSessionPresent = false,
-                    error = error,
-                ),
-            )
-            _uiState.value = _uiState.value.copy(management = ManagementUiState())
-        }
-    }
-
     fun refreshRuntimeStatus() {
         runtimeStatusRefreshJob?.cancel()
         runtimeStatusRefreshJob = viewModelScope.launch {
@@ -951,133 +755,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         ),
                     )
                 }
-        }
-    }
-
-    /**
-     * Refresh the owner/admin-only mobile management projection. The server remains
-     * authoritative; a stale local role never grants access because every request
-     * still carries the bearer and is checked by the control/gateway policy.
-     */
-    fun refreshManagement() {
-        if (_uiState.value.management.loading) return
-        val localRole = authStore.read()?.role
-        if (!managementRoleAllowed(localRole)) {
-            _uiState.value = _uiState.value.copy(management = ManagementUiState())
-            return
-        }
-        viewModelScope.launch {
-            val state = _uiState.value
-            _uiState.value = state.copy(
-                management = state.management.copy(loading = true, error = null),
-            )
-            val client = apiClient(state)
-            try {
-                val summary = client.fetchManageSummary().getOrThrow()
-                val usersResponse = client.fetchManagedUsers().getOrThrow()
-                val users = usersResponse.users
-                    .asSequence()
-                    .filter { it.userId.isNotBlank() && it.username.isNotBlank() }
-                    .take(MAX_MANAGED_USERS)
-                    .toList()
-
-                // Bindings are fetched per user because the manager endpoint deliberately
-                // avoids a global identity dump. Keep fan-out bounded by the user cap.
-                val usersWithBindings = coroutineScope {
-                    users.map { user ->
-                        async {
-                            val bindings = client.fetchUserTailscaleBindings(user.userId)
-                                .getOrThrow()
-                                .bindings
-                                .asSequence()
-                                .filter { it.bindingId.isNotBlank() }
-                                .take(MAX_MANAGED_BINDINGS)
-                                .map { it.toManagedBindingSnapshot(user.userId) }
-                                .toList()
-                            user.toManagedUserSnapshot(bindings)
-                        }
-                    }.awaitAll()
-                }
-
-                val audit = if (summary.auditAvailable) {
-                    client.fetchManageAudit(MAX_MANAGEMENT_AUDIT_EVENTS)
-                        .getOrThrow()
-                        .events
-                        .take(MAX_MANAGEMENT_AUDIT_EVENTS)
-                } else {
-                    emptyList()
-                }
-                _uiState.value = _uiState.value.copy(
-                    management = ManagementUiState(
-                        summary = summary,
-                        users = usersWithBindings,
-                        audit = audit,
-                    ),
-                )
-            } catch (e: Exception) {
-                QlhLogger.e("MainViewModel", "refreshManagement failed", e)
-                _uiState.value = _uiState.value.copy(
-                    management = _uiState.value.management.copy(
-                        loading = false,
-                        error = formatManagementError(e),
-                        summary = null,
-                        users = emptyList(),
-                        audit = emptyList(),
-                    ),
-                )
-            }
-        }
-    }
-
-    /** Request and consume a one-shot confirmation token entirely inside the ViewModel. */
-    fun revokeManagedUser(user: ManagedUserSnapshot) {
-        if (user.userId.isBlank() || user.aggregateVersion < 1) {
-            _uiState.value = _uiState.value.copy(
-                management = _uiState.value.management.copy(error = "成员版本不可用，已拒绝撤销"),
-            )
-            return
-        }
-        runManagedMutation("revoke-user:${user.userId}") { client ->
-            val confirmation = client.requestManageConfirm("user_manage", user.userId).getOrThrow()
-            client.revokeUser(user.userId, user.aggregateVersion, confirmation.confirmToken).getOrThrow()
-        }
-    }
-
-    /** Request and consume a one-shot confirmation token for a cross-user binding revoke. */
-    fun revokeManagedBinding(binding: ManagedBindingSnapshot) {
-        if (binding.bindingId.isBlank()) {
-            _uiState.value = _uiState.value.copy(
-                management = _uiState.value.management.copy(error = "绑定标识不可用，已拒绝撤销"),
-            )
-            return
-        }
-        runManagedMutation("revoke-binding:${binding.bindingId}") { client ->
-            val confirmation = client.requestManageConfirm("tailnet_bind", binding.bindingId).getOrThrow()
-            client.revokeTailscaleBinding(binding.bindingId, confirmation.confirmToken).getOrThrow()
-        }
-    }
-
-    private fun runManagedMutation(action: String, operation: suspend (ApiClient) -> Unit) {
-        if (_uiState.value.management.busyAction != null) return
-        viewModelScope.launch {
-            _uiState.value = _uiState.value.copy(
-                management = _uiState.value.management.copy(busyAction = action, error = null),
-            )
-            try {
-                operation(apiClient())
-                _uiState.value = _uiState.value.copy(
-                    management = _uiState.value.management.copy(busyAction = null),
-                )
-                refreshManagement()
-            } catch (e: Exception) {
-                QlhLogger.e("MainViewModel", "management mutation failed", e)
-                _uiState.value = _uiState.value.copy(
-                    management = _uiState.value.management.copy(
-                        busyAction = null,
-                        error = formatManagementError(e),
-                    ),
-                )
-            }
         }
     }
 
@@ -1878,76 +1555,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             settings.setThemeMode(mode)
             _uiState.value = _uiState.value.copy(themeMode = mode)
-        }
-    }
-
-    fun generateQuorumVoterKey() {
-        viewModelScope.launch(Dispatchers.IO) {
-            runCatching {
-                check(android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
-                    "Android voter requires API 33 or newer"
-                }
-                val material = QuorumVoterKeyStore(getApplication()).readOrCreate()
-                try {
-                    QuorumEd25519.encode(material.publicKey)
-                } finally {
-                    material.seed.fill(0)
-                }
-            }.onSuccess { key ->
-                _uiState.value = _uiState.value.copy(quorumVoterPublicKey = key, quorumVoterMessage = null)
-            }.onFailure { error ->
-                _uiState.value = _uiState.value.copy(
-                    quorumVoterMessage = error.message ?: error.javaClass.simpleName,
-                )
-            }
-        }
-    }
-
-    fun saveQuorumVoterConfig(voterId: String, voterSetJson: String, enabled: Boolean) {
-        viewModelScope.launch {
-            try {
-                val normalizedId = voterId.trim()
-                if (enabled) {
-                    check(android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
-                        "Android voter requires API 33 or newer"
-                    }
-                    require(normalizedId.isNotBlank() && voterSetJson.isNotBlank()) {
-                        "voter ID and voter set are required"
-                    }
-                    val parsed = AndroidVoterSet.parse(
-                        com.google.gson.JsonParser.parseString(voterSetJson).asJsonObject,
-                    )
-                    require(parsed.clusterId == settings.getClusterId()) {
-                        "voter set cluster does not match the Android bootstrap cluster"
-                    }
-                    require(parsed.voters.size >= 3) { "automatic quorum requires at least three configured voters" }
-                    val identity = parsed.voters[normalizedId]
-                        ?: error("voter ID is absent from voter set")
-                    val material = withContext(Dispatchers.IO) {
-                        QuorumVoterKeyStore(getApplication()).readOrCreate()
-                    }
-                    try {
-                        require(QuorumEd25519.matches(material.seed, identity.publicKey)) {
-                            "voter set public key does not match this device key"
-                        }
-                        require(settings.getClusterSecret().isNotBlank()) { "cluster credential is unavailable" }
-                        _uiState.value = _uiState.value.copy(
-                            quorumVoterPublicKey = QuorumEd25519.encode(material.publicKey),
-                        )
-                    } finally {
-                        material.seed.fill(0)
-                    }
-                }
-                settings.saveQuorumVoterConfig(normalizedId, voterSetJson, enabled)
-                _uiState.value = _uiState.value.copy(
-                    quorumVoterMessage = if (enabled) "配置已保存，等待 voter 服务状态"
-                    else "配置已停用",
-                )
-            } catch (error: Exception) {
-                _uiState.value = _uiState.value.copy(
-                    quorumVoterMessage = error.message ?: error.javaClass.simpleName,
-                )
-            }
         }
     }
 

@@ -293,8 +293,6 @@ dependencies {
     // Coroutines
     implementation(libs.kotlinx.coroutines.android)
 
-    // AndroidKeyStore does not expose an exportable Ed25519 seed on API 35.
-    implementation(libs.bouncycastle.crypto)
 }
 
 // Room schema 导出目录 — 必须在顶层，不能在 defaultConfig 内

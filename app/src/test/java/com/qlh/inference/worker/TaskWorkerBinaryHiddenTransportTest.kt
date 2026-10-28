@@ -6,6 +6,7 @@ import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.DataInputStream
 import java.io.DataOutputStream
+import java.io.InputStream
 import java.net.Socket
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -406,27 +407,13 @@ class TaskWorkerBinaryHiddenTransportTest {
     }
 
     @Test
-    fun `ACK already being admitted cannot revive a concurrently closed owner`() = runBlocking {
-        val entered = CountDownLatch(1)
-        val release = CountDownLatch(1)
-        val fence = TcpControlFence(validate = { certificate ->
-            if (certificate.get("phase")?.asString == "late") {
-                entered.countDown()
-                check(release.await(5, TimeUnit.SECONDS)) { "late ACK was not released" }
-            }
-        })
-        fun certificate(phase: String) = JsonObject().apply { addProperty("phase", phase) }
-        fence.admit(JsonObject().apply { add("control_certificate", certificate("initial")) })
-        fun certifiedAck(message: TaskWorkerEnvelope, phase: String): ByteArray {
-            val data = JsonParser.parseString(TaskWorkerProtocol.canonicalBytes(message).toString(Charsets.UTF_8)).asJsonObject
-            data.add("control_certificate", certificate(phase))
-            return pack(JsonObject().apply {
-                addProperty("type", "task_worker"); addProperty("format", "json"); add("data", data)
-            }.toString().toByteArray())
-        }
-        val socket = MemorySocket(certifiedAck(ack(true), "initial") +
-            certifiedAck(ack(true, "msg_ack_late_12345678"), "late"))
-        val transport = SocketTaskWorkerTransport(socket, controlFence = fence)
+    fun `ACK being read cannot revive a concurrently closed owner`() = runBlocking {
+        val firstAck = jsonFrame(ack(true))
+        val socket = BlockingMemorySocket(
+            firstAck + jsonFrame(ack(true, "msg_ack_late_12345678")),
+            pauseAtByte = firstAck.size + 4,
+        )
+        val transport = SocketTaskWorkerTransport(socket)
         transport.setBinaryHiddenEnabled(true)
         sendHello(transport, socket)
         transport.receive()
@@ -434,10 +421,10 @@ class TaskWorkerBinaryHiddenTransportTest {
         sendHello(transport, socket)
         val lateAck = async(Dispatchers.IO) { transport.receive() }
         try {
-            assertTrue("ACK must reach the real receiveEvent admission boundary", entered.await(5, TimeUnit.SECONDS))
+            assertTrue("second ACK must reach the socket read boundary", socket.readEntered.await(5, TimeUnit.SECONDS))
             transport.close()
             assertFalse(transport.isBinaryHiddenNegotiated)
-        } finally { release.countDown() }
+        } finally { socket.releaseRead.countDown() }
         assertEquals(TaskWorkerProtocol.HELLO_ACK, lateAck.await()!!.messageType)
         assertFalse("late ACK must not revive the retired owner", transport.isBinaryHiddenNegotiated)
     }
@@ -514,10 +501,38 @@ class TaskWorkerBinaryHiddenTransportTest {
         try { block(); fail("malformed frame accepted") }
         catch (error: TaskWorkerProtocolException) { assertEquals("invalid_frame", error.code) }
     }
-    private class MemorySocket(bytes: ByteArray) : Socket() {
+    private open class MemorySocket(bytes: ByteArray) : Socket() {
         val written = ByteArrayOutputStream()
         private val incoming = ByteArrayInputStream(bytes)
-        override fun getInputStream() = incoming
+        override fun getInputStream(): InputStream = incoming
         override fun getOutputStream() = written
+    }
+    private class BlockingMemorySocket(bytes: ByteArray, private val pauseAtByte: Int) : MemorySocket(bytes) {
+        val readEntered = CountDownLatch(1)
+        val releaseRead = CountDownLatch(1)
+        private val source = ByteArrayInputStream(bytes)
+        private var bytesRead = 0
+        private val incoming = object : InputStream() {
+            private fun pauseIfNeeded() {
+                if (bytesRead >= pauseAtByte && readEntered.count == 1L) {
+                    readEntered.countDown()
+                    check(releaseRead.await(5, TimeUnit.SECONDS)) { "second ACK read was not released" }
+                }
+            }
+
+            override fun read(): Int {
+                pauseIfNeeded()
+                return source.read().also { if (it >= 0) bytesRead++ }
+            }
+
+            override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                pauseIfNeeded()
+                val availableBeforePause = (pauseAtByte - bytesRead).coerceAtLeast(1)
+                val boundedLength = minOf(length, availableBeforePause)
+                return source.read(buffer, offset, boundedLength).also { if (it > 0) bytesRead += it }
+            }
+        }
+
+        override fun getInputStream() = incoming
     }
 }

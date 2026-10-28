@@ -6,6 +6,7 @@ import android.app.NotificationManager
 import android.os.Build
 import com.qlh.inference.data.AppDatabase
 import com.qlh.inference.logging.QlhLogger
+import com.qlh.inference.security.LegacyAuthSessionCleanup
 import com.qlh.inference.service.InferenceService
 
 class QlhApplication : Application() {
@@ -20,6 +21,7 @@ class QlhApplication : Application() {
     override fun onCreate() {
         super.onCreate()
         instance = this
+        LegacyAuthSessionCleanup.clear(this)
 
         // 初始化 Room 数据库
         database = AppDatabase.getInstance(this)

@@ -20,15 +20,11 @@ class CredentialReadRetryInstrumentedTest {
     private val testId = UUID.randomUUID().toString()
     private val clusterPrefs = "qlh_test_cluster_$testId"
     private val clusterAlias = "com.qlh.inference.test.cluster.$testId"
-    private val authPrefs = "qlh_test_auth_$testId"
-    private val authAlias = "com.qlh.inference.test.auth.$testId"
 
     @After
     fun cleanOnlyTestCredentials() {
         ClusterCredentialStore(context, clusterPrefs, clusterAlias).clear()
-        AuthTokenStore(context, authPrefs, authAlias).clear()
         context.deleteSharedPreferences(clusterPrefs)
-        context.deleteSharedPreferences(authPrefs)
     }
 
     @Test
@@ -83,64 +79,6 @@ class CredentialReadRetryInstrumentedTest {
         assertNull(store.read())
         assertEquals(original, context.getSharedPreferences(clusterPrefs, 0).all)
         assertFalse(keyStore().containsAlias(clusterAlias))
-    }
-
-    @Test
-    fun transientAuthKeystoreFailureRetainsSessionForRetry() {
-        val store = AuthTokenStore(context, authPrefs, authAlias)
-        val session = StoredAuthSession(
-            accessToken = "android-auth-token-${"d".repeat(32)}",
-            sessionId = "sess_test",
-            expiresAt = "2026-12-31T00:00:00Z",
-            userId = "test_user",
-            username = "test_owner",
-            role = "owner",
-        )
-        store.save(session)
-        val original = context.getSharedPreferences(authPrefs, 0).all.toMap()
-
-        val temporaryFailure = AuthTokenStore(context, authPrefs, authAlias) {
-            throw KeyStoreException("temporary Keystore failure")
-        }
-        assertNull(temporaryFailure.read())
-        assertEquals(original, context.getSharedPreferences(authPrefs, 0).all)
-        assertTrue(keyStore().containsAlias(authAlias))
-        assertEquals(session, store.read())
-    }
-
-    @Test
-    fun authTamperingDiscardsOnlyRecordAndReadDoesNotRecreateMissingKey() {
-        val store = AuthTokenStore(context, authPrefs, authAlias)
-        val session = StoredAuthSession(
-            accessToken = "android-auth-token-${"e".repeat(32)}",
-            sessionId = "sess_test",
-            expiresAt = "2026-12-31T00:00:00Z",
-            userId = "test_user",
-            username = "test_owner",
-            role = "owner",
-        )
-        store.save(session)
-        val preferences = context.getSharedPreferences(authPrefs, 0)
-        val ciphertext = Base64.decode(
-            preferences.getString(AuthTokenStore.KEY_CIPHERTEXT, null),
-            Base64.NO_WRAP,
-        )
-        ciphertext[0] = (ciphertext[0].toInt() xor 1).toByte()
-        preferences.edit().putString(
-            AuthTokenStore.KEY_CIPHERTEXT,
-            Base64.encodeToString(ciphertext, Base64.NO_WRAP),
-        ).commit()
-
-        assertNull(store.read())
-        assertTrue(preferences.all.isEmpty())
-        assertTrue(keyStore().containsAlias(authAlias))
-        store.save(session)
-        val encrypted = preferences.all.toMap()
-        keyStore().deleteEntry(authAlias)
-
-        assertNull(store.read())
-        assertEquals(encrypted, preferences.all)
-        assertFalse(keyStore().containsAlias(authAlias))
     }
 
     private fun keyStore(): KeyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }

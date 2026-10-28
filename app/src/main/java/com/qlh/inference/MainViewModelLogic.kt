@@ -141,7 +141,7 @@ fun clearMessageError(state: MainUiState): MainUiState =
 
 fun formatMessageSendError(error: Throwable): String = when (error) {
     is ApiClientHttpException -> when (error.statusCode) {
-        401, 403 -> "远程推理需要先在账户页完成 Auth App 登录"
+        401, 403 -> "主节点拒绝远程推理，请检查服务端访问策略"
         503 -> "主节点暂时拒绝远程推理，请检查分布式节点连接与模型准入"
         else -> "发送失败（HTTP ${error.statusCode}）"
     }
@@ -170,24 +170,6 @@ fun formatAuditError(error: Throwable): String = when (error) {
     is java.net.ConnectException -> "无法连接主节点"
     is java.net.SocketTimeoutException -> "读取审计资料超时"
     else -> "读取审计资料失败"
-}
-
-/** Management errors are intentionally generic; never echo response bodies or IDs. */
-fun formatManagementError(error: Throwable): String = when (error) {
-    is java.net.ConnectException -> "无法连接主节点"
-    is java.net.SocketTimeoutException -> "读取管理控制面超时"
-    else -> "管理控制面不可用或权限不足"
-}
-
-/** Authentication failures are intentionally coarse; never echo response bodies or secrets. */
-fun formatAuthError(error: Throwable): String = when (error) {
-    is java.net.ConnectException -> "无法连接认证控制面"
-    is java.net.SocketTimeoutException -> "认证控制面响应超时"
-    else -> when {
-        error.message?.contains("HTTP 401") == true || error.message?.contains("HTTP 403") == true ->
-            "认证会话无效或已过期"
-        else -> "认证服务不可用"
-    }
 }
 
 /**

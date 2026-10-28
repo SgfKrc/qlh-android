@@ -7,7 +7,6 @@ import java.io.File
 
 class AndroidBackupContractTest {
     private val exclusions = listOf(
-        "<exclude domain=\"sharedpref\" path=\"qlh_auth_session.xml\" />",
         "<exclude domain=\"sharedpref\" path=\"qlh_cluster_credential.xml\" />",
         "<exclude domain=\"file\" path=\"datastore/\" />",
         "<exclude domain=\"file\" path=\"logs/\" />",

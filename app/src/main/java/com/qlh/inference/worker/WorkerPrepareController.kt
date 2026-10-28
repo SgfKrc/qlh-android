@@ -58,7 +58,6 @@ internal class WorkerPrepareController(
     fun committedIdentity(): WorkerPrepareIdentity? = visible
 
     override suspend fun command(data: JsonObject, scope: CoroutineScope, reply: suspend (JsonObject) -> Unit, authorize: () -> Unit) {
-        // Transport strips the admitted certificate. Unknown fields are never treated as cleanup.
         val request = WorkerPrepareRequest.parse(data)
         authorize()
         if (request.identity.text("node_id") != nodeId) {

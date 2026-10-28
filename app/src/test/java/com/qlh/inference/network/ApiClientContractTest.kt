@@ -4,14 +4,11 @@ import com.google.gson.Gson
 import com.google.gson.GsonBuilder
 import com.google.gson.ToNumberPolicy
 import com.google.gson.JsonParser
-import com.qlh.inference.security.AuthSessionStore
-import com.qlh.inference.security.StoredAuthSession
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.async
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
-import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -63,27 +60,6 @@ class ApiClientContractTest {
         val body: String,
         val headers: Map<String, String> = emptyMap(),
     )
-
-    private class FakeAuthStore(initial: StoredAuthSession? = null) : AuthSessionStore {
-        var session: StoredAuthSession? = initial
-        var clearCount: Int = 0
-        var failNextRead: Boolean = false
-
-        override fun read(): StoredAuthSession? {
-            if (failNextRead) {
-                failNextRead = false
-                return null
-            }
-            return session
-        }
-        override fun save(session: StoredAuthSession) {
-            this.session = session
-        }
-        override fun clear() {
-            clearCount += 1
-            session = null
-        }
-    }
 
     // T14：完整 JSON 解析比较（Gson 自动还原 \u003d 转义）
     private fun parseJson(body: String): com.google.gson.JsonObject =
@@ -201,16 +177,6 @@ class ApiClientContractTest {
         }
     }
 
-    private fun storedSession(): StoredAuthSession = StoredAuthSession(
-        accessToken = "token_" + "a".repeat(24),
-        sessionId = "session-1",
-        expiresAt = "2030-01-01T00:00:00.000Z",
-        userId = "user-1",
-        username = "owner",
-        displayName = "Owner",
-        role = "owner",
-    )
-
     private fun bootstrapResponseFor(request: Request, clusterSecret: String): String {
         val body = parseJson(request.body)
         val nodeId = body.get("node_id").asString
@@ -299,331 +265,6 @@ class ApiClientContractTest {
                 ),
             ),
         )
-    }
-
-    @Test
-    fun `auth capability is public and supports gateway shape`() {
-        var seen: Request? = null
-        route("/api/auth/capability") { req, reply ->
-            seen = req
-            reply(
-                200,
-                """{"required":true,"enforced":true,"mode":"local_totp","bootstrap_available":true}""",
-            )
-        }
-        val result = runBlocking { client.getAuthCapability() }
-        assertTrue(result.isSuccess)
-        assertEquals("GET", seen?.method)
-        assertEquals("/api/auth/capability", seen?.path)
-        assertTrue(seen?.headers?.keys?.none { it.equals("Authorization", ignoreCase = true) } == true)
-        assertTrue(result.getOrNull()!!.required)
-        assertTrue(result.getOrNull()!!.enforced)
-        assertEquals("local_totp", result.getOrNull()!!.mode)
-    }
-
-    @Test
-    fun `login saves validated session without sending stale bearer`() {
-        val store = FakeAuthStore(storedSession())
-        client = ApiClient(baseUrl = "http://127.0.0.1:${server.port}", authStore = store)
-        var seen: Request? = null
-        route("/api/auth/login") { req, reply ->
-            seen = req
-            reply(
-                200,
-                """{"access_token":"new_token_${"b".repeat(24)}","token_type":"Bearer","session_id":"session-2","expires_at":"2030-01-02T00:00:00.000Z","user":{"user_id":"user-2","username":"alice","display_name":"Alice","role":"member"}}""",
-            )
-        }
-
-        val result = runBlocking { client.login("alice", code = "123456") }
-        assertTrue(result.isSuccess)
-        assertEquals("alice", result.getOrNull()?.username)
-        assertEquals("session-2", store.session?.sessionId)
-        assertTrue(seen?.headers?.keys?.none { it.equals("Authorization", ignoreCase = true) } == true)
-        assertEquals("123456", parseJson(seen!!.body).get("code").asString)
-    }
-
-    @Test
-    fun `authenticated requests receive bearer from session store`() {
-        val store = FakeAuthStore(storedSession())
-        client = ApiClient(baseUrl = "http://127.0.0.1:${server.port}", authStore = store)
-        var seen: Request? = null
-        route("/api/auth/session") { req, reply ->
-            seen = req
-            reply(200, """{"session_id":"session-1","expires_at":"2030-01-01T00:00:00.000Z","user":{"user_id":"user-1","username":"owner","role":"owner"}}""")
-        }
-
-        val result = runBlocking { client.getAuthSession() }
-        assertTrue(result.isSuccess)
-        assertEquals("Bearer ${storedSession().accessToken}", seen?.headers?.entries?.firstOrNull {
-            it.key.equals("Authorization", ignoreCase = true)
-        }?.value)
-    }
-
-    @Test
-    fun `unauthorized response clears the local session`() {
-        val store = FakeAuthStore(storedSession())
-        client = ApiClient(baseUrl = "http://127.0.0.1:${server.port}", authStore = store)
-        route("/api/auth/session") { _, reply -> reply(401, """{"error":"expired"}""") }
-
-        val result = runBlocking { client.getAuthSession() }
-        assertTrue(result.isFailure)
-        assertEquals(1, store.clearCount)
-        assertEquals(null, store.session)
-    }
-
-    @Test
-    fun `unauthorized response without readable bearer preserves local session`() {
-        val store = FakeAuthStore(storedSession()).apply { failNextRead = true }
-        client = ApiClient(baseUrl = "http://127.0.0.1:${server.port}", authStore = store)
-        var hadAuthorization = true
-        route("/api/auth/session") { request, reply ->
-            hadAuthorization = request.headers.keys.any { it.equals("Authorization", ignoreCase = true) }
-            reply(401, """{"error":"missing_bearer"}""")
-        }
-
-        assertTrue(runBlocking { client.getAuthSession() }.isFailure)
-        assertFalse(hadAuthorization)
-        assertEquals(0, store.clearCount)
-        assertEquals(storedSession(), store.session)
-        assertTrue(store.read()?.accessToken?.isNotBlank() == true)
-    }
-
-    @Test
-    fun `stale unauthorized response does not clear a newer session`() {
-        val store = FakeAuthStore(storedSession())
-        client = ApiClient(baseUrl = "http://127.0.0.1:${server.port}", authStore = store)
-        val newerSession = storedSession().copy(accessToken = "token_${"z".repeat(24)}")
-        route("/api/auth/session") { _, reply ->
-            store.save(newerSession)
-            reply(401, """{"error":"expired"}""")
-        }
-
-        assertTrue(runBlocking { client.getAuthSession() }.isFailure)
-        assertEquals(0, store.clearCount)
-        assertEquals(newerSession, store.session)
-    }
-
-    @Test
-    fun `logout clears local session when server is unavailable`() {
-        val store = FakeAuthStore(storedSession())
-        client = ApiClient(baseUrl = "http://127.0.0.1:${server.port}", authStore = store)
-        route("/api/auth/logout") { _, reply -> reply(503, """{"error":"offline"}""") }
-
-        val result = runBlocking { client.logout() }
-        assertTrue(result.isFailure)
-        assertEquals(null, store.session)
-        assertTrue(store.clearCount >= 1)
-    }
-
-    // ---- AND-CTRL-05 前置：管理摘要 / 审计 / 二次确认 ----
-
-    @Test
-    fun `manage summary is authenticated and projects manager matrix`() {
-        val store = FakeAuthStore(storedSession())
-        client = ApiClient(baseUrl = "http://127.0.0.1:${server.port}", authStore = store)
-        var seen: Request? = null
-        route("/api/auth/manage/summary") { req, reply ->
-            seen = req
-            reply(
-                200,
-                """{"role":"owner","policy_version":"and-ctrl-05-v1","audit_available":true,"confirm_ttl_seconds":120,
-                    "actions":{"user_manage":{"allowed":true,"confirm_required":true,"audited":true,"description":"成员管理"},
-                               "tailnet_bind":{"allowed":true,"confirm_required":true,"audited":true,"description":"绑定撤销"},
-                               "review_admin":{"allowed":true,"confirm_required":false,"audited":false,"description":"审批域"}},
-                    "counts":{"users":3,"bindings":2},"review_admin_auth_pending":true}""",
-            )
-        }
-
-        val result = runBlocking { client.fetchManageSummary() }
-        assertTrue(result.isSuccess)
-        assertEquals("GET", seen?.method)
-        assertEquals("owner", result.getOrNull()?.role)
-        assertEquals(true, result.getOrNull()?.actions?.get("user_manage")?.allowed)
-        assertEquals(true, result.getOrNull()?.actions?.get("user_manage")?.confirmRequired)
-        assertEquals(false, result.getOrNull()?.actions?.get("review_admin")?.confirmRequired)
-        assertEquals(true, result.getOrNull()?.reviewAdminAuthPending)
-        // 管理端点必须带 Bearer
-        assertNotNull(seen?.headers?.entries?.firstOrNull { it.key.equals("Authorization", ignoreCase = true) })
-    }
-
-    @Test
-    fun `manage audit is bounded client side and parses redacted events`() {
-        val store = FakeAuthStore(storedSession())
-        client = ApiClient(baseUrl = "http://127.0.0.1:${server.port}", authStore = store)
-        var seen: Request? = null
-        val auditResponseJson = """{"events":[
-            {"event_id":"e1","event_type":"user_revoked","outcome":"success","reason_code":null,
-             "actor_user_id":"user-1","user_id":"user-2","subject_id":"user-2","created_at":"2026-08-23T00:00:00.000Z"},
-            {"event_id":"e2","event_type":"tailscale_binding_revoked","outcome":"success","reason_code":null,
-             "actor_user_id":"user-1","user_id":"user-2","subject_id":"binding-1","created_at":"2026-08-23T00:01:00.000Z"}]}"""
-        route("/api/auth/manage/audit?limit=5") { req, reply ->
-            seen = req
-            reply(
-                200,
-                auditResponseJson,
-            )
-        }
-
-        val result = runBlocking { client.fetchManageAudit(limit = 5) }
-        assertTrue(result.isSuccess)
-        assertEquals("/api/auth/manage/audit?limit=5", seen?.path)
-        val events = result.getOrNull()?.events.orEmpty()
-        assertEquals(2, events.size)
-        assertEquals("user_revoked", events[0].eventType)
-        assertEquals("binding-1", events[1].subjectId)
-        // 脱敏契约：原始响应体不得含 details/token 类键（data class 会静默丢弃，
-        // 必须对原始 JSON 断言才能防回归）
-        val raw = JsonParser.parseString(auditResponseJson).asJsonObject.getAsJsonArray("events")
-        raw.forEach { element ->
-            val event = element.asJsonObject
-            assertFalse("脱敏契约：审计事件不得含 details", event.has("details"))
-            assertFalse("脱敏契约：审计事件不得含 token", event.has("token"))
-        }
-    }
-
-    @Test
-    fun `manage confirm issues token then revoke carries it in header`() {
-        val store = FakeAuthStore(storedSession())
-        client = ApiClient(baseUrl = "http://127.0.0.1:${server.port}", authStore = store)
-        val issued = mutableListOf<Pair<String, String>>()
-        route("/api/auth/manage/confirm") { req, reply ->
-            val body = parseJson(req.body)
-            issued += body.get("action").asString to body.get("target_id").asString
-            reply(200, """{"confirm_token":"ct_1234567890abcdef","expires_at":"2030-01-01T00:00:00.000Z","action":"user_manage","target_id":"user-9"}""")
-        }
-        var revokeSeen: Request? = null
-        route("/api/auth/users/user-9") { req, reply ->
-            revokeSeen = req
-            reply(200, """{"status":"revoked","user":{"user_id":"user-9","username":"member"}}""")
-        }
-
-        val confirmation = runBlocking { client.requestManageConfirm("user_manage", "user-9") }
-        assertTrue(confirmation.isSuccess)
-        assertEquals("user_manage" to "user-9", issued.firstOrNull())
-        val token = confirmation.getOrNull()?.confirmToken.orEmpty()
-        assertFalse(token.isBlank())
-
-        val revoke = runBlocking { client.revokeUser("user-9", expectedVersion = 1, confirmToken = token) }
-        assertTrue(revoke.isSuccess)
-        assertEquals("DELETE", revokeSeen?.method)
-        assertEquals("ct_1234567890abcdef", revokeSeen?.headers?.entries?.firstOrNull {
-            it.key.equals("X-QLH-Confirm-Token", ignoreCase = true)
-        }?.value)
-        // revoke 请求体必须携带 expected_version
-        assertEquals(1, parseJson(revokeSeen!!.body).get("expected_version").asInt)
-    }
-
-    @Test
-    fun `managed users and per-user bindings stay authenticated and bounded`() {
-        val store = FakeAuthStore(storedSession())
-        client = ApiClient(baseUrl = "http://127.0.0.1:${server.port}", authStore = store)
-        var usersSeen: Request? = null
-        var bindingsSeen: Request? = null
-        route("/api/users") { req, reply ->
-            usersSeen = req
-            reply(200, """{"users":[{"user_id":"user-2","username":"member","role":"member","status":"active","aggregate_version":3,"secret":"drop"}]}""")
-        }
-        route("/api/auth/users/user-2/tailscale") { req, reply ->
-            bindingsSeen = req
-            reply(200, """{"bindings":[{"binding_id":"binding-2","user_id":"user-2","tailnet_id":"tailnet-a","tailscale_user_id":"ts-user","node_id":"node-a","state":"active","credential_ref":"drop"}]}""")
-        }
-
-        val users = runBlocking { client.fetchManagedUsers() }
-        val bindings = runBlocking { client.fetchUserTailscaleBindings("user-2") }
-        assertTrue(users.isSuccess)
-        assertTrue(bindings.isSuccess)
-        assertEquals("member", users.getOrNull()?.users?.single()?.username)
-        assertEquals(3, users.getOrNull()?.users?.single()?.aggregateVersion)
-        assertEquals("binding-2", bindings.getOrNull()?.bindings?.single()?.bindingId)
-        assertEquals("GET", usersSeen?.method)
-        assertEquals("GET", bindingsSeen?.method)
-        assertNotNull(usersSeen?.headers?.entries?.firstOrNull { it.key.equals("Authorization", ignoreCase = true) })
-        assertNotNull(bindingsSeen?.headers?.entries?.firstOrNull { it.key.equals("Authorization", ignoreCase = true) })
-    }
-
-    @Test
-    fun `manage confirm JSON encodes target and rejects blank target locally`() {
-        val store = FakeAuthStore(storedSession())
-        client = ApiClient(baseUrl = "http://127.0.0.1:${server.port}", authStore = store)
-        var seen: Request? = null
-        route("/api/auth/manage/confirm") { req, reply ->
-            seen = req
-            reply(200, """{"confirm_token":"ct_safe_123456789","expires_at":"2030-01-01T00:00:00.000Z","action":"user_manage","target_id":"user-\\\"9"}""")
-        }
-        val encoded = runBlocking { client.requestManageConfirm("user_manage", "user-\"9") }
-        assertTrue(encoded.isSuccess)
-        assertEquals("user-\"9", parseJson(seen!!.body).get("target_id").asString)
-
-        var hitServer = false
-        route("/api/auth/manage/confirm") { _, reply -> hitServer = true; reply(200, "{}") }
-        val blank = runBlocking { client.requestManageConfirm("user_manage", "") }
-        assertTrue(blank.isFailure)
-        assertTrue(!hitServer)
-    }
-
-    @Test
-    fun `revoking own tailscale binding may omit confirm token while cross-user revoke fails without it`() {
-        val store = FakeAuthStore(storedSession())
-        client = ApiClient(baseUrl = "http://127.0.0.1:${server.port}", authStore = store)
-        var seen: Request? = null
-        route("/api/auth/tailscale/bindings/binding-5/revoke") { req, reply ->
-            seen = req
-            reply(200, """{"status":"revoked","binding":{"binding_id":"binding-5","state":"revoked"}}""")
-        }
-        // 自撤销（无 token 头）
-        val own = runBlocking { client.revokeTailscaleBinding("binding-5") }
-        assertTrue(own.isSuccess)
-        assertEquals("POST", seen?.method)
-        assertTrue(seen?.headers?.keys?.none { it.equals("X-QLH-Confirm-Token", ignoreCase = true) } == true)
-        // 跨用户管理（带头）
-        val crossSeen = arrayOf<Request?>(null)
-        route("/api/auth/tailscale/bindings/binding-6/revoke") { req, reply ->
-            crossSeen[0] = req
-            reply(200, """{"status":"revoked","binding":{"binding_id":"binding-6","state":"revoked"}}""")
-        }
-        val cross = runBlocking { client.revokeTailscaleBinding("binding-6", confirmToken = "ct_cross") }
-        assertTrue(cross.isSuccess)
-        assertEquals("ct_cross", crossSeen[0]?.headers?.entries?.firstOrNull {
-            it.key.equals("X-QLH-Confirm-Token", ignoreCase = true)
-        }?.value)
-    }
-
-    @Test
-    fun `revoking user without confirm token fails without hitting network`() {
-        val store = FakeAuthStore(storedSession())
-        client = ApiClient(baseUrl = "http://127.0.0.1:${server.port}", authStore = store)
-        var hitServer = false
-        route("/api/auth/users/user-9") { _, reply -> hitServer = true; reply(200, "{}") }
-
-        val result = runBlocking { client.revokeUser("user-9", expectedVersion = 1, confirmToken = "") }
-        assertTrue(result.isFailure)
-        assertFalse(hitServer)
-    }
-
-    @Test
-    fun `manage confirm rejects invalid token response`() {
-        val store = FakeAuthStore(storedSession())
-        client = ApiClient(baseUrl = "http://127.0.0.1:${server.port}", authStore = store)
-        route("/api/auth/manage/confirm") { _, reply ->
-            reply(200, """{"expires_at":"2030-01-01T00:00:00.000Z","action":"user_manage"}""")
-        }
-
-        val result = runBlocking { client.requestManageConfirm("user_manage", "user-9") }
-        assertTrue(result.isFailure)
-    }
-
-    @Test
-    fun `manage audit clamps limit to server bound`() {
-        val store = FakeAuthStore(storedSession())
-        client = ApiClient(baseUrl = "http://127.0.0.1:${server.port}", authStore = store)
-        var seen: Request? = null
-        route("/api/auth/manage/audit?limit=200") { req, reply ->
-            seen = req
-            reply(200, """{"events":[]}""")
-        }
-        val result = runBlocking { client.fetchManageAudit(limit = 500) }
-        assertTrue(result.isSuccess)
-        assertEquals("/api/auth/manage/audit?limit=200", seen?.path)
     }
 
     private fun productChatRepository(
@@ -1136,19 +777,13 @@ class ApiClientContractTest {
     }
 
     @Test
-    fun `audit requests bounded server summaries and excludes content fields`() {
+    fun `audit polls only bounded workflow summaries without account auth`() {
         route("/api/requests?limit=8") { req, reply ->
             assertEquals("GET", req.method)
+            assertTrue(req.headers.keys.none { it.equals("Authorization", ignoreCase = true) })
             reply(
                 200,
                 """{"schema_version":2,"revision":1,"identity":{"boot_id":"test"},"observed_at":100,"validity":"valid","requests":[{"request_id":"req-1","deployment_id":"deployment","phase":"finished","execution_state":"stopped","terminal":"completed","outcome":"completed"}],"prompt":"must-not-be-present"}""",
-            )
-        }
-        route("/api/cluster/review/tickets?limit=8&summary=1") { req, reply ->
-            assertEquals("GET", req.method)
-            reply(
-                200,
-                """{"count":1,"tickets":[{"ticket_id":"review-1","status":"pending","created_at":10,"target_node_id":"node-2","score":0,"vote_count":0,"transfer_reason":"must-not-be-present","votes":[{"comment":"secret"}]}]}""",
             )
         }
 
@@ -1156,12 +791,10 @@ class ApiClientContractTest {
         assertEquals("req-1", audit.requests.requests.single().requestId)
         assertEquals("stopped", audit.requests.requests.single().executionState)
         assertEquals("completed", audit.requests.requests.single().terminal)
-        assertEquals("review-1", audit.reviewTickets.tickets.single().ticketId)
-        assertEquals("node-2", audit.reviewTickets.tickets.single().targetNodeId)
     }
 
     @Test
-    fun `connection health probe records bounded checks and skips absent auth`() {
+    fun `connection health probe checks cluster status without session probing`() {
         route("/api/cluster/status") { req, reply ->
             assertEquals("GET", req.method)
             reply(200, "{\"status\":\"ok\"}")
@@ -1169,7 +802,7 @@ class ApiClientContractTest {
         val report = runBlocking { client.probeConnectionHealth("wifi") }.getOrThrow()
         assertEquals("wifi", report.localNetworkType)
         assertEquals(ConnectionHealthState.PASS, report.checks.first { it.id == "cluster_status" }.state)
-        assertEquals(ConnectionHealthState.SKIPPED, report.checks.first { it.id == "auth_session" }.state)
+        assertEquals(listOf("cluster_status"), report.checks.map { it.id })
     }
 
     @Test
@@ -1378,10 +1011,9 @@ class ApiClientContractTest {
     }
 
     @Test
-    fun `intent HTTP failures retain named reasons and authenticated requests`() = runBlocking {
-        client = ApiClient("http://127.0.0.1:${server.port}", authStore = FakeAuthStore(storedSession()))
+    fun `intent HTTP failures retain named reasons without account bearer`() = runBlocking {
         route("/api/models/intent/catalog") { request, reply ->
-            assertEquals("Bearer ${storedSession().accessToken}", request.headers["Authorization"])
+            assertTrue(request.headers.keys.none { it.equals("Authorization", ignoreCase = true) })
             reply(409, """{"detail":{"reason_code":"INTENT_NODES_UNAVAILABLE","reason":"No admitted workers"}}""")
         }
         val error = client.getModelIntentCatalog().exceptionOrNull()!!

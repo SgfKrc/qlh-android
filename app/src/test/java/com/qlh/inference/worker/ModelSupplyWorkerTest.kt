@@ -54,7 +54,7 @@ class ModelSupplyWorkerTest {
         val replies=mutableListOf<JsonObject>()
         var refreshed=false
         val controller=ModelSupplyController(node,"bound-master",temp.newFolder(),{true},{true},{123L},{it()},{fail("must not register local cut")})
-        val inventory=JsonParser.parseString("""{"action":"inventory","operation_id":"$operation","model_id":"source","source_model_sha256":"${"a".repeat(64)}","control_certificate":{}}""").asJsonObject
+        val inventory=JsonParser.parseString("""{"action":"inventory","operation_id":"$operation","model_id":"source","source_model_sha256":"${"a".repeat(64)}"}""").asJsonObject
         controller.command(inventory,this,{replies+=it},{refreshed=true})
         assertEquals("inventory_result",replies.last()["action"].asString)
         assertFalse(replies.last()["local_cut"].asBoolean)
@@ -117,39 +117,29 @@ class ModelSupplyWorkerTest {
         controller.command(JsonParser.parseString("""{"action":"inventory","operation_id":"$operation"}""").asJsonObject,this,{replies+=it},{fail("stale hello")})
         assertEquals("SUPPLY_MASTER_BINDING_CHANGED",replies.single()["reason_code"].asString)
     }
-    @Test fun `supply shares outer control fence and outbound decoration`()=runBlocking {
-        val cert=JsonParser.parseString("""{"term":2,"expires_at_ms":123456789}""").asJsonObject
-        val fence=TcpControlFence(required=true,validate={assertEquals(cert,it)})
+    @Test fun `supply transport preserves exact wire fields`()=runBlocking {
         val server=ServerSocket(0)
         var error:Throwable?=null
         val peer=thread {
             try { server.accept().use { socket ->
                 val output=DataOutputStream(socket.getOutputStream())
-                val bytes="""{"type":"model_supply","format":"json","data":{"action":"inventory","operation_id":"$operation","control_certificate":$cert}}""".toByteArray()
+                val bytes="""{"type":"model_supply","format":"json","data":{"action":"inventory","operation_id":"$operation"}}""".toByteArray()
                 output.writeInt(bytes.size);output.write(bytes);output.flush()
                 val input=DataInputStream(socket.getInputStream());val reply=ByteArray(input.readInt());input.readFully(reply)
                 val outer=JsonParser.parseString(reply.toString(Charsets.UTF_8)).asJsonObject
                 assertEquals("model_supply",outer["type"].asString)
-                assertEquals(cert,outer["data"].asJsonObject["control_certificate"])
+                assertEquals(setOf("action"), outer["data"].asJsonObject.keySet())
             } } catch(t:Throwable){error=t}
         }
         try {
             val socket=java.net.Socket("127.0.0.1",server.localPort)
-            val transport=SocketTaskWorkerTransport(socket,controlFence=fence)
+            val transport=SocketTaskWorkerTransport(socket)
             val event=transport.receiveEvent() as TaskWorkerInboundEvent.ModelSupply
             assertEquals(operation,event.data["operation_id"].asString)
             transport.sendModelSupply(JsonObject().apply{addProperty("action","inventory_result")})
             transport.close()
         } finally { server.close();peer.join(3000) }
         assertNull(error)
-    }
-    @Test fun `unconfigured certificate authority never accepts a claimed HA lease`() {
-        val fence=TcpControlFence()
-        try { fence.admit(JsonObject().apply{add("control_certificate",JsonObject())});fail("claimed authority") }
-        catch(error:TaskWorkerProtocolException){assertEquals("control_fence_unavailable",error.code)}
-        val required=TcpControlFence(required=true)
-        try { required.admit(JsonObject());fail("missing certificate") }
-        catch(error:TaskWorkerProtocolException){assertEquals("control_certificate_missing",error.code)}
     }
     @Test fun `inventory permits unresolved source hash but ensure manifest remains strict`() = runBlocking {
         val replies = mutableListOf<JsonObject>()

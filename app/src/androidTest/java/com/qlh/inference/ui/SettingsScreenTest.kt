@@ -5,20 +5,16 @@ import androidx.compose.ui.test.assertIsEnabled
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.ui.test.junit4.createEmptyComposeRule
+import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
-import androidx.compose.ui.test.performTextInput
 import com.qlh.inference.ClusterOverviewNode
 import com.qlh.inference.ClusterOverviewSnapshot
 import com.qlh.inference.ClusterOverviewUiState
-import com.qlh.inference.AuditReviewTicket
 import com.qlh.inference.AuditSnapshot
 import com.qlh.inference.AuditUiState
 import com.qlh.inference.AuditRequest
-import com.qlh.inference.AuthAccountSnapshot
-import com.qlh.inference.AuthCapabilitySnapshot
-import com.qlh.inference.AuthControlUiState
 import com.qlh.inference.ModelFleetEntry
 import com.qlh.inference.ModelFleetSnapshot
 import com.qlh.inference.ModelFleetStatus
@@ -220,7 +216,7 @@ class SettingsScreenTest {
     // ------------------------------------------------------------------
 
     @Test
-    fun auditOverviewIsReadOnlyBoundedAndRefreshable() {
+    fun auditOverviewShowsWorkflowRequestsWithoutRetiredReviewOrAccountControls() {
         var refreshCalls = 0
         setSettingsContent(
             themeMode = "system",
@@ -234,16 +230,6 @@ class SettingsScreenTest {
                             outcome = "completed", executionState = "stopped",
                         ),
                     ),
-                    reviews = listOf(
-                        AuditReviewTicket(
-                            ticketId = "review-1",
-                            status = "pending",
-                            createdAt = 1.0,
-                            targetNodeId = "node-2",
-                            score = 0,
-                            voteCount = 0,
-                        ),
-                    ),
                 ),
             ),
             onRefreshAudit = { refreshCalls += 1 },
@@ -251,59 +237,10 @@ class SettingsScreenTest {
 
         composeRule.onNodeWithTag("audit_overview_details").performScrollTo().assertIsDisplayed().performClick()
         composeRule.onNodeWithTag("audit_request_req-1").performScrollTo().assertIsDisplayed()
-        composeRule.onNodeWithTag("audit_review_review-1").performScrollTo().assertIsDisplayed()
+        assertTrue(composeRule.onAllNodesWithTag("audit_review_review-1").fetchSemanticsNodes().isEmpty())
+        assertTrue(composeRule.onAllNodesWithTag("auth_control_details").fetchSemanticsNodes().isEmpty())
         composeRule.onNodeWithTag("audit_overview_refresh").performScrollTo().assertIsEnabled().performClick()
         composeRule.runOnIdle { assertTrue(refreshCalls >= 2) }
-    }
-
-    @Test
-    fun accountSessionShowsSafeProjectionAndLogout() {
-        var logoutCalls = 0
-        var refreshCalls = 0
-        setSettingsContent(
-            themeMode = "system",
-            authControl = AuthControlUiState(
-                capability = AuthCapabilitySnapshot(
-                    required = true,
-                    available = true,
-                    mode = "local_totp",
-                ),
-                account = AuthAccountSnapshot(
-                    username = "alice",
-                    displayName = "Alice",
-                    role = "member",
-                    expiresAt = "2030-01-01T00:00:00Z",
-                ),
-            ),
-            onLogout = { logoutCalls += 1 },
-            onRefreshAuthControl = { refreshCalls += 1 },
-        )
-
-        composeRule.onNodeWithTag("auth_control_details").performScrollTo().assertIsDisplayed().performClick()
-        composeRule.onNodeWithTag("auth_account_summary").performScrollTo().assertIsDisplayed()
-        composeRule.onNodeWithTag("auth_logout").performScrollTo().assertIsEnabled().performClick()
-        composeRule.onNodeWithTag("auth_refresh").performScrollTo().assertIsEnabled().performClick()
-        composeRule.runOnIdle {
-            assertEquals(1, logoutCalls)
-            assertTrue(refreshCalls >= 2)
-        }
-    }
-
-    @Test
-    fun accountLoginDoesNotPersistSecretFieldsInUiState() {
-        var login: Triple<String, String?, String?>? = null
-        setSettingsContent(
-            themeMode = "system",
-            authControl = AuthControlUiState(
-                capability = AuthCapabilitySnapshot(required = true, available = true, mode = "local_totp"),
-            ),
-            onLogin = { username, code, recovery -> login = Triple(username, code, recovery) },
-        )
-        composeRule.onNodeWithTag("auth_control_details").performScrollTo().performClick()
-        composeRule.onNodeWithTag("auth_username").performScrollTo().assertIsDisplayed().performTextInput("alice")
-        composeRule.onNodeWithTag("auth_code").performScrollTo().assertIsDisplayed().performTextInput("123456")
-        composeRule.onNodeWithTag("auth_login").performScrollTo().assertIsEnabled().performClick()
-        composeRule.runOnIdle { assertEquals(Triple("alice", "123456", null), login) }
     }
 
     private fun setSettingsContent(
@@ -315,7 +252,6 @@ class SettingsScreenTest {
         clusterOverview: ClusterOverviewUiState = ClusterOverviewUiState(),
         modelFleet: ModelFleetUiState = ModelFleetUiState(),
         audit: AuditUiState = AuditUiState(),
-        authControl: AuthControlUiState = AuthControlUiState(),
         onThemeModeChange: (String) -> Unit = {},
         onRefreshRuntimeStatus: () -> Unit = {},
         onDownloadRemoteModel: (GgufModelInfo) -> Unit = {},
@@ -323,9 +259,6 @@ class SettingsScreenTest {
         onRefreshClusterOverview: () -> Unit = {},
         onRefreshModelFleet: () -> Unit = {},
         onRefreshAudit: () -> Unit = {},
-        onRefreshAuthControl: () -> Unit = {},
-        onLogin: (String, String?, String?) -> Unit = { _, _, _ -> },
-        onLogout: () -> Unit = {},
     ) {
         scenario.onActivity { activity ->
             activity.setContent {
@@ -373,10 +306,6 @@ class SettingsScreenTest {
                     onRefreshModelFleet = onRefreshModelFleet,
                     audit = audit,
                     onRefreshAudit = onRefreshAudit,
-                    authControl = authControl,
-                    onRefreshAuthControl = onRefreshAuthControl,
-                    onLogin = onLogin,
-                    onLogout = onLogout,
                 )
                 }
             }
